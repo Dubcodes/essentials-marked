@@ -50,3 +50,16 @@ def test_medication_pin_is_ephemeral():
         ok=client.post('/api/classroom/medication/administrations',json={'authority_id':authority['id'],'room_id':room.id,'staff_id':staff.id,'staff_pin':'1234','outcome':'given','dose':'5ml'});assert ok.status_code==200 and '1234' not in ok.text
         assert '1234' not in str([x.data for x in db.query(Event).all()])
     finally: db.close()
+def test_current_medicine_categories_and_sleep_timer_states():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room)
+        # Category iii is not accepted for this centre-based workflow.
+        assert client.post('/api/medication/authorities',json={'child_id':children[0].id,'medication_name':'Demo','dose':'1ml','route':'oral','category':'iii'}).status_code==422
+        settling=client.post('/api/classroom/sleep',json={'client_id':'sleep-put-down-1','child_ids':[children[0].id],'room_id':room.id,'action':'put_down','staff_id':staff.id});assert settling.status_code==200
+        # A settling child is not marked overdue before falling asleep.
+        assert client.get('/api/classroom/sleep-status').json()['status']=='green'
+        assert client.post('/api/classroom/sleep',json={'client_id':'sleep-asleep-1','child_ids':[children[0].id],'room_id':room.id,'action':'fell_asleep','staff_id':staff.id}).status_code==200
+        assert client.post('/api/classroom/sleep',json={'client_id':'sleep-wake-1','child_ids':[children[0].id],'room_id':room.id,'action':'wake','staff_id':staff.id}).status_code==200
+        assert client.get('/api/classroom/sleep-status').json()['status']=='green'
+    finally: db.close()

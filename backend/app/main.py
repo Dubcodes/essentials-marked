@@ -36,7 +36,9 @@ def issue_session(response: Response, kind: str, subject_id: str, centre_id: str
     try:
         db.add(AppSession(centre_id=centre_id,subject_type=kind,subject_id=subject_id,token_hash=hashlib.sha256(raw.encode()).hexdigest(),expires_at=expiry));db.commit()
     finally: db.close()
-    response.set_cookie(kind,raw,httponly=True,samesite='strict',secure=secure_cookie,max_age=minutes*60,path='/')
+    # The server-side expiry is the authority. A longer browser cookie permits
+    # active sessions to slide; an inactive/revoked session still fails closed.
+    response.set_cookie(kind,raw,httponly=True,samesite='strict',secure=secure_cookie,max_age=max(minutes*60,31536000),path='/')
 def claim(request: Request, kind: str, db: Session):
     raw = request.cookies.get(kind)
     if not raw: raise HTTPException(401, 'Sign in required')
@@ -61,10 +63,11 @@ def device(request: Request, db: Session=Depends(get_db)):
 def scoped(db, cls, centre_id): return db.scalars(select(cls).where(cls.centre_id==centre_id))
 def rate(db: Session, scope: str, key: str):
     """Database-backed per-identifier rate window; no untrusted proxy headers."""
-    start=now().replace(second=0,microsecond=0)-timedelta(minutes=9)
+    cutoff=now()-timedelta(minutes=10); start=now().replace(second=0,microsecond=0)
+    attempts=db.scalar(select(func.coalesce(func.sum(LoginAttempt.count),0)).where(LoginAttempt.scope==scope,LoginAttempt.key==key,LoginAttempt.window_start>=cutoff))
+    if attempts>=8: raise HTTPException(429,'Too many attempts; try later')
     row=db.scalar(select(LoginAttempt).where(LoginAttempt.scope==scope,LoginAttempt.key==key,LoginAttempt.window_start==start))
     if not row: row=LoginAttempt(scope=scope,key=key,window_start=start,count=0);db.add(row);db.flush()
-    if row.count>=8: db.commit();raise HTTPException(429,'Too many attempts; try later')
     row.count+=1;db.commit()
 def audit(db, centre, entity, entity_id, action, before=None, after=None, actor=None, reason=None): db.add(Audit(centre_id=centre,entity=entity,entity_id=entity_id,action=action,before=before,after=after,actor_id=actor,reason=reason))
 def public_child(c): return {'id':c.id,'first_name':c.preferred_name or c.first_name,'last_name':c.last_name,'room_id':c.room_id}
@@ -87,10 +90,11 @@ class PresenceIn(BaseModel): child_id: str; room_id:str; action: Literal['arrive
 class NoteIn(BaseModel): child_id: str; body: str=Field(min_length=1,max_length=1500)
 class RoomIn(BaseModel): name: str=Field(min_length=2,max_length=100); accent: str='#176b5b'; icon: str='🌿'
 class SleepIn(BaseModel): client_id:str=Field(min_length=10,max_length=80); child_ids:list[str]=Field(min_length=1,max_length=50); room_id:str; action:Literal['put_down','fell_asleep','wake','got_up','check']; effective_at:datetime|None=None; staff_id:str; warmth:str='normal'; breathing:str='normal'; wellbeing:str='well'; note:str|None=None; quality:str|None=None; wake_state:str|None=None
-class MedicationAuthorityIn(BaseModel): child_id:str; medication_name:str; dose:str; route:str; category:Literal['i','ii','iii']; form:str|None=None; concentration:str|None=None; frequency:str|None=None; scheduled_times:list[str]=[]; instructions:str|None=None; signer_name:str|None=None
+class MedicationAuthorityIn(BaseModel): child_id:str; medication_name:str; dose:str; route:str; category:Literal['i','ii']; form:str|None=None; concentration:str|None=None; frequency:str|None=None; scheduled_times:list[str]=[]; instructions:str|None=None; signer_name:str|None=None
 class MedicationReceiptIn(BaseModel): authority_id:str; staff_id:str; handed_by:str|None=None; label_checked:bool; authority_matched:bool; expiry_checked:bool; storage_location:str|None=None; quantity:str|None=None; note:str|None=None
 class MedicationAdminIn(BaseModel): authority_id:str; room_id:str; staff_id:str; staff_pin:str; outcome:Literal['given','refused','partly_taken','spat_out','vomited_afterward','missed','parent_administered','other']; dose:str; note:str|None=None; administered_at:datetime|None=None
 class IncidentIn(BaseModel): child_id:str; room_id:str; staff_id:str; effective_at:datetime|None=None; environment:Literal['indoor','outdoor']|None=None; location:str|None=None; incident_type:str; other_child_id:str|None=None; skin_broken:bool=False; description:str|None=None; body_areas:list[str]=[]; actions:list[str]=[]; staff_pin:str|None=None; finalise:bool=False
+class SignatureIn(BaseModel): signer_name:str=Field(min_length=2,max_length=200); relationship:str|None=None; signature_data:str=Field(min_length=12,max_length=500000); purpose:str=Field(min_length=2,max_length=100)
 
 @app.get('/api/health')
 def health(): return {'status':'ok'}
@@ -134,7 +138,7 @@ def events(day:str|None=None,room_id:str|None=None,staff_id:str|None=None,a:Acco
     if room_id:q=q.where(Event.room_id==room_id)
     if staff_id:q=q.where(Event.performed_by_id==staff_id)
     if day:
-        local=datetime.fromisoformat(day).date();zone=ZoneInfo(db.get(Centre,a.centre_id).timezone);start=datetime.combine(local,datetime.min.time(),tzinfo=zone).astimezone(timezone.utc);q=q.where(Event.effective_at>=start,Event.effective_at<start+timedelta(days=1))
+        local=datetime.fromisoformat(day).date();zone=ZoneInfo(db.get(Centre,a.centre_id).timezone);start=datetime.combine(local,datetime.min.time(),tzinfo=zone).astimezone(timezone.utc);end=datetime.combine(local+timedelta(days=1),datetime.min.time(),tzinfo=zone).astimezone(timezone.utc);q=q.where(Event.effective_at>=start,Event.effective_at<end)
     return [event_out(e,db) for e in db.scalars(q.order_by(Event.created_at.desc()).limit(500))]
 @app.patch('/api/admin/events/{event_id}/attribution')
 def correct(event_id:str,body:Correction,a:Account=Depends(admin),db:Session=Depends(get_db)):
@@ -203,8 +207,9 @@ def staff_for_device(db,d,staff_id):
 def active_sleep(db, centre_id, child_id):
     return db.scalar(select(SleepSession).where(SleepSession.centre_id==centre_id,SleepSession.child_id==child_id,SleepSession.got_up_at.is_(None)).order_by(SleepSession.created_at.desc()))
 def sleep_status(db, session):
+    if not session.fell_asleep_at or session.woke_at: return 'green'
     last=db.scalar(select(SleepCheck).where(SleepCheck.sleep_session_id==session.id).order_by(SleepCheck.checked_at.desc()))
-    last_at=utc(last.checked_at) if last else utc(session.put_down_at); elapsed=(now()-last_at).total_seconds()/60
+    last_at=utc(last.checked_at) if last else utc(session.fell_asleep_at); elapsed=(now()-last_at).total_seconds()/60
     return 'red' if elapsed>session.check_interval_minutes else ('amber' if elapsed>=session.check_interval_minutes*.8 else 'green')
 
 @app.post('/api/classroom/sleep')
@@ -243,11 +248,33 @@ def medication_authority(body:MedicationAuthorityIn,a:Account=Depends(admin),db:
     if not child: raise HTTPException(404,'Child not found')
     authority=MedicationAuthority(centre_id=a.centre_id,child_id=child.id,status='authorised' if body.signer_name else 'draft',**body.model_dump(exclude={'child_id'}))
     db.add(authority);db.commit();return {'id':authority.id,'status':authority.status,'revision':authority.revision}
+@app.post('/api/parent/medication-authorities')
+def parent_medication_authority(body:MedicationAuthorityIn,p:Parent=Depends(parent),db:Session=Depends(get_db)):
+    if not db.scalar(select(ParentChild).where(ParentChild.parent_id==p.id,ParentChild.child_id==body.child_id)): raise HTTPException(404,'Child not found')
+    authority=MedicationAuthority(centre_id=p.centre_id,child_id=body.child_id,status='draft',**body.model_dump(exclude={'child_id','signer_name'}));db.add(authority);db.commit();return {'id':authority.id,'status':authority.status,'revision':authority.revision}
+@app.post('/api/parent/medication-authorities/{authority_id}/authorise')
+def authorise_medication(authority_id:str,body:SignatureIn,p:Parent=Depends(parent),db:Session=Depends(get_db)):
+    authority=db.scalar(select(MedicationAuthority).where(MedicationAuthority.id==authority_id,MedicationAuthority.centre_id==p.centre_id))
+    if not authority or not db.scalar(select(ParentChild).where(ParentChild.parent_id==p.id,ParentChild.child_id==authority.child_id)): raise HTTPException(404,'Medication authority not found')
+    if authority.status!='draft': raise HTTPException(409,'Authority has already been actioned')
+    authority.status='authorised';authority.signer_name=body.signer_name;authority.updated_at=now();db.add(Signature(centre_id=p.centre_id,parent_id=p.id,signer_name=body.signer_name,relationship=body.relationship,domain_type='medication_authority',domain_id=authority.id,revision=authority.revision,purpose=body.purpose,signature_data=body.signature_data));db.commit();return {'id':authority.id,'status':authority.status}
+@app.get('/api/parent/medication-authorities')
+def parent_medication_authorities(p:Parent=Depends(parent),db:Session=Depends(get_db)):
+    permitted=[x.child_id for x in db.scalars(select(ParentChild).where(ParentChild.parent_id==p.id))]
+    return [{'id':m.id,'child_id':m.child_id,'medication_name':m.medication_name,'dose':m.dose,'route':m.route,'category':m.category,'status':m.status,'scheduled_times':m.scheduled_times,'instructions':m.instructions,'revision':m.revision} for m in db.scalars(select(MedicationAuthority).where(MedicationAuthority.centre_id==p.centre_id,MedicationAuthority.child_id.in_(permitted)).order_by(MedicationAuthority.created_at.desc()))]
+@app.get('/api/classroom/medications')
+def classroom_medications(d:Device=Depends(device),db:Session=Depends(get_db)):
+    rows=[]
+    for authority in db.scalars(select(MedicationAuthority).where(MedicationAuthority.centre_id==d.centre_id).order_by(MedicationAuthority.created_at.desc())):
+        child=db.get(Child,authority.child_id); receipt=db.scalar(select(MedicationReceipt).where(MedicationReceipt.authority_id==authority.id,MedicationReceipt.returned_at.is_(None)).order_by(MedicationReceipt.received_at.desc()))
+        rows.append({'id':authority.id,'child_id':authority.child_id,'child_name':(child.preferred_name or child.first_name),'medication_name':authority.medication_name,'dose':authority.dose,'route':authority.route,'category':authority.category,'scheduled_times':authority.scheduled_times,'instructions':authority.instructions,'status':authority.status,'received':bool(receipt),'receipt_id':receipt.id if receipt else None})
+    return rows
 @app.post('/api/medication/receipts')
 def medication_receipt(body:MedicationReceiptIn,d:Device=Depends(device),db:Session=Depends(get_db)):
     authority=db.scalar(select(MedicationAuthority).where(MedicationAuthority.id==body.authority_id,MedicationAuthority.centre_id==d.centre_id))
     staff=staff_for_device(db,d,body.staff_id)
     if not authority: raise HTTPException(404,'Medication authority not found')
+    if not (body.label_checked and body.authority_matched and body.expiry_checked): raise HTTPException(422,'All receipt safety checks must be confirmed before medication becomes active')
     receipt=MedicationReceipt(centre_id=d.centre_id,authority_id=authority.id,received_by_id=staff.id,**body.model_dump(exclude={'authority_id','staff_id'}));db.add(receipt);db.commit();return {'id':receipt.id}
 @app.post('/api/classroom/medication/administrations')
 def medication_administration(body:MedicationAdminIn,d:Device=Depends(device),db:Session=Depends(get_db)):
@@ -287,7 +314,7 @@ def timeline(child_id:str,day:str|None=None,p:Parent=Depends(parent),db:Session=
     if not accessible:raise HTTPException(404,'Child not found')
     centre=db.get(Centre,p.centre_id); zone=ZoneInfo(centre.timezone); target=datetime.fromisoformat(day).date() if day else now().astimezone(zone).date()
     if target < now().astimezone(zone).date()-timedelta(days=centre.parent_history_days-1):raise HTTPException(403,'This date is outside the family history window')
-    start=datetime.combine(target,datetime.min.time(),tzinfo=zone).astimezone(timezone.utc); end=start+timedelta(days=1)
+    start=datetime.combine(target,datetime.min.time(),tzinfo=zone).astimezone(timezone.utc); end=datetime.combine(target+timedelta(days=1),datetime.min.time(),tzinfo=zone).astimezone(timezone.utc)
     q=select(Event).where(Event.centre_id==p.centre_id,Event.child_id==child_id,Event.visibility=='parent',Event.effective_at>=start,Event.effective_at<end).order_by(Event.effective_at)
     return [event_out(e,db) for e in db.scalars(q)]
 @app.post('/api/parent/notes')
@@ -308,9 +335,12 @@ def export(child_id:str,p:Parent=Depends(parent),db:Session=Depends(get_db)):
 @app.on_event('startup')
 def seed():
     if APP_ENV=='production':
-        if SECRET=='development-only-change-me' or len(SECRET)<32: raise RuntimeError('Production requires a unique SECRET_KEY of at least 32 characters')
+        known={'development-only-change-me','development-only-change-me-replace-before-production','replace-with-a-long-random-secret'}
+        if SECRET in known or len(SECRET)<32: raise RuntimeError('Production requires a unique, non-example SECRET_KEY of at least 32 characters')
         if not secure_cookie: raise RuntimeError('Production requires COOKIE_SECURE=true')
         if os.getenv('DEMO_SEED','false').lower()=='true': raise RuntimeError('Production must not seed demo data')
+        if 'change-me-before-production' in os.getenv('DATABASE_URL',''): raise RuntimeError('Production requires a non-example database password')
+        if not os.getenv('PUBLIC_ORIGIN','').startswith('https://'): raise RuntimeError('Production requires an HTTPS PUBLIC_ORIGIN')
     if os.getenv('DEMO_SEED','true').lower()!='true':return
     from .db import SessionLocal
     db=SessionLocal()
