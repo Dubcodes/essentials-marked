@@ -1,4 +1,4 @@
-import os, secrets, hashlib
+import os, secrets, hashlib, re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Literal
@@ -7,10 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from passlib.context import CryptContext
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .db import get_db
-from .models import Centre, Room, Staff, Account, Child, Parent, ParentChild, Event, Attendance, Device, Pairing, Audit, ParentNote, AppSession, LoginAttempt, SleepSession, SleepCheck, MedicationAuthority, MedicationReceipt, MedicationAdministration, Incident, IncidentBodyArea, IncidentAction, Signature, now
+from .models import Centre, Room, Staff, Account, Child, Parent, ParentChild, Event, Attendance, Device, Pairing, Audit, ParentNote, AppSession, LoginAttempt, SleepSession, SleepCheck, DomainOperation, MedicationAuthority, MedicationReceipt, MedicationAdministration, Incident, IncidentBodyArea, IncidentAction, Signature, now
 
 app = FastAPI(title='Essentials Marked', version='0.1.0')
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv('CORS_ORIGINS','http://localhost:5173').split(','), allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
@@ -90,10 +91,10 @@ class PresenceIn(BaseModel): child_id: str; room_id:str; action: Literal['arrive
 class NoteIn(BaseModel): child_id: str; body: str=Field(min_length=1,max_length=1500)
 class RoomIn(BaseModel): name: str=Field(min_length=2,max_length=100); accent: str='#176b5b'; icon: str='🌿'
 class SleepIn(BaseModel): client_id:str=Field(min_length=10,max_length=80); child_ids:list[str]=Field(min_length=1,max_length=50); room_id:str; action:Literal['put_down','fell_asleep','wake','got_up','check']; effective_at:datetime|None=None; staff_id:str; warmth:str='normal'; breathing:str='normal'; wellbeing:str='well'; note:str|None=None; quality:str|None=None; wake_state:str|None=None
-class MedicationAuthorityIn(BaseModel): child_id:str; medication_name:str; dose:str; route:str; category:Literal['i','ii']; form:str|None=None; concentration:str|None=None; frequency:str|None=None; scheduled_times:list[str]=[]; instructions:str|None=None; signer_name:str|None=None
+class MedicationAuthorityIn(BaseModel): child_id:str; medication_name:str; dose:str; route:str; category:Literal['i','ii']; form:str|None=None; concentration:str|None=None; frequency:str|None=None; scheduled_times:list[str]=[]; starts_on:str|None=None; ends_on:str|None=None; instructions:str|None=None; signer_name:str|None=None
 class MedicationReceiptIn(BaseModel): authority_id:str; staff_id:str; handed_by:str|None=None; label_checked:bool; authority_matched:bool; expiry_checked:bool; storage_location:str|None=None; quantity:str|None=None; note:str|None=None
-class MedicationAdminIn(BaseModel): authority_id:str; room_id:str; staff_id:str; staff_pin:str; outcome:Literal['given','refused','partly_taken','spat_out','vomited_afterward','missed','parent_administered','other']; dose:str; note:str|None=None; administered_at:datetime|None=None
-class IncidentIn(BaseModel): child_id:str; room_id:str; staff_id:str; effective_at:datetime|None=None; environment:Literal['indoor','outdoor']|None=None; location:str|None=None; incident_type:str; other_child_id:str|None=None; skin_broken:bool=False; description:str|None=None; body_areas:list[str]=[]; actions:list[str]=[]; staff_pin:str|None=None; finalise:bool=False
+class MedicationAdminIn(BaseModel): client_operation_id:str=Field(min_length=10,max_length=80); authority_id:str; room_id:str; staff_id:str; staff_pin:str; outcome:Literal['given','refused','partly_taken','spat_out','vomited_afterward','missed','parent_administered','other']; dose:str; note:str|None=None; administered_at:datetime|None=None
+class IncidentIn(BaseModel): client_draft_id:str=Field(min_length=10,max_length=80); incident_id:str|None=None; finalise_operation_id:str|None=Field(default=None,min_length=10,max_length=80); child_id:str; room_id:str; staff_id:str; effective_at:datetime|None=None; environment:Literal['indoor','outdoor']|None=None; location:str|None=None; incident_type:str; other_child_id:str|None=None; skin_broken:bool=False; description:str|None=None; body_areas:list[str]=[]; actions:list[str]=[]; staff_pin:str|None=None; finalise:bool=False
 class SignatureIn(BaseModel): signer_name:str=Field(min_length=2,max_length=200); relationship:str|None=None; signature_data:str=Field(min_length=12,max_length=500000); purpose:str=Field(min_length=2,max_length=100)
 
 @app.get('/api/health')
@@ -214,7 +215,13 @@ def sleep_status(db, session):
 
 @app.post('/api/classroom/sleep')
 def sleep(body:SleepIn,d:Device=Depends(device),db:Session=Depends(get_db)):
-    room_for_device(db,d,body.room_id); staff=staff_for_device(db,d,body.staff_id)
+    room_for_device(db,d,body.room_id)
+    prior=db.scalar(select(DomainOperation).where(DomainOperation.centre_id==d.centre_id,DomainOperation.domain=='sleep',DomainOperation.client_operation_id==body.client_id))
+    if prior:
+        prior_children={item['child_id'] for item in prior.result.get('sessions',[])}
+        if prior.result.get('action')!=body.action or prior.result.get('room_id')!=body.room_id or prior.result.get('staff_id')!=body.staff_id or prior_children!=set(body.child_ids): raise HTTPException(409,'Operation ID was already used for a different sleep request')
+        return {'sessions':prior.result.get('sessions',[]),'idempotent':True}
+    staff=staff_for_device(db,d,body.staff_id)
     if body.action=='put_down':
         centre=db.get(Centre,d.centre_id)
         if not 5<=centre.sleep_check_minutes<=10: raise HTTPException(409,'Centre sleep-check interval must be between 5 and 10 minutes')
@@ -229,12 +236,26 @@ def sleep(body:SleepIn,d:Device=Depends(device),db:Session=Depends(get_db)):
             centre=db.get(Centre,d.centre_id); session=SleepSession(centre_id=d.centre_id,child_id=child.id,room_id=body.room_id,put_down_at=when,check_interval_minutes=centre.sleep_check_minutes,opened_by_staff_id=staff.id,note=body.note);db.add(session);results.append({'child_id':child.id,'session_id':session.id,'status':'green'})
         else:
             if not session: raise HTTPException(409,f'{child.first_name} has no active sleep session')
-            if body.action=='fell_asleep':session.fell_asleep_at=when;session.note=body.note or session.note
-            elif body.action=='wake':session.woke_at=when;session.wake_state=body.wake_state;session.quality=body.quality;session.note=body.note or session.note
-            elif body.action=='got_up':session.got_up_at=when;session.closed_by_staff_id=staff.id;session.note=body.note or session.note
-            else: db.add(SleepCheck(centre_id=d.centre_id,sleep_session_id=session.id,child_id=child.id,room_id=body.room_id,checked_at=when,staff_id=staff.id,warmth=body.warmth,breathing=body.breathing,wellbeing=body.wellbeing,note=body.note))
+            if session.room_id!=body.room_id: raise HTTPException(409,f'{child.first_name} sleep session belongs to a different room')
+            if body.action=='fell_asleep':
+                if session.fell_asleep_at or session.woke_at: raise HTTPException(409,f'{child.first_name} cannot be marked asleep in the current state')
+                session.fell_asleep_at=when;session.note=body.note or session.note
+            elif body.action=='wake':
+                if not session.fell_asleep_at or session.woke_at: raise HTTPException(409,f'{child.first_name} cannot be woken in the current state')
+                session.woke_at=when;session.wake_state=body.wake_state;session.quality=body.quality;session.note=body.note or session.note
+            elif body.action=='got_up':
+                session.got_up_at=when;session.closed_by_staff_id=staff.id;session.note=body.note or session.note
+            else:
+                if not session.fell_asleep_at or session.woke_at: raise HTTPException(409,f'{child.first_name} is not currently asleep')
+                db.add(SleepCheck(centre_id=d.centre_id,sleep_session_id=session.id,child_id=child.id,room_id=session.room_id,checked_at=when,staff_id=staff.id,warmth=body.warmth,breathing=body.breathing,wellbeing=body.wellbeing,note=body.note))
             session.updated_at=now();results.append({'child_id':child.id,'session_id':session.id,'status':sleep_status(db,session)})
-    db.commit(); return {'sessions':results}
+    db.add(DomainOperation(centre_id=d.centre_id,domain='sleep',client_operation_id=body.client_id,result={'action':body.action,'room_id':body.room_id,'staff_id':body.staff_id,'sessions':results}))
+    try: db.commit()
+    except IntegrityError:
+        db.rollback(); prior=db.scalar(select(DomainOperation).where(DomainOperation.centre_id==d.centre_id,DomainOperation.domain=='sleep',DomainOperation.client_operation_id==body.client_id))
+        if prior and prior.result.get('action')==body.action and prior.result.get('room_id')==body.room_id and prior.result.get('staff_id')==body.staff_id and {item['child_id'] for item in prior.result.get('sessions',[])}==set(body.child_ids):return {'sessions':prior.result.get('sessions',[]),'idempotent':True}
+        raise
+    return {'sessions':results,'idempotent':False}
 
 @app.get('/api/classroom/sleep-status')
 def classroom_sleep_status(d:Device=Depends(device),db:Session=Depends(get_db)):
@@ -246,7 +267,7 @@ def classroom_sleep_status(d:Device=Depends(device),db:Session=Depends(get_db)):
 def medication_authority(body:MedicationAuthorityIn,a:Account=Depends(admin),db:Session=Depends(get_db)):
     child=db.scalar(select(Child).where(Child.id==body.child_id,Child.centre_id==a.centre_id))
     if not child: raise HTTPException(404,'Child not found')
-    authority=MedicationAuthority(centre_id=a.centre_id,child_id=child.id,status='authorised' if body.signer_name else 'draft',**body.model_dump(exclude={'child_id'}))
+    authority=MedicationAuthority(centre_id=a.centre_id,child_id=child.id,status='draft',**body.model_dump(exclude={'child_id','signer_name'}))
     db.add(authority);db.commit();return {'id':authority.id,'status':authority.status,'revision':authority.revision}
 @app.post('/api/parent/medication-authorities')
 def parent_medication_authority(body:MedicationAuthorityIn,p:Parent=Depends(parent),db:Session=Depends(get_db)):
@@ -274,32 +295,78 @@ def medication_receipt(body:MedicationReceiptIn,d:Device=Depends(device),db:Sess
     authority=db.scalar(select(MedicationAuthority).where(MedicationAuthority.id==body.authority_id,MedicationAuthority.centre_id==d.centre_id))
     staff=staff_for_device(db,d,body.staff_id)
     if not authority: raise HTTPException(404,'Medication authority not found')
+    if authority.status!='authorised': raise HTTPException(409,'Medication authority has not been authorised by a parent')
     if not (body.label_checked and body.authority_matched and body.expiry_checked): raise HTTPException(422,'All receipt safety checks must be confirmed before medication becomes active')
+    if db.scalar(select(MedicationReceipt).where(MedicationReceipt.authority_id==authority.id,MedicationReceipt.returned_at.is_(None))): raise HTTPException(409,'Medication already has an active receipt')
     receipt=MedicationReceipt(centre_id=d.centre_id,authority_id=authority.id,received_by_id=staff.id,**body.model_dump(exclude={'authority_id','staff_id'}));db.add(receipt);db.commit();return {'id':receipt.id}
+
+def normalised_dose(value:str): return re.sub(r'\s+','',value).casefold()
+
 @app.post('/api/classroom/medication/administrations')
 def medication_administration(body:MedicationAdminIn,d:Device=Depends(device),db:Session=Depends(get_db)):
-    room_for_device(db,d,body.room_id); staff=staff_for_device(db,d,body.staff_id); rate(db,'staff_pin',staff.id)
+    room_for_device(db,d,body.room_id)
+    prior=db.scalar(select(MedicationAdministration).where(MedicationAdministration.centre_id==d.centre_id,MedicationAdministration.client_operation_id==body.client_operation_id))
+    if prior:
+        prior_event=db.scalar(select(Event).where(Event.centre_id==d.centre_id,Event.client_id=='medicine-'+body.client_operation_id))
+        if prior.authority_id!=body.authority_id or prior.staff_id!=body.staff_id or prior.outcome!=body.outcome or normalised_dose(prior.dose)!=normalised_dose(body.dose) or not prior_event or prior_event.room_id!=body.room_id:raise HTTPException(409,'Operation ID was already used for a different administration')
+        return {'id':prior.id,'outcome':prior.outcome,'idempotent':True}
+    staff=staff_for_device(db,d,body.staff_id)
+    rate(db,'staff_pin',staff.id)
     if not staff.pin_hash or not pwd.verify(body.staff_pin,staff.pin_hash): raise HTTPException(403,'Incorrect staff PIN — nothing was recorded.')
     authority=db.scalar(select(MedicationAuthority).where(MedicationAuthority.id==body.authority_id,MedicationAuthority.centre_id==d.centre_id,MedicationAuthority.status=='authorised'))
     receipt=db.scalar(select(MedicationReceipt).where(MedicationReceipt.authority_id==body.authority_id,MedicationReceipt.centre_id==d.centre_id,MedicationReceipt.returned_at.is_(None)))
     if not authority or not receipt: raise HTTPException(409,'Medication needs an active authority and confirmed physical receipt')
-    admin=MedicationAdministration(centre_id=d.centre_id,authority_id=authority.id,child_id=authority.child_id,administered_at=body.administered_at or now(),staff_id=staff.id,outcome=body.outcome,dose=body.dose,note=body.note)
-    db.add(admin);db.flush(); db.add(Event(centre_id=d.centre_id,room_id=body.room_id,child_id=authority.child_id,type='medicine',visibility='parent',effective_at=admin.administered_at,performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id='medicine-'+admin.id,operation_id='medicine-'+admin.id,data={'medication':authority.medication_name,'dose':body.dose,'outcome':body.outcome},finalised=True));db.commit();return {'id':admin.id,'outcome':admin.outcome}
+    centre=db.get(Centre,d.centre_id); administered_at=body.administered_at or now(); local_day=utc(administered_at).astimezone(ZoneInfo(centre.timezone)).date().isoformat()
+    if (authority.starts_on and local_day<authority.starts_on) or (authority.ends_on and local_day>authority.ends_on): raise HTTPException(409,'Administration is outside the authority treatment dates')
+    if normalised_dose(body.dose)!=normalised_dose(authority.dose): raise HTTPException(409,'Dose does not exactly match the authorised dose')
+    admin=MedicationAdministration(centre_id=d.centre_id,authority_id=authority.id,child_id=authority.child_id,client_operation_id=body.client_operation_id,administered_at=administered_at,staff_id=staff.id,outcome=body.outcome,dose=authority.dose,note=body.note)
+    event_operation='medicine-'+body.client_operation_id
+    db.add(admin);db.flush(); db.add(Event(centre_id=d.centre_id,room_id=body.room_id,child_id=authority.child_id,type='medicine',visibility='parent',effective_at=admin.administered_at,performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id=event_operation,operation_id=event_operation,data={'medication':authority.medication_name,'dose':authority.dose,'route':authority.route,'outcome':body.outcome},finalised=True))
+    try:db.commit()
+    except IntegrityError:
+        db.rollback();prior=db.scalar(select(MedicationAdministration).where(MedicationAdministration.centre_id==d.centre_id,MedicationAdministration.client_operation_id==body.client_operation_id))
+        prior_event=db.scalar(select(Event).where(Event.centre_id==d.centre_id,Event.client_id=='medicine-'+body.client_operation_id))
+        if prior and prior.authority_id==body.authority_id and prior.staff_id==body.staff_id and prior.outcome==body.outcome and normalised_dose(prior.dose)==normalised_dose(body.dose) and prior_event and prior_event.room_id==body.room_id:return {'id':prior.id,'outcome':prior.outcome,'idempotent':True}
+        raise
+    return {'id':admin.id,'outcome':admin.outcome,'idempotent':False}
 
 @app.post('/api/classroom/incidents')
 def incident(body:IncidentIn,d:Device=Depends(device),db:Session=Depends(get_db)):
     room_for_device(db,d,body.room_id);staff=staff_for_device(db,d,body.staff_id)
     child=db.scalar(select(Child).where(Child.id==body.child_id,Child.centre_id==d.centre_id));other=db.scalar(select(Child).where(Child.id==body.other_child_id,Child.centre_id==d.centre_id)) if body.other_child_id else None
     if not child or (body.other_child_id and not other):raise HTTPException(404,'Child not found')
+    canonical_areas={'head','face','neck','chest','back','abdomen','left_arm','right_arm','left_hand','right_hand','left_leg','right_leg','left_foot','right_foot','other'}
+    invalid=set(body.body_areas)-canonical_areas
+    if invalid:raise HTTPException(422,'Invalid body area: '+', '.join(sorted(invalid)))
+    report=db.scalar(select(Incident).where(Incident.centre_id==d.centre_id,Incident.client_draft_id==body.client_draft_id))
+    if body.incident_id and (not report or report.id!=body.incident_id):raise HTTPException(409,'Incident ID does not match this draft operation')
+    if report and report.child_id!=child.id:raise HTTPException(409,'Draft operation belongs to a different child')
+    if report and report.status=='finalised':
+        if body.finalise and report.finalise_operation_id==body.finalise_operation_id:return {'id':report.id,'status':report.status,'revision':report.revision,'idempotent':True}
+        raise HTTPException(409,'Incident has already been finalised')
     if body.finalise:
+        if not body.finalise_operation_id:raise HTTPException(422,'A finalise operation ID is required')
+        used=db.scalar(select(Incident).where(Incident.centre_id==d.centre_id,Incident.finalise_operation_id==body.finalise_operation_id))
+        if used and (not report or used.id!=report.id):raise HTTPException(409,'Finalise operation ID was already used')
         rate(db,'staff_pin',staff.id)
         if not body.staff_pin or not staff.pin_hash or not pwd.verify(body.staff_pin,staff.pin_hash):raise HTTPException(403,'Incorrect staff PIN — incident remains a draft.')
-    report=Incident(centre_id=d.centre_id,child_id=child.id,room_id=body.room_id,effective_at=body.effective_at or now(),environment=body.environment,location=body.location,incident_type=body.incident_type,other_child_id=body.other_child_id,skin_broken=body.skin_broken,description=body.description,status='finalised' if body.finalise else 'draft',created_by_id=staff.id,finalised_by_id=staff.id if body.finalise else None,finalised_at=now() if body.finalise else None)
-    db.add(report);db.flush()
+    is_update=report is not None
+    if not report:
+        report=Incident(centre_id=d.centre_id,client_draft_id=body.client_draft_id,child_id=child.id,room_id=body.room_id,effective_at=body.effective_at or now(),incident_type=body.incident_type,status='draft',created_by_id=staff.id);db.add(report);db.flush()
+    report.room_id=body.room_id;report.effective_at=body.effective_at or report.effective_at;report.environment=body.environment;report.location=body.location;report.incident_type=body.incident_type;report.other_child_id=body.other_child_id;report.skin_broken=body.skin_broken;report.description=body.description;report.updated_at=now()
+    if is_update:report.revision+=1
+    db.execute(delete(IncidentBodyArea).where(IncidentBodyArea.incident_id==report.id));db.execute(delete(IncidentAction).where(IncidentAction.incident_id==report.id))
     for area in set(body.body_areas):db.add(IncidentBodyArea(incident_id=report.id,area=area))
     for action in body.actions:db.add(IncidentAction(incident_id=report.id,action_at=now(),description=action,staff_id=staff.id))
-    if body.finalise: db.add(Event(centre_id=d.centre_id,room_id=body.room_id,child_id=child.id,type='incident',visibility='parent',effective_at=report.effective_at,performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id='incident-'+report.id,operation_id='incident-'+report.id,data={'incident_type':report.incident_type,'skin_broken':report.skin_broken,'description':report.description or '', 'involved':'another child' if report.other_child_id else None},finalised=True))
-    db.commit();return {'id':report.id,'status':report.status,'revision':report.revision}
+    if body.finalise:
+        report.status='finalised';report.finalise_operation_id=body.finalise_operation_id;report.finalised_by_id=staff.id;report.finalised_at=now();event_operation='incident-'+body.finalise_operation_id
+        db.add(Event(centre_id=d.centre_id,room_id=body.room_id,child_id=child.id,type='incident',visibility='parent',effective_at=report.effective_at,performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id=event_operation,operation_id=event_operation,data={'incident_type':report.incident_type,'skin_broken':report.skin_broken,'description':report.description or '', 'involved':'another child' if report.other_child_id else None},finalised=True))
+    try:db.commit()
+    except IntegrityError:
+        db.rollback();existing=db.scalar(select(Incident).where(Incident.centre_id==d.centre_id,Incident.client_draft_id==body.client_draft_id))
+        if existing and existing.child_id==body.child_id and body.finalise and existing.finalise_operation_id==body.finalise_operation_id:return {'id':existing.id,'status':existing.status,'revision':existing.revision,'idempotent':True}
+        raise
+    return {'id':report.id,'status':report.status,'revision':report.revision,'idempotent':False}
 
 def event_out(e,db):
     c=db.get(Child,e.child_id); s=db.get(Staff,e.performed_by_id) if e.performed_by_id else None; r=db.get(Room,e.room_id) if e.room_id else None
