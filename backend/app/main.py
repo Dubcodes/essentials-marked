@@ -101,6 +101,7 @@ class PairComplete(BaseModel): token: str; challenge: str
 class Correction(BaseModel): performed_by_id: str; reason: str=Field(min_length=3,max_length=500)
 class PresenceIn(BaseModel): child_id: str; room_id:str; action: Literal['arrive','depart','visit','end_visit']
 class NoteIn(BaseModel): child_id: str; body: str=Field(min_length=1,max_length=1500)
+class ParentNoteAction(BaseModel): read:bool|None=None; pinned:bool|None=None
 class RoomIn(BaseModel): name: str=Field(min_length=2,max_length=100); accent: str='#176b5b'; icon: str='🌿'
 class SleepIn(BaseModel): client_id:str=Field(min_length=10,max_length=80); child_ids:list[str]=Field(min_length=1,max_length=50); room_id:str; action:Literal['put_down','fell_asleep','wake','got_up','check']; effective_at:datetime|None=None; staff_id:str; warmth:str='normal'; breathing:str='normal'; wellbeing:str='well'; note:str|None=None; quality:str|None=None; wake_state:str|None=None
 class MedicationAuthorityIn(BaseModel):
@@ -110,6 +111,7 @@ class MedicationAuthorityIn(BaseModel):
         if self.starts_on and self.ends_on and self.ends_on<self.starts_on:raise ValueError('end date must be on or after start date')
         return self
 class MedicationReceiptIn(BaseModel): authority_id:str; staff_id:str; handed_by:str|None=None; label_checked:bool; authority_matched:bool; expiry_checked:bool; storage_location:str|None=None; quantity:str|None=None; note:str|None=None
+class MedicationReturnIn(BaseModel): staff_id:str; returned_to:str=Field(min_length=2,max_length=200)
 class MedicationAdminIn(BaseModel): client_operation_id:str=Field(min_length=10,max_length=80); authority_id:str; room_id:str; staff_id:str; staff_pin:str; outcome:Literal['given','refused','partly_taken','spat_out','vomited_afterward','missed','parent_administered','other']; dose:str; note:str|None=None; administered_at:datetime|None=None
 class IncidentIn(BaseModel): client_draft_id:str=Field(min_length=10,max_length=80); incident_id:str|None=None; finalise_operation_id:str|None=Field(default=None,min_length=10,max_length=80); child_id:str; room_id:str; staff_id:str; effective_at:datetime|None=None; environment:Literal['indoor','outdoor']|None=None; location:str|None=None; incident_type:str; other_child_id:str|None=None; skin_broken:bool=False; description:str|None=None; body_areas:list[str]=[]; actions:list[str]=[]; staff_pin:str|None=None; finalise:bool=False
 class SignatureIn(BaseModel): signer_name:str=Field(min_length=2,max_length=200); relationship:str|None=None; signature_data:str=Field(min_length=12,max_length=500000); purpose:str=Field(min_length=2,max_length=100)
@@ -188,6 +190,17 @@ def pair(body:PairComplete,response:Response,db:Session=Depends(get_db)):
 def classroom_bootstrap(d:Device=Depends(device),db:Session=Depends(get_db)):
     children=list(scoped(db,Child,d.centre_id)); active_att={x.child_id:x for x in db.scalars(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None)))}
     return {'device_id':d.id,'default_room_id':d.default_room_id,'rooms':[{'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon} for r in scoped(db,Room,d.centre_id)],'staff':[{'id':s.id,'name':(s.preferred_name or s.first_name)+' '+s.last_name[:1]+'.'} for s in scoped(db,Staff,d.centre_id) if s.active],'children':[public_child(c)|{'present':c.id in active_att,'visiting_room_id':active_att[c.id].visit_room_id if c.id in active_att and active_att[c.id].visit_ended_at is None else None} for c in children],'unread_notes':db.scalar(select(func.count()).select_from(ParentNote).where(ParentNote.centre_id==d.centre_id,ParentNote.read_at.is_(None)))}
+@app.get('/api/classroom/parent-notes')
+def classroom_parent_notes(d:Device=Depends(device),db:Session=Depends(get_db)):
+    rows=db.scalars(select(ParentNote).where(ParentNote.centre_id==d.centre_id).order_by(ParentNote.pinned.desc(),ParentNote.created_at.desc()).limit(100))
+    return [{'id':n.id,'child_id':n.child_id,'child_name':(db.get(Child,n.child_id).preferred_name or db.get(Child,n.child_id).first_name),'body':n.body,'created_at':n.created_at,'read_at':n.read_at,'pinned':n.pinned} for n in rows]
+@app.patch('/api/classroom/parent-notes/{note_id}')
+def classroom_parent_note_action(note_id:str,body:ParentNoteAction,d:Device=Depends(device),db:Session=Depends(get_db)):
+    note=db.scalar(select(ParentNote).where(ParentNote.id==note_id,ParentNote.centre_id==d.centre_id))
+    if not note:raise HTTPException(404,'Parent note not found')
+    if body.read is not None:note.read_at=now() if body.read else None
+    if body.pinned is not None:note.pinned=body.pinned
+    db.commit();return {'id':note.id,'read_at':note.read_at,'pinned':note.pinned}
 @app.post('/api/classroom/presence')
 def presence(body:PresenceIn,d:Device=Depends(device),db:Session=Depends(get_db)):
     room_for_device(db,d,body.room_id)
@@ -273,6 +286,10 @@ def sleep(body:SleepIn,d:Device=Depends(device),db:Session=Depends(get_db)):
                 if not session.fell_asleep_at or session.woke_at: raise HTTPException(409,f'{child.first_name} is not currently asleep')
                 db.add(SleepCheck(centre_id=d.centre_id,sleep_session_id=session.id,child_id=child.id,room_id=session.room_id,checked_at=when,staff_id=staff.id,warmth=body.warmth,breathing=body.breathing,wellbeing=body.wellbeing,note=body.note))
             session.updated_at=now();results.append({'child_id':child.id,'session_id':session.id,'status':sleep_status(db,session)})
+        if body.action!='check':
+            event_id='sleep-'+hashlib.sha256(f'{body.client_id}:{child.id}'.encode()).hexdigest()
+            duration_minutes=round((utc(when)-utc(session.fell_asleep_at)).total_seconds()/60) if body.action=='wake' and session.fell_asleep_at else None
+            db.add(Event(centre_id=d.centre_id,room_id=body.room_id,child_id=child.id,type='sleep',visibility='parent',effective_at=when,performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id=event_id,operation_id=body.client_id,data={'state':body.action.replace('_',' '),'duration_minutes':duration_minutes,'quality':body.quality,'wake_state':body.wake_state,'note':body.note},finalised=True))
     db.add(DomainOperation(centre_id=d.centre_id,domain='sleep',client_operation_id=body.client_id,request_fingerprint=fingerprint,result={'action':body.action,'room_id':body.room_id,'staff_id':body.staff_id,'sessions':results}))
     try: db.commit()
     except IntegrityError:
@@ -286,7 +303,12 @@ def sleep(body:SleepIn,d:Device=Depends(device),db:Session=Depends(get_db)):
 def classroom_sleep_status(d:Device=Depends(device),db:Session=Depends(get_db)):
     sessions=list(db.scalars(select(SleepSession).where(SleepSession.centre_id==d.centre_id,SleepSession.got_up_at.is_(None))))
     states=[sleep_status(db,s) for s in sessions]; worst='red' if 'red' in states else ('amber' if 'amber' in states else 'green')
-    return {'active':len(sessions),'status':worst,'sessions':[{'id':s.id,'child_id':s.child_id,'room_id':s.room_id,'status':sleep_status(db,s)} for s in sessions]}
+    items=[]
+    for s in sessions:
+        child=db.get(Child,s.child_id);last=db.scalar(select(SleepCheck).where(SleepCheck.sleep_session_id==s.id).order_by(SleepCheck.checked_at.desc()))
+        state='sleeping' if s.fell_asleep_at and not s.woke_at else ('awake_resting' if s.woke_at else 'settling')
+        items.append({'id':s.id,'child_id':s.child_id,'child_name':child.preferred_name or child.first_name,'room_id':s.room_id,'state':state,'status':sleep_status(db,s),'put_down_at':s.put_down_at,'fell_asleep_at':s.fell_asleep_at,'woke_at':s.woke_at,'last_check_at':last.checked_at if last else None,'check_interval_minutes':s.check_interval_minutes})
+    return {'active':len(sessions),'status':worst,'sessions':items}
 
 @app.post('/api/medication/authorities')
 def medication_authority(body:MedicationAuthorityIn,a:Account=Depends(admin),db:Session=Depends(get_db)):
@@ -313,7 +335,8 @@ def classroom_medications(d:Device=Depends(device),db:Session=Depends(get_db)):
     rows=[]
     for authority in db.scalars(select(MedicationAuthority).where(MedicationAuthority.centre_id==d.centre_id).order_by(MedicationAuthority.created_at.desc())):
         child=db.get(Child,authority.child_id); receipt=db.scalar(select(MedicationReceipt).where(MedicationReceipt.authority_id==authority.id,MedicationReceipt.returned_at.is_(None)).order_by(MedicationReceipt.received_at.desc()))
-        rows.append({'id':authority.id,'child_id':authority.child_id,'child_name':(child.preferred_name or child.first_name),'medication_name':authority.medication_name,'dose':authority.dose,'route':authority.route,'category':authority.category,'scheduled_times':authority.scheduled_times,'instructions':authority.instructions,'status':authority.status,'received':bool(receipt),'receipt_id':receipt.id if receipt else None})
+        latest=db.scalar(select(MedicationReceipt).where(MedicationReceipt.authority_id==authority.id).order_by(MedicationReceipt.received_at.desc()))
+        rows.append({'id':authority.id,'child_id':authority.child_id,'child_name':(child.preferred_name or child.first_name),'medication_name':authority.medication_name,'dose':authority.dose,'route':authority.route,'category':authority.category,'scheduled_times':authority.scheduled_times,'instructions':authority.instructions,'status':authority.status,'received':bool(receipt),'receipt_id':receipt.id if receipt else None,'returned_at':latest.returned_at if latest else None})
     return rows
 @app.post('/api/medication/receipts')
 def medication_receipt(body:MedicationReceiptIn,d:Device=Depends(device),db:Session=Depends(get_db)):
@@ -324,6 +347,13 @@ def medication_receipt(body:MedicationReceiptIn,d:Device=Depends(device),db:Sess
     if not (body.label_checked and body.authority_matched and body.expiry_checked): raise HTTPException(422,'All receipt safety checks must be confirmed before medication becomes active')
     if db.scalar(select(MedicationReceipt).where(MedicationReceipt.authority_id==authority.id,MedicationReceipt.returned_at.is_(None))): raise HTTPException(409,'Medication already has an active receipt')
     receipt=MedicationReceipt(centre_id=d.centre_id,authority_id=authority.id,received_by_id=staff.id,**body.model_dump(exclude={'authority_id','staff_id'}));db.add(receipt);db.commit();return {'id':receipt.id}
+
+@app.post('/api/medication/receipts/{receipt_id}/return')
+def return_medication(receipt_id:str,body:MedicationReturnIn,d:Device=Depends(device),db:Session=Depends(get_db)):
+    staff=staff_for_device(db,d,body.staff_id);receipt=db.scalar(select(MedicationReceipt).where(MedicationReceipt.id==receipt_id,MedicationReceipt.centre_id==d.centre_id))
+    if not receipt:raise HTTPException(404,'Medication receipt not found')
+    if receipt.returned_at:raise HTTPException(409,'Medication has already been returned')
+    receipt.returned_at=now();receipt.returned_to=body.returned_to;receipt.returned_by_id=staff.id;db.commit();return {'id':receipt.id,'returned_at':receipt.returned_at}
 
 def normalised_dose(value:str): return re.sub(r'\s+','',value).casefold()
 
@@ -386,7 +416,7 @@ def incident(body:IncidentIn,d:Device=Depends(device),db:Session=Depends(get_db)
     for action in body.actions:db.add(IncidentAction(incident_id=report.id,action_at=now(),description=action,staff_id=staff.id))
     if body.finalise:
         report.status='finalised';report.finalise_operation_id=body.finalise_operation_id;report.finalise_request_fingerprint=finalise_fingerprint;report.finalised_by_id=staff.id;report.finalised_at=now();event_operation='incident-'+body.finalise_operation_id
-        db.add(Event(centre_id=d.centre_id,room_id=body.room_id,child_id=child.id,type='incident',visibility='parent',effective_at=report.effective_at,performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id=event_operation,operation_id=event_operation,data={'incident_type':report.incident_type,'skin_broken':report.skin_broken,'description':report.description or '', 'involved':'another child' if report.other_child_id else None},finalised=True))
+        db.add(Event(centre_id=d.centre_id,room_id=body.room_id,child_id=child.id,type='incident',visibility='parent',effective_at=report.effective_at,performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id=event_operation,operation_id=event_operation,data={'incident_type':report.incident_type,'skin_broken':report.skin_broken,'description':report.description or '', 'body_areas':body.body_areas,'actions':body.actions,'involved':'another child' if report.other_child_id else None},finalised=True))
     try:db.commit()
     except IntegrityError:
         db.rollback();existing=db.scalar(select(Incident).where(Incident.centre_id==d.centre_id,Incident.client_draft_id==body.client_draft_id))
@@ -447,6 +477,8 @@ def seed():
         names=['Mila Chen','Theo Banks','Isla Hart','Noah Bell','Ava Patel','Leo Wright','Ella Ross','Finn Lane','Ruby King','Arlo Webb','Zoe Gray','Jack Moon','Ivy Stone','Max Reed','Luna Fox','Owen Price','Mia Lake','Kai Birch','Eva North','Sam Coast']
         children=[Child(centre_id=c.id,room_id=rooms[i%4].id,first_name=n.split()[0],last_name=n.split()[1]) for i,n in enumerate(names)];db.add_all(children);db.flush()
         p=Parent(centre_id=c.id,name='Demo Family',login='demo-parent',pin_hash=pwd.hash('123456'));db.add(p);db.flush();db.add_all([ParentChild(parent_id=p.id,child_id=children[0].id),ParentChild(parent_id=p.id,child_id=children[1].id)])
+        medicine=MedicationAuthority(centre_id=c.id,child_id=children[0].id,medication_name='Demo inhaler',dose='2 puffs',route='inhaled',category='ii',status='authorised',signer_name='Demo Parent',scheduled_times=['12:00'],instructions='Use spacer and allow normal breathing.');db.add(medicine);db.flush()
+        db.add(Signature(centre_id=c.id,parent_id=p.id,signer_name='Demo Parent',relationship='parent',domain_type='medication_authority',domain_id=medicine.id,revision=medicine.revision,purpose='medication authority',signature_data='demo-signature-not-for-production'))
         db.add(ParentNote(centre_id=c.id,child_id=children[0].id,body='Mila had a poor sleep last night and may be tired.'))
         db.commit()
     finally:db.close()

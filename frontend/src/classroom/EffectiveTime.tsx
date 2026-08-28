@@ -1,0 +1,2 @@
+import React from'react';
+export function EffectiveTime({value,onChange}:{value:string;onChange:(value:string)=>void}){return <label>Effective time <span className="inline"><button type="button" className={!value?'selected minor':'minor'} onClick={()=>onChange('')}>Now</button><input aria-label="Effective time" type="datetime-local" value={value} onChange={e=>onChange(e.target.value)}/></span></label>}

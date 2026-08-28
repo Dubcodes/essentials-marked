@@ -87,7 +87,10 @@ def test_medication_pin_is_ephemeral():
         assert client.post('/api/classroom/medication/administrations',json={**payload,'note':'changed replay'}).status_code==409
         assert db.query(MedicationAdministration).count()==1 and db.query(Event).filter(Event.type=='medicine').count()==1
         assert '1234' not in str([x.data for x in db.query(Event).all()])
-        receipt=db.query(MedicationReceipt).filter_by(authority_id=authority['id']).one();receipt.returned_at=now();db.commit()
+        receipt=db.query(MedicationReceipt).filter_by(authority_id=authority['id']).one()
+        returned=client.post(f'/api/medication/receipts/{receipt.id}/return',json={'staff_id':staff.id,'returned_to':'Demo parent'})
+        db.expire_all()
+        assert returned.status_code==200 and db.get(MedicationReceipt,receipt.id).returned_at is not None
         assert client.post('/api/classroom/medication/administrations',json={**payload,'client_operation_id':'medicine-returned-1'}).status_code==409
     finally: db.close()
 def test_current_medicine_categories_and_sleep_timer_states():
@@ -102,6 +105,10 @@ def test_current_medicine_categories_and_sleep_timer_states():
         assert client.post('/api/classroom/sleep',json={'client_id':'sleep-asleep-1','child_ids':[children[0].id],'room_id':room.id,'action':'fell_asleep','staff_id':staff.id}).status_code==200
         assert client.post('/api/classroom/sleep',json={'client_id':'sleep-wake-1','child_ids':[children[0].id],'room_id':room.id,'action':'wake','staff_id':staff.id}).status_code==200
         assert client.get('/api/classroom/sleep-status').json()['status']=='green'
+        assert client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
+        timeline=client.get(f'/api/parent/children/{children[0].id}/timeline').json()
+        assert [item['data']['state'] for item in timeline]==['put down','fell asleep','wake']
+        assert timeline[-1]['data']['duration_minutes'] is not None and all(item['data']['state']!='check' for item in timeline)
     finally: db.close()
 
 def test_sleep_state_guards_room_binding_and_bulk_idempotency():
@@ -146,8 +153,9 @@ def test_incident_draft_finalise_idempotency_and_parent_privacy():
         assert client.post('/api/classroom/incidents',json={**final,'finalise_operation_id':'incident-final-0002'}).status_code==409
         assert db.query(Event).filter(Event.type=='incident').count()==1 and db.query(IncidentAction).count()==1 and db.query(IncidentBodyArea).count()==1
         assert client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
-        wire=str(client.get(f'/api/parent/children/{children[0].id}/timeline').json())
+        parent_event=client.get(f'/api/parent/children/{children[0].id}/timeline').json()[0];wire=str(parent_event)
         assert children[1].id not in wire and children[1].first_name not in wire and 'another child' in wire
+        assert parent_event['data']['body_areas']==['head'] and parent_event['data']['actions']==['cold pack']
     finally: db.close()
 
 def test_server_session_sliding_expiry_revocation_and_rate_window():
@@ -180,7 +188,7 @@ def test_failed_pin_budget_ignores_success_and_resets_safely():
             with pytest.raises(Exception):verify_staff_pin(db,staff,'0000','bad pin')
         with pytest.raises(Exception) as blocked:verify_staff_pin(db,staff,'1234','bad pin')
         assert getattr(blocked.value,'status_code',None)==429
-        for attempt in db.query(LoginAttempt).filter_by(scope='staff_pin',key=staff.id):attempt.window_start=now()-timedelta(minutes=11)
+        for index,attempt in enumerate(db.query(LoginAttempt).filter_by(scope='staff_pin',key=staff.id)):attempt.window_start=now()-timedelta(minutes=11+index)
         db.commit();verify_staff_pin(db,staff,'1234','bad pin')
     finally:db.close()
 
