@@ -2,7 +2,7 @@
   "name": "Essentials Marked",
   "short_name": "Marked",
   "description": "Daily early-childhood care records",
-  "start_url": "/",
+  "start_url": "/classroom",
   "display": "standalone",
   "background_color": "#f7f4eb",
   "theme_color": "#176b5b",

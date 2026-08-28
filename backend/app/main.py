@@ -465,7 +465,7 @@ def seed():
         if os.getenv('DEMO_SEED','false').lower()=='true': raise RuntimeError('Production must not seed demo data')
         if 'change-me-before-production' in os.getenv('DATABASE_URL',''): raise RuntimeError('Production requires a non-example database password')
         if not os.getenv('PUBLIC_ORIGIN','').startswith('https://'): raise RuntimeError('Production requires an HTTPS PUBLIC_ORIGIN')
-    if os.getenv('DEMO_SEED','true').lower()!='true':return
+    if os.getenv('DEMO_SEED','false').lower()!='true':return
     from .db import SessionLocal
     db=SessionLocal()
     try:
