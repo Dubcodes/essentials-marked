@@ -1,11 +1,11 @@
-import os, secrets, hashlib, re
-from datetime import datetime, timedelta, timezone
+import os, secrets, hashlib, json, re
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from passlib.context import CryptContext
 from sqlalchemy import select, func, delete
 from sqlalchemy.exc import IntegrityError
@@ -62,14 +62,26 @@ def device(request: Request, db: Session=Depends(get_db)):
     if not d or d.revoked: raise HTTPException(401,'Device session revoked')
     d.last_active_at=now(); db.commit(); return d
 def scoped(db, cls, centre_id): return db.scalars(select(cls).where(cls.centre_id==centre_id))
-def rate(db: Session, scope: str, key: str):
-    """Database-backed per-identifier rate window; no untrusted proxy headers."""
+def enforce_failure_limit(db: Session, scope: str, key: str):
+    """Check recent credential failures for a server-derived identifier."""
     cutoff=now()-timedelta(minutes=10); start=now().replace(second=0,microsecond=0)
     attempts=db.scalar(select(func.coalesce(func.sum(LoginAttempt.count),0)).where(LoginAttempt.scope==scope,LoginAttempt.key==key,LoginAttempt.window_start>=cutoff))
     if attempts>=8: raise HTTPException(429,'Too many attempts; try later')
+    return start
+def record_auth_failure(db: Session, scope: str, key: str):
+    start=enforce_failure_limit(db,scope,key)
     row=db.scalar(select(LoginAttempt).where(LoginAttempt.scope==scope,LoginAttempt.key==key,LoginAttempt.window_start==start))
     if not row: row=LoginAttempt(scope=scope,key=key,window_start=start,count=0);db.add(row);db.flush()
     row.count+=1;db.commit()
+def clear_auth_failures(db: Session, scope: str, key: str):
+    db.execute(delete(LoginAttempt).where(LoginAttempt.scope==scope,LoginAttempt.key==key));db.commit()
+def verify_staff_pin(db:Session,staff:Staff,pin:str|None,detail:str):
+    enforce_failure_limit(db,'staff_pin',staff.id)
+    if not pin or not staff.pin_hash or not pwd.verify(pin,staff.pin_hash):record_auth_failure(db,'staff_pin',staff.id);raise HTTPException(403,detail)
+    clear_auth_failures(db,'staff_pin',staff.id)
+def request_fingerprint(material:dict):
+    canonical=json.dumps(material,sort_keys=True,separators=(',',':'),ensure_ascii=False,default=lambda value:value.isoformat())
+    return hashlib.sha256(canonical.encode()).hexdigest()
 def audit(db, centre, entity, entity_id, action, before=None, after=None, actor=None, reason=None): db.add(Audit(centre_id=centre,entity=entity,entity_id=entity_id,action=action,before=before,after=after,actor_id=actor,reason=reason))
 def public_child(c): return {'id':c.id,'first_name':c.preferred_name or c.first_name,'last_name':c.last_name,'room_id':c.room_id}
 def clean_domain_data(value):
@@ -91,7 +103,12 @@ class PresenceIn(BaseModel): child_id: str; room_id:str; action: Literal['arrive
 class NoteIn(BaseModel): child_id: str; body: str=Field(min_length=1,max_length=1500)
 class RoomIn(BaseModel): name: str=Field(min_length=2,max_length=100); accent: str='#176b5b'; icon: str='🌿'
 class SleepIn(BaseModel): client_id:str=Field(min_length=10,max_length=80); child_ids:list[str]=Field(min_length=1,max_length=50); room_id:str; action:Literal['put_down','fell_asleep','wake','got_up','check']; effective_at:datetime|None=None; staff_id:str; warmth:str='normal'; breathing:str='normal'; wellbeing:str='well'; note:str|None=None; quality:str|None=None; wake_state:str|None=None
-class MedicationAuthorityIn(BaseModel): child_id:str; medication_name:str; dose:str; route:str; category:Literal['i','ii']; form:str|None=None; concentration:str|None=None; frequency:str|None=None; scheduled_times:list[str]=[]; starts_on:str|None=None; ends_on:str|None=None; instructions:str|None=None; signer_name:str|None=None
+class MedicationAuthorityIn(BaseModel):
+    child_id:str; medication_name:str; dose:str; route:str; category:Literal['i','ii']; form:str|None=None; concentration:str|None=None; frequency:str|None=None; scheduled_times:list[str]=[]; starts_on:date|None=None; ends_on:date|None=None; instructions:str|None=None; signer_name:str|None=None
+    @model_validator(mode='after')
+    def valid_treatment_range(self):
+        if self.starts_on and self.ends_on and self.ends_on<self.starts_on:raise ValueError('end date must be on or after start date')
+        return self
 class MedicationReceiptIn(BaseModel): authority_id:str; staff_id:str; handed_by:str|None=None; label_checked:bool; authority_matched:bool; expiry_checked:bool; storage_location:str|None=None; quantity:str|None=None; note:str|None=None
 class MedicationAdminIn(BaseModel): client_operation_id:str=Field(min_length=10,max_length=80); authority_id:str; room_id:str; staff_id:str; staff_pin:str; outcome:Literal['given','refused','partly_taken','spat_out','vomited_afterward','missed','parent_administered','other']; dose:str; note:str|None=None; administered_at:datetime|None=None
 class IncidentIn(BaseModel): client_draft_id:str=Field(min_length=10,max_length=80); incident_id:str|None=None; finalise_operation_id:str|None=Field(default=None,min_length=10,max_length=80); child_id:str; room_id:str; staff_id:str; effective_at:datetime|None=None; environment:Literal['indoor','outdoor']|None=None; location:str|None=None; incident_type:str; other_child_id:str|None=None; skin_broken:bool=False; description:str|None=None; body_areas:list[str]=[]; actions:list[str]=[]; staff_pin:str|None=None; finalise:bool=False
@@ -101,14 +118,16 @@ class SignatureIn(BaseModel): signer_name:str=Field(min_length=2,max_length=200)
 def health(): return {'status':'ok'}
 @app.post('/api/auth/admin/login')
 def admin_login(body: Login, response: Response, request: Request, db: Session=Depends(get_db)):
-    rate(db,'admin',body.email.lower()); a=db.scalar(select(Account).where(Account.email==body.email.lower()))
-    if not a or not pwd.verify(body.password,a.password_hash): raise HTTPException(401,'Invalid credentials')
+    key=body.email.lower();enforce_failure_limit(db,'admin',key);a=db.scalar(select(Account).where(Account.email==key))
+    if not a or not pwd.verify(body.password,a.password_hash):record_auth_failure(db,'admin',key);raise HTTPException(401,'Invalid credentials')
+    clear_auth_failures(db,'admin',key)
     issue_session(response,'admin',a.id,a.centre_id,720)
     return {'centre_id':a.centre_id,'role':a.role}
 @app.post('/api/auth/parent/login')
 def parent_login(body: ParentLogin,response: Response,request:Request,db:Session=Depends(get_db)):
-    rate(db,'parent',body.login.lower()); p=db.scalar(select(Parent).where(Parent.login==body.login.lower()))
-    if not p or not pwd.verify(body.pin,p.pin_hash): raise HTTPException(401,'Invalid login or PIN')
+    key=body.login.lower();enforce_failure_limit(db,'parent',key);p=db.scalar(select(Parent).where(Parent.login==key))
+    if not p or not pwd.verify(body.pin,p.pin_hash):record_auth_failure(db,'parent',key);raise HTTPException(401,'Invalid login or PIN')
+    clear_auth_failures(db,'parent',key)
     issue_session(response,'parent',p.id,p.centre_id,43200)
     return {'ok':True}
 @app.post('/api/auth/logout')
@@ -159,15 +178,16 @@ def revoke(device_id:str,a:Account=Depends(admin),db:Session=Depends(get_db)):
 
 @app.post('/api/device/pair')
 def pair(body:PairComplete,response:Response,db:Session=Depends(get_db)):
-    rate(db,'pairing',hashlib.sha256(body.token.encode()).hexdigest())
-    p=db.scalar(select(Pairing).where(Pairing.token_hash==hashlib.sha256(body.token.encode()).hexdigest()))
+    key=hashlib.sha256(body.token.encode()).hexdigest();enforce_failure_limit(db,'pairing',key)
+    p=db.scalar(select(Pairing).where(Pairing.token_hash==key))
     expiry = p.expires_at.replace(tzinfo=timezone.utc) if p and p.expires_at.tzinfo is None else (p.expires_at if p else now())
-    if not p or p.consumed_at or expiry<now() or not secrets.compare_digest(p.challenge,body.challenge): raise HTTPException(400,'Pairing code invalid or expired')
+    if not p or p.consumed_at or expiry<now() or not secrets.compare_digest(p.challenge,body.challenge):record_auth_failure(db,'pairing',key);raise HTTPException(400,'Pairing code invalid or expired')
+    clear_auth_failures(db,'pairing',key)
     d=Device(centre_id=p.centre_id,label='Classroom tablet',default_room_id=p.room_id);p.consumed_at=now();db.add(d);db.commit();issue_session(response,'device',d.id,d.centre_id,10080);return {'id':d.id,'room_id':d.default_room_id}
 @app.get('/api/classroom/bootstrap')
 def classroom_bootstrap(d:Device=Depends(device),db:Session=Depends(get_db)):
     children=list(scoped(db,Child,d.centre_id)); active_att={x.child_id:x for x in db.scalars(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None)))}
-    return {'device_id':d.id,'default_room_id':d.default_room_id,'rooms':[{'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon} for r in scoped(db,Room,d.centre_id)],'staff':[{'id':s.id,'name':(s.preferred_name or s.first_name)+' '+s.last_name[:1]+'.'} for s in scoped(db,Staff,d.centre_id) if s.active],'children':[public_child(c)|{'present':c.id in active_att,'visiting_room_id':active_att[c.id].visit_room_id if c.id in active_att else None} for c in children],'unread_notes':db.scalar(select(func.count()).select_from(ParentNote).where(ParentNote.centre_id==d.centre_id,ParentNote.read_at.is_(None)))}
+    return {'device_id':d.id,'default_room_id':d.default_room_id,'rooms':[{'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon} for r in scoped(db,Room,d.centre_id)],'staff':[{'id':s.id,'name':(s.preferred_name or s.first_name)+' '+s.last_name[:1]+'.'} for s in scoped(db,Staff,d.centre_id) if s.active],'children':[public_child(c)|{'present':c.id in active_att,'visiting_room_id':active_att[c.id].visit_room_id if c.id in active_att and active_att[c.id].visit_ended_at is None else None} for c in children],'unread_notes':db.scalar(select(func.count()).select_from(ParentNote).where(ParentNote.centre_id==d.centre_id,ParentNote.read_at.is_(None)))}
 @app.post('/api/classroom/presence')
 def presence(body:PresenceIn,d:Device=Depends(device),db:Session=Depends(get_db)):
     room_for_device(db,d,body.room_id)
@@ -177,10 +197,14 @@ def presence(body:PresenceIn,d:Device=Depends(device),db:Session=Depends(get_db)
     if body.action=='arrive':
         if not a:a=Attendance(centre_id=d.centre_id,child_id=c.id,room_id=body.room_id,arrived_at=now());db.add(a)
     elif not a: raise HTTPException(409,'Child is not present')
-    elif body.action=='depart':a.departed_at=now();a.visit_ended_at=now() if a.visit_room_id else None
+    elif body.action=='depart':
+        a.departed_at=now()
+        if a.visit_room_id:a.last_visit_room_id=a.visit_room_id;a.visit_room_id=None;a.visit_ended_at=now()
     elif body.action=='visit':a.visit_room_id=body.room_id;a.visit_started_at=now();a.visit_ended_at=None
-    else:a.visit_ended_at=now()
-    db.commit();return {'ok':True}
+    else:
+        if not a.visit_room_id or a.visit_ended_at is not None:raise HTTPException(409,'Child has no active room visit')
+        a.last_visit_room_id=a.visit_room_id;a.visit_room_id=None;a.visit_ended_at=now()
+    db.commit();return {'ok':True,'visiting_room_id':a.visit_room_id}
 @app.post('/api/classroom/events')
 def create_event(body:EventIn,d:Device=Depends(device),db:Session=Depends(get_db)):
     room_for_device(db,d,body.room_id)
@@ -216,10 +240,10 @@ def sleep_status(db, session):
 @app.post('/api/classroom/sleep')
 def sleep(body:SleepIn,d:Device=Depends(device),db:Session=Depends(get_db)):
     room_for_device(db,d,body.room_id)
+    material=body.model_dump(mode='json',exclude={'client_id'});material['child_ids']=sorted(material['child_ids']);fingerprint=request_fingerprint(material)
     prior=db.scalar(select(DomainOperation).where(DomainOperation.centre_id==d.centre_id,DomainOperation.domain=='sleep',DomainOperation.client_operation_id==body.client_id))
     if prior:
-        prior_children={item['child_id'] for item in prior.result.get('sessions',[])}
-        if prior.result.get('action')!=body.action or prior.result.get('room_id')!=body.room_id or prior.result.get('staff_id')!=body.staff_id or prior_children!=set(body.child_ids): raise HTTPException(409,'Operation ID was already used for a different sleep request')
+        if not prior.request_fingerprint or not secrets.compare_digest(prior.request_fingerprint,fingerprint):raise HTTPException(409,'Operation ID was already used for a different sleep request')
         return {'sessions':prior.result.get('sessions',[]),'idempotent':True}
     staff=staff_for_device(db,d,body.staff_id)
     if body.action=='put_down':
@@ -249,11 +273,12 @@ def sleep(body:SleepIn,d:Device=Depends(device),db:Session=Depends(get_db)):
                 if not session.fell_asleep_at or session.woke_at: raise HTTPException(409,f'{child.first_name} is not currently asleep')
                 db.add(SleepCheck(centre_id=d.centre_id,sleep_session_id=session.id,child_id=child.id,room_id=session.room_id,checked_at=when,staff_id=staff.id,warmth=body.warmth,breathing=body.breathing,wellbeing=body.wellbeing,note=body.note))
             session.updated_at=now();results.append({'child_id':child.id,'session_id':session.id,'status':sleep_status(db,session)})
-    db.add(DomainOperation(centre_id=d.centre_id,domain='sleep',client_operation_id=body.client_id,result={'action':body.action,'room_id':body.room_id,'staff_id':body.staff_id,'sessions':results}))
+    db.add(DomainOperation(centre_id=d.centre_id,domain='sleep',client_operation_id=body.client_id,request_fingerprint=fingerprint,result={'action':body.action,'room_id':body.room_id,'staff_id':body.staff_id,'sessions':results}))
     try: db.commit()
     except IntegrityError:
         db.rollback(); prior=db.scalar(select(DomainOperation).where(DomainOperation.centre_id==d.centre_id,DomainOperation.domain=='sleep',DomainOperation.client_operation_id==body.client_id))
-        if prior and prior.result.get('action')==body.action and prior.result.get('room_id')==body.room_id and prior.result.get('staff_id')==body.staff_id and {item['child_id'] for item in prior.result.get('sessions',[])}==set(body.child_ids):return {'sessions':prior.result.get('sessions',[]),'idempotent':True}
+        if prior and prior.request_fingerprint and secrets.compare_digest(prior.request_fingerprint,fingerprint):return {'sessions':prior.result.get('sessions',[]),'idempotent':True}
+        if prior:raise HTTPException(409,'Operation ID was already used for a different sleep request')
         raise
     return {'sessions':results,'idempotent':False}
 
@@ -305,34 +330,36 @@ def normalised_dose(value:str): return re.sub(r'\s+','',value).casefold()
 @app.post('/api/classroom/medication/administrations')
 def medication_administration(body:MedicationAdminIn,d:Device=Depends(device),db:Session=Depends(get_db)):
     room_for_device(db,d,body.room_id)
+    material=body.model_dump(mode='json',exclude={'client_operation_id','staff_pin'});material['dose']=normalised_dose(body.dose);fingerprint=request_fingerprint(material)
     prior=db.scalar(select(MedicationAdministration).where(MedicationAdministration.centre_id==d.centre_id,MedicationAdministration.client_operation_id==body.client_operation_id))
     if prior:
-        prior_event=db.scalar(select(Event).where(Event.centre_id==d.centre_id,Event.client_id=='medicine-'+body.client_operation_id))
-        if prior.authority_id!=body.authority_id or prior.staff_id!=body.staff_id or prior.outcome!=body.outcome or normalised_dose(prior.dose)!=normalised_dose(body.dose) or not prior_event or prior_event.room_id!=body.room_id:raise HTTPException(409,'Operation ID was already used for a different administration')
+        if not prior.request_fingerprint or not secrets.compare_digest(prior.request_fingerprint,fingerprint):raise HTTPException(409,'Operation ID was already used for a different administration')
         return {'id':prior.id,'outcome':prior.outcome,'idempotent':True}
     staff=staff_for_device(db,d,body.staff_id)
-    rate(db,'staff_pin',staff.id)
-    if not staff.pin_hash or not pwd.verify(body.staff_pin,staff.pin_hash): raise HTTPException(403,'Incorrect staff PIN — nothing was recorded.')
+    verify_staff_pin(db,staff,body.staff_pin,'Incorrect staff PIN — nothing was recorded.')
     authority=db.scalar(select(MedicationAuthority).where(MedicationAuthority.id==body.authority_id,MedicationAuthority.centre_id==d.centre_id,MedicationAuthority.status=='authorised'))
     receipt=db.scalar(select(MedicationReceipt).where(MedicationReceipt.authority_id==body.authority_id,MedicationReceipt.centre_id==d.centre_id,MedicationReceipt.returned_at.is_(None)))
     if not authority or not receipt: raise HTTPException(409,'Medication needs an active authority and confirmed physical receipt')
-    centre=db.get(Centre,d.centre_id); administered_at=body.administered_at or now(); local_day=utc(administered_at).astimezone(ZoneInfo(centre.timezone)).date().isoformat()
+    centre=db.get(Centre,d.centre_id); administered_at=body.administered_at or now(); local_day=utc(administered_at).astimezone(ZoneInfo(centre.timezone)).date()
     if (authority.starts_on and local_day<authority.starts_on) or (authority.ends_on and local_day>authority.ends_on): raise HTTPException(409,'Administration is outside the authority treatment dates')
     if normalised_dose(body.dose)!=normalised_dose(authority.dose): raise HTTPException(409,'Dose does not exactly match the authorised dose')
-    admin=MedicationAdministration(centre_id=d.centre_id,authority_id=authority.id,child_id=authority.child_id,client_operation_id=body.client_operation_id,administered_at=administered_at,staff_id=staff.id,outcome=body.outcome,dose=authority.dose,note=body.note)
+    admin=MedicationAdministration(centre_id=d.centre_id,authority_id=authority.id,child_id=authority.child_id,client_operation_id=body.client_operation_id,request_fingerprint=fingerprint,administered_at=administered_at,staff_id=staff.id,outcome=body.outcome,dose=authority.dose,note=body.note)
     event_operation='medicine-'+body.client_operation_id
     db.add(admin);db.flush(); db.add(Event(centre_id=d.centre_id,room_id=body.room_id,child_id=authority.child_id,type='medicine',visibility='parent',effective_at=admin.administered_at,performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id=event_operation,operation_id=event_operation,data={'medication':authority.medication_name,'dose':authority.dose,'route':authority.route,'outcome':body.outcome},finalised=True))
     try:db.commit()
     except IntegrityError:
         db.rollback();prior=db.scalar(select(MedicationAdministration).where(MedicationAdministration.centre_id==d.centre_id,MedicationAdministration.client_operation_id==body.client_operation_id))
-        prior_event=db.scalar(select(Event).where(Event.centre_id==d.centre_id,Event.client_id=='medicine-'+body.client_operation_id))
-        if prior and prior.authority_id==body.authority_id and prior.staff_id==body.staff_id and prior.outcome==body.outcome and normalised_dose(prior.dose)==normalised_dose(body.dose) and prior_event and prior_event.room_id==body.room_id:return {'id':prior.id,'outcome':prior.outcome,'idempotent':True}
+        if prior and prior.request_fingerprint and secrets.compare_digest(prior.request_fingerprint,fingerprint):return {'id':prior.id,'outcome':prior.outcome,'idempotent':True}
+        if prior:raise HTTPException(409,'Operation ID was already used for a different administration')
         raise
     return {'id':admin.id,'outcome':admin.outcome,'idempotent':False}
 
 @app.post('/api/classroom/incidents')
 def incident(body:IncidentIn,d:Device=Depends(device),db:Session=Depends(get_db)):
     room_for_device(db,d,body.room_id);staff=staff_for_device(db,d,body.staff_id)
+    finalise_fingerprint=None
+    if body.finalise:
+        material=body.model_dump(mode='json',exclude={'staff_pin','finalise_operation_id'});material['body_areas']=sorted(set(material['body_areas']));finalise_fingerprint=request_fingerprint(material)
     child=db.scalar(select(Child).where(Child.id==body.child_id,Child.centre_id==d.centre_id));other=db.scalar(select(Child).where(Child.id==body.other_child_id,Child.centre_id==d.centre_id)) if body.other_child_id else None
     if not child or (body.other_child_id and not other):raise HTTPException(404,'Child not found')
     canonical_areas={'head','face','neck','chest','back','abdomen','left_arm','right_arm','left_hand','right_hand','left_leg','right_leg','left_foot','right_foot','other'}
@@ -342,14 +369,13 @@ def incident(body:IncidentIn,d:Device=Depends(device),db:Session=Depends(get_db)
     if body.incident_id and (not report or report.id!=body.incident_id):raise HTTPException(409,'Incident ID does not match this draft operation')
     if report and report.child_id!=child.id:raise HTTPException(409,'Draft operation belongs to a different child')
     if report and report.status=='finalised':
-        if body.finalise and report.finalise_operation_id==body.finalise_operation_id:return {'id':report.id,'status':report.status,'revision':report.revision,'idempotent':True}
+        if body.finalise and report.finalise_operation_id==body.finalise_operation_id and report.finalise_request_fingerprint and secrets.compare_digest(report.finalise_request_fingerprint,finalise_fingerprint):return {'id':report.id,'status':report.status,'revision':report.revision,'idempotent':True}
         raise HTTPException(409,'Incident has already been finalised')
     if body.finalise:
         if not body.finalise_operation_id:raise HTTPException(422,'A finalise operation ID is required')
         used=db.scalar(select(Incident).where(Incident.centre_id==d.centre_id,Incident.finalise_operation_id==body.finalise_operation_id))
         if used and (not report or used.id!=report.id):raise HTTPException(409,'Finalise operation ID was already used')
-        rate(db,'staff_pin',staff.id)
-        if not body.staff_pin or not staff.pin_hash or not pwd.verify(body.staff_pin,staff.pin_hash):raise HTTPException(403,'Incorrect staff PIN — incident remains a draft.')
+        verify_staff_pin(db,staff,body.staff_pin,'Incorrect staff PIN — incident remains a draft.')
     is_update=report is not None
     if not report:
         report=Incident(centre_id=d.centre_id,client_draft_id=body.client_draft_id,child_id=child.id,room_id=body.room_id,effective_at=body.effective_at or now(),incident_type=body.incident_type,status='draft',created_by_id=staff.id);db.add(report);db.flush()
@@ -359,12 +385,13 @@ def incident(body:IncidentIn,d:Device=Depends(device),db:Session=Depends(get_db)
     for area in set(body.body_areas):db.add(IncidentBodyArea(incident_id=report.id,area=area))
     for action in body.actions:db.add(IncidentAction(incident_id=report.id,action_at=now(),description=action,staff_id=staff.id))
     if body.finalise:
-        report.status='finalised';report.finalise_operation_id=body.finalise_operation_id;report.finalised_by_id=staff.id;report.finalised_at=now();event_operation='incident-'+body.finalise_operation_id
+        report.status='finalised';report.finalise_operation_id=body.finalise_operation_id;report.finalise_request_fingerprint=finalise_fingerprint;report.finalised_by_id=staff.id;report.finalised_at=now();event_operation='incident-'+body.finalise_operation_id
         db.add(Event(centre_id=d.centre_id,room_id=body.room_id,child_id=child.id,type='incident',visibility='parent',effective_at=report.effective_at,performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id=event_operation,operation_id=event_operation,data={'incident_type':report.incident_type,'skin_broken':report.skin_broken,'description':report.description or '', 'involved':'another child' if report.other_child_id else None},finalised=True))
     try:db.commit()
     except IntegrityError:
         db.rollback();existing=db.scalar(select(Incident).where(Incident.centre_id==d.centre_id,Incident.client_draft_id==body.client_draft_id))
-        if existing and existing.child_id==body.child_id and body.finalise and existing.finalise_operation_id==body.finalise_operation_id:return {'id':existing.id,'status':existing.status,'revision':existing.revision,'idempotent':True}
+        if existing and existing.child_id==body.child_id and body.finalise and existing.finalise_operation_id==body.finalise_operation_id and existing.finalise_request_fingerprint and secrets.compare_digest(existing.finalise_request_fingerprint,finalise_fingerprint):return {'id':existing.id,'status':existing.status,'revision':existing.revision,'idempotent':True}
+        if existing:raise HTTPException(409,'Incident operation conflicts with an existing request')
         raise
     return {'id':report.id,'status':report.status,'revision':report.revision,'idempotent':False}
 

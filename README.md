@@ -16,7 +16,7 @@ Essentials Marked is a focused browser application for recording daily early-chi
 
 ## Run locally
 
-Use Node 22 for the supported frontend toolchain and Docker Desktop with Linux containers.
+The reproducible web image is pinned to Node 22. Local frontend checks are supported on Node 22 through 24; this release was also verified on Node 24. Use Docker Desktop with Linux containers for the full stack.
 
 ```sh
 copy .env.example .env
@@ -33,15 +33,22 @@ Open `http://localhost:8088`. The checked-in example is explicitly **development
 
 Set `APP_ENV=production`, a unique 32+ character `SECRET_KEY`, a non-trivial database password, `COOKIE_SECURE=true`, the exact HTTPS `PUBLIC_ORIGIN`, and `DEMO_SEED=false`. Production startup rejects the default secret, insecure cookies and demo seeding. Terminate HTTPS at a trusted reverse proxy/Cloudflare Tunnel and do not forward untrusted client-IP headers as an identity source.
 
+The API container runs `alembic upgrade head` before starting Uvicorn. PostgreSQL and uploaded media use the named `postgres_data` and `media_data` volumes; treat migration, database backup and media backup as one deployment procedure.
+
 ## Validation
 
 ```sh
 cd backend && python -m pytest -q -p no:cacheprovider
-cd frontend && npm ci && npm run build
+cd frontend && npm ci && npm test && npm run typecheck && npm run build
+docker compose config --quiet
 docker compose up --build
 ```
 
 `package-lock.json` is committed and the Docker web image uses `npm ci` for deterministic installs.
+
+### Development-tool audit status
+
+Vite 5.4.21 and Vitest 2.1.9 include the low-risk fixes available on their current release lines. `npm audit` still reports five findings inherited through the Vite/Vitest development servers (three moderate, one high and one critical); the registry currently offers only major-version upgrades to clear them. Those servers are not shipped in the production image—the compiled static assets are served by Nginx—and Vitest is run in one-shot CLI mode without its UI/API server. Major toolchain upgrades are deferred to a dedicated compatibility pass.
 
 ## Backups and retention
 

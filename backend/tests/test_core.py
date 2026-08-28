@@ -1,13 +1,14 @@
 import os
+import hashlib
 from datetime import timedelta
 import pytest
 os.environ['DATABASE_URL']='sqlite:///./test.db'
 os.environ['DEMO_SEED']='false'
 from fastapi.testclient import TestClient
 import app.main as main_module
-from app.main import app, pwd, rate
+from app.main import app, pwd, enforce_failure_limit, record_auth_failure, verify_staff_pin
 from app.db import Base, engine, SessionLocal
-from app.models import Centre, Account, Room, Staff, Child, Parent, ParentChild, Event, MedicationAuthority, MedicationAdministration, MedicationReceipt, Signature, SleepSession, SleepCheck, Incident, IncidentAction, IncidentBodyArea, LoginAttempt, AppSession, now
+from app.models import Centre, Account, Room, Staff, Child, Parent, ParentChild, Attendance, Event, MedicationAuthority, MedicationAdministration, MedicationReceipt, Signature, SleepSession, SleepCheck, Incident, IncidentAction, IncidentBodyArea, LoginAttempt, AppSession, now
 
 def setup():
     Base.metadata.drop_all(engine);Base.metadata.create_all(engine);db=SessionLocal()
@@ -43,11 +44,31 @@ def test_room_validation_bulk_retry_and_pin_never_persisted():
         assert '1234' not in str([x.data for x in db.query(Event).all()])
         payload['client_id']='cross-centre-123';payload['room_id']=other_room.id;assert client.post('/api/classroom/events',json=payload).status_code==404
     finally: db.close()
+
+def test_ended_room_visit_is_cleared_and_stays_cleared_after_bootstrap():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        visiting=Room(centre_id=centre.id,name='Visiting Room');children[0].room_id=room.id;db.add(visiting);db.commit()
+        client=TestClient(app);paired(client,room);child=children[0]
+        assert client.post('/api/classroom/presence',json={'child_id':child.id,'room_id':room.id,'action':'arrive'}).status_code==200
+        assert client.post('/api/classroom/presence',json={'child_id':child.id,'room_id':visiting.id,'action':'visit'}).status_code==200
+        during=next(item for item in client.get('/api/classroom/bootstrap').json()['children'] if item['id']==child.id)
+        assert during['present'] and during['visiting_room_id']==visiting.id
+        ended=client.post('/api/classroom/presence',json={'child_id':child.id,'room_id':visiting.id,'action':'end_visit'})
+        assert ended.status_code==200 and ended.json()['visiting_room_id'] is None
+        attendance=db.query(Attendance).filter_by(child_id=child.id).one();db.refresh(attendance)
+        assert attendance.visit_room_id is None and attendance.last_visit_room_id==visiting.id and attendance.visit_ended_at is not None
+        refreshed=next(item for item in client.get('/api/classroom/bootstrap').json()['children'] if item['id']==child.id)
+        assert refreshed['visiting_room_id'] is None and refreshed['room_id']==room.id and refreshed['present']
+    finally:db.close()
 def test_medication_pin_is_ephemeral():
     db,centre,account,room,other_room,staff,children,parent=setup()
     try:
         client=TestClient(app);paired(client,room)
-        authority=client.post('/api/medication/authorities',json={'child_id':children[0].id,'medication_name':'Demo medicine','dose':'5ml','route':'oral','category':'ii','signer_name':'Forged Admin Signature'}).json()
+        assert client.post('/api/medication/authorities',json={'child_id':children[0].id,'medication_name':'Bad date','dose':'5ml','route':'oral','category':'ii','starts_on':'not-a-date'}).status_code==422
+        assert client.post('/api/medication/authorities',json={'child_id':children[0].id,'medication_name':'Bad range','dose':'5ml','route':'oral','category':'ii','starts_on':'2030-01-02','ends_on':'2030-01-01'}).status_code==422
+        today=now().date();start=today-timedelta(days=1);end=today+timedelta(days=1)
+        authority=client.post('/api/medication/authorities',json={'child_id':children[0].id,'medication_name':'Demo medicine','dose':'5ml','route':'oral','category':'ii','signer_name':'Forged Admin Signature','starts_on':start.isoformat(),'ends_on':end.isoformat()}).json()
         assert authority['status']=='draft'
         assert client.post('/api/medication/receipts',json={'authority_id':authority['id'],'staff_id':staff.id,'label_checked':True,'authority_matched':True,'expiry_checked':True}).status_code==409
         assert client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
@@ -55,16 +76,19 @@ def test_medication_pin_is_ephemeral():
         assert signed.status_code==200 and db.query(Signature).count()==1
         assert client.post('/api/medication/receipts',json={'authority_id':authority['id'],'staff_id':staff.id,'label_checked':True,'authority_matched':True,'expiry_checked':True}).status_code==200
         assert client.post('/api/medication/receipts',json={'authority_id':authority['id'],'staff_id':staff.id,'label_checked':True,'authority_matched':True,'expiry_checked':True}).status_code==409
-        row=db.get(MedicationAuthority,authority['id']);row.ends_on='2000-01-01';db.commit()
-        assert client.post('/api/classroom/medication/administrations',json={'client_operation_id':'medicine-date-bad1','authority_id':authority['id'],'room_id':room.id,'staff_id':staff.id,'staff_pin':'1234','outcome':'given','dose':'5ml'}).status_code==409
-        row.ends_on=None;db.commit()
+        before=(start-timedelta(days=2)).isoformat()+'T12:00:00Z';after=(end+timedelta(days=2)).isoformat()+'T12:00:00Z'
+        assert client.post('/api/classroom/medication/administrations',json={'client_operation_id':'medicine-date-before','authority_id':authority['id'],'room_id':room.id,'staff_id':staff.id,'staff_pin':'1234','outcome':'given','dose':'5ml','administered_at':before}).status_code==409
+        assert client.post('/api/classroom/medication/administrations',json={'client_operation_id':'medicine-date-after1','authority_id':authority['id'],'room_id':room.id,'staff_id':staff.id,'staff_pin':'1234','outcome':'given','dose':'5ml','administered_at':after}).status_code==409
         bad=client.post('/api/classroom/medication/administrations',json={'client_operation_id':'medicine-op-bad-1','authority_id':authority['id'],'room_id':room.id,'staff_id':staff.id,'staff_pin':'0000','outcome':'given','dose':'5ml'});assert bad.status_code==403
         assert client.post('/api/classroom/medication/administrations',json={'client_operation_id':'medicine-dose-bad','authority_id':authority['id'],'room_id':room.id,'staff_id':staff.id,'staff_pin':'1234','outcome':'given','dose':'6ml'}).status_code==409
         payload={'client_operation_id':'medicine-op-good-1','authority_id':authority['id'],'room_id':room.id,'staff_id':staff.id,'staff_pin':'1234','outcome':'given','dose':'5 ml'}
         ok=client.post('/api/classroom/medication/administrations',json=payload);assert ok.status_code==200 and '1234' not in ok.text
         retry=client.post('/api/classroom/medication/administrations',json=payload);assert retry.status_code==200 and retry.json()['idempotent']
+        assert client.post('/api/classroom/medication/administrations',json={**payload,'note':'changed replay'}).status_code==409
         assert db.query(MedicationAdministration).count()==1 and db.query(Event).filter(Event.type=='medicine').count()==1
         assert '1234' not in str([x.data for x in db.query(Event).all()])
+        receipt=db.query(MedicationReceipt).filter_by(authority_id=authority['id']).one();receipt.returned_at=now();db.commit()
+        assert client.post('/api/classroom/medication/administrations',json={**payload,'client_operation_id':'medicine-returned-1'}).status_code==409
     finally: db.close()
 def test_current_medicine_categories_and_sleep_timer_states():
     db,centre,account,room,other_room,staff,children,parent=setup()
@@ -97,6 +121,7 @@ def test_sleep_state_guards_room_binding_and_bulk_idempotency():
         check={**base,'client_id':'sleep-bulk-check-01','action':'check'}
         assert client.post('/api/classroom/sleep',json=check).status_code==200
         assert client.post('/api/classroom/sleep',json=check).json()['idempotent']
+        assert client.post('/api/classroom/sleep',json={**check,'note':'changed replay'}).status_code==409
         assert db.query(SleepCheck).count()==2
         assert client.post('/api/classroom/sleep',json={**base,'client_id':'sleep-bulk-wake-01','action':'wake'}).status_code==200
         assert client.post('/api/classroom/sleep',json={**base,'client_id':'sleep-check-after-wake','action':'check'}).status_code==409
@@ -117,6 +142,7 @@ def test_incident_draft_finalise_idempotency_and_parent_privacy():
         final={**updated,'finalise':True,'finalise_operation_id':'incident-final-0001','staff_pin':'1234'}
         result=client.post('/api/classroom/incidents',json=final);assert result.status_code==200 and result.json()['status']=='finalised'
         retry=client.post('/api/classroom/incidents',json=final);assert retry.status_code==200 and retry.json()['idempotent']
+        assert client.post('/api/classroom/incidents',json={**final,'description':'Changed after finalisation'}).status_code==409
         assert client.post('/api/classroom/incidents',json={**final,'finalise_operation_id':'incident-final-0002'}).status_code==409
         assert db.query(Event).filter(Event.type=='incident').count()==1 and db.query(IncidentAction).count()==1 and db.query(IncidentBodyArea).count()==1
         assert client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
@@ -133,13 +159,46 @@ def test_server_session_sliding_expiry_revocation_and_rate_window():
         assert client.get('/api/admin/bootstrap').status_code==200
         db.refresh(session);assert session.expires_at>before
         session.revoked_at=now();db.commit();assert client.get('/api/admin/bootstrap').status_code==401
-        for _ in range(8):rate(db,'focused-test','same-key')
+        for _ in range(8):record_auth_failure(db,'focused-test','same-key')
         with pytest.raises(Exception) as blocked:
-            rate(db,'focused-test','same-key')
+            enforce_failure_limit(db,'focused-test','same-key')
         assert getattr(blocked.value,'status_code',None)==429
         for attempt in db.query(LoginAttempt).filter_by(scope='focused-test',key='same-key'):attempt.window_start=now()-timedelta(minutes=11)
-        db.commit();rate(db,'focused-test','same-key')
+        db.commit();enforce_failure_limit(db,'focused-test','same-key')
     finally: db.close()
+
+def test_failed_pin_budget_ignores_success_and_resets_safely():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        for _ in range(3):
+            with pytest.raises(Exception) as denied:verify_staff_pin(db,staff,'0000','bad pin')
+            assert getattr(denied.value,'status_code',None)==403
+        verify_staff_pin(db,staff,'1234','bad pin')
+        assert db.query(LoginAttempt).filter_by(scope='staff_pin',key=staff.id).count()==0
+        for _ in range(12):verify_staff_pin(db,staff,'1234','bad pin')
+        for _ in range(8):
+            with pytest.raises(Exception):verify_staff_pin(db,staff,'0000','bad pin')
+        with pytest.raises(Exception) as blocked:verify_staff_pin(db,staff,'1234','bad pin')
+        assert getattr(blocked.value,'status_code',None)==429
+        for attempt in db.query(LoginAttempt).filter_by(scope='staff_pin',key=staff.id):attempt.window_start=now()-timedelta(minutes=11)
+        db.commit();verify_staff_pin(db,staff,'1234','bad pin')
+    finally:db.close()
+
+def test_successful_admin_parent_and_pairing_auth_clear_failures():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app)
+        for _ in range(2):assert client.post('/api/auth/admin/login',json={'email':'a@test','password':'wrong'}).status_code==401
+        assert client.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+        assert db.query(LoginAttempt).filter_by(scope='admin',key='a@test').count()==0
+        for _ in range(2):assert client.post('/api/auth/parent/login',json={'login':'p','pin':'000000'}).status_code==401
+        assert client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
+        assert db.query(LoginAttempt).filter_by(scope='parent',key='p').count()==0
+        pairing=client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Rate-test tablet'}).json()
+        for _ in range(2):assert client.post('/api/device/pair',json={'token':pairing['token'],'challenge':'000'}).status_code==400
+        assert client.post('/api/device/pair',json={'token':pairing['token'],'challenge':pairing['challenge']}).status_code==200
+        key=hashlib.sha256(pairing['token'].encode()).hexdigest();assert db.query(LoginAttempt).filter_by(scope='pairing',key=key).count()==0
+    finally:db.close()
 
 def test_production_startup_guard_rejects_defaults(monkeypatch):
     monkeypatch.setattr(main_module,'APP_ENV','production');monkeypatch.setattr(main_module,'SECRET','development-only-change-me');monkeypatch.setattr(main_module,'secure_cookie',False)
