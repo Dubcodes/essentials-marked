@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from passlib.context import CryptContext
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .db import get_db
@@ -230,7 +230,7 @@ def create_event(body:EventIn,d:Device=Depends(device),db:Session=Depends(get_db
     items=[]
     visibility='staff' if body.type=='staff_note' else 'parent'; data=clean_domain_data(body.data)
     for c in children:
-        e=Event(centre_id=d.centre_id,room_id=body.room_id,child_id=c.id,type=body.type,visibility=visibility,effective_at=body.effective_at or now(),performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id=body.client_id+'-'+c.id,operation_id=body.client_id,data=data,finalised=False);db.add(e);items.append(e)
+        e=Event(centre_id=d.centre_id,room_id=body.room_id,child_id=c.id,type=body.type,visibility=visibility,effective_at=body.effective_at or now(),performed_by_id=staff.id,recorded_by_id=staff.id,device_id=d.id,client_id=hashlib.sha256(f'{body.client_id}:{c.id}'.encode()).hexdigest(),operation_id=body.client_id,data=data,finalised=False);db.add(e);items.append(e)
     try:db.commit()
     except Exception:
         db.rollback(); existing=list(db.scalars(select(Event).where(Event.centre_id==d.centre_id,Event.operation_id==body.client_id).order_by(Event.child_id)));
@@ -441,6 +441,141 @@ def timeline(child_id:str,day:str|None=None,p:Parent=Depends(parent),db:Session=
     start=datetime.combine(target,datetime.min.time(),tzinfo=zone).astimezone(timezone.utc); end=datetime.combine(target+timedelta(days=1),datetime.min.time(),tzinfo=zone).astimezone(timezone.utc)
     q=select(Event).where(Event.centre_id==p.centre_id,Event.child_id==child_id,Event.visibility=='parent',Event.effective_at>=start,Event.effective_at<end).order_by(Event.effective_at)
     return [event_out(e,db) for e in db.scalars(q)]
+
+@app.get('/api/parent/children/{child_id}/day')
+def parent_day(child_id:str,day:str|None=None,p:Parent=Depends(parent),db:Session=Depends(get_db)):
+    accessible=db.scalar(
+        select(ParentChild).where(
+            ParentChild.parent_id==p.id,
+            ParentChild.child_id==child_id
+        )
+    )
+    if not accessible:
+        raise HTTPException(404,'Child not found')
+
+    centre=db.get(Centre,p.centre_id)
+    zone=ZoneInfo(centre.timezone)
+
+    target=(
+        datetime.fromisoformat(day).date()
+        if day
+        else now().astimezone(zone).date()
+    )
+
+    today=now().astimezone(zone).date()
+    oldest=today-timedelta(days=centre.parent_history_days-1)
+
+    if target<oldest or target>today:
+        raise HTTPException(
+            403,
+            'This date is outside the family history window'
+        )
+
+    start=datetime.combine(
+        target,
+        datetime.min.time(),
+        tzinfo=zone
+    ).astimezone(timezone.utc)
+
+    end=datetime.combine(
+        target+timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=zone
+    ).astimezone(timezone.utc)
+
+    attendance=list(
+        db.scalars(
+            select(Attendance)
+            .where(
+                Attendance.centre_id==p.centre_id,
+                Attendance.child_id==child_id,
+                Attendance.arrived_at<end,
+                or_(
+                    Attendance.departed_at.is_(None),
+                    Attendance.departed_at>=start
+                )
+            )
+            .order_by(Attendance.arrived_at)
+        )
+    )
+
+    sleeps=list(
+        db.scalars(
+            select(SleepSession)
+            .where(
+                SleepSession.centre_id==p.centre_id,
+                SleepSession.child_id==child_id,
+                SleepSession.put_down_at<end,
+                or_(
+                    SleepSession.got_up_at.is_(None),
+                    SleepSession.got_up_at>=start
+                )
+            )
+            .order_by(SleepSession.put_down_at)
+        )
+    )
+
+    events=list(
+        db.scalars(
+            select(Event)
+            .where(
+                Event.centre_id==p.centre_id,
+                Event.child_id==child_id,
+                Event.visibility=='parent',
+                Event.type!='sleep',
+                Event.effective_at>=start,
+                Event.effective_at<end
+            )
+            .order_by(Event.effective_at)
+        )
+    )
+
+    attendance_out=[]
+
+    for a in attendance:
+        room=db.get(Room,a.room_id) if a.room_id else None
+        attendance_out.append({
+            'id':a.id,
+            'arrived_at':a.arrived_at,
+            'departed_at':a.departed_at,
+            'room':room.name if room else None
+        })
+
+    sleep_out=[]
+
+    for s in sleeps:
+        room=db.get(Room,s.room_id) if s.room_id else None
+
+        duration=None
+
+        if s.fell_asleep_at and s.woke_at:
+            seconds=(
+                utc(s.woke_at)-utc(s.fell_asleep_at)
+            ).total_seconds()
+
+            if seconds>=0:
+                duration=round(seconds/60)
+
+        sleep_out.append({
+            'id':s.id,
+            'put_down_at':s.put_down_at,
+            'fell_asleep_at':s.fell_asleep_at,
+            'woke_at':s.woke_at,
+            'got_up_at':s.got_up_at,
+            'duration_minutes':duration,
+            'quality':s.quality,
+            'wake_state':s.wake_state,
+            'note':s.note,
+            'room':room.name if room else None
+        })
+
+    return {
+        'date':target.isoformat(),
+        'attendance':attendance_out,
+        'sleep_sessions':sleep_out,
+        'events':[event_out(e,db) for e in events]
+    }
+
 @app.post('/api/parent/notes')
 def parent_note(body:NoteIn,p:Parent=Depends(parent),db:Session=Depends(get_db)):
     if not db.scalar(select(ParentChild).where(ParentChild.parent_id==p.id,ParentChild.child_id==body.child_id)):raise HTTPException(404,'Child not found')
