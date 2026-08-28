@@ -1,0 +1,46 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-essentials_marked}
+      POSTGRES_USER: ${POSTGRES_USER:-essentials}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-before-production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://essentials:change-me-before-production@db:5432/essentials_marked}
+      SECRET_KEY: ${SECRET_KEY:-development-only-change-me}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      DEMO_SEED: ${DEMO_SEED:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; assert urlopen('http://localhost:8000/api/health').status == 200"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  web:
+    build: ./frontend
+    ports:
+      - "${PUBLIC_PORT:-8088}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/healthz | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+volumes:
+  postgres_data:
+  media_data:
