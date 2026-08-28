@@ -1,61 +1,54 @@
 # Essentials Marked
 
-Essentials Marked is a focused, browser-based daily-care recording system for early-childhood classrooms. It supports fast care entries, room-console attribution, parent daily records and a small operational admin surface. It deliberately does not replace enrolment administration, learning stories, chat, payroll or emergency systems.
+Essentials Marked is a focused browser application for recording daily early-childhood care. It supports classroom tablet operations, a small parent daily record and a centre admin view. It is not an enrolment, learning-story, messaging, payroll or emergency-management system.
 
-## Architecture
+## Current foundation
 
-- **Web:** React + TypeScript + Vite single-page interface, served by Nginx.
-- **API:** FastAPI + SQLAlchemy 2 with tenant-scoped records and Alembic migration.
-- **Data:** PostgreSQL 16 with a persistent Docker volume; media volume is reserved for validated uploads.
-- **Deployment:** Three services in `docker-compose.yml`: `web`, `api`, and `db`. Nginx serves same-origin `/api` requests, so cookies are not exposed to cross-origin browser scripts.
+- React 18/Vite 5 front end; FastAPI/SQLAlchemy 2 API; PostgreSQL 16; Nginx same-origin proxy.
+- Explicit Alembic schema migration. The earlier prototype database must be reset before this version: development data is disposable.
+- Centre-scoped rooms, children, staff, parents, devices, attendance and events.
+- Server-side, revocable sliding sessions: device inactivity defaults to seven days, parent to 30 days, admin to 12 hours.
+- Bcrypt password/PIN hashes. Staff PINs are transient verification secrets and are stripped from all ordinary domain payloads and local outbox records.
+- Fast nappy/toilet, food, sunscreen, staff note, supply, attendance and room-presence event APIs; room selection is sent and validated per operation.
+- Explicit sleep-session/check, medicine authority/receipt/administration and incident domain APIs.
+- Parent child-scoped timeline/export. Staff-only notes are filtered by the server and never exported.
+- IndexedDB outbox and draft-store foundation. Only offline/network failures and 502/503/504 ordinary event failures are queued; 401/403/409/422 operations are not queued.
 
-## Quick start
+## Run locally
+
+Use Node 22 for the supported frontend toolchain and Docker Desktop with Linux containers.
 
 ```sh
 copy .env.example .env
 docker compose up --build
 ```
 
-Open `http://localhost:8088`. Development-only seeded credentials:
+Open `http://localhost:8088`. The checked-in example is explicitly **development only** and sets demo seed data:
 
 - Admin: `admin@demo.local` / `ChangeMe123!`
 - Parent: `demo-parent` / `123456`
-- Sample staff PINs: Sarah `1234`, Michael `2345`, Aroha `3456`
+- Staff PINs: Sarah `1234`, Michael `2345`, Aroha `3456`
 
-Set a unique `SECRET_KEY`, database password and `COOKIE_SECURE=true` behind HTTPS before any real deployment. Set `DEMO_SEED=false` for a production database. Portainer can deploy the same compose file after setting environment values.
+## Production checklist
 
-## Workflows included
+Set `APP_ENV=production`, a unique 32+ character `SECRET_KEY`, a non-trivial database password, `COOKIE_SECURE=true`, the exact HTTPS `PUBLIC_ORIGIN`, and `DEMO_SEED=false`. Production startup rejects the default secret, insecure cookies and demo seeding. Terminate HTTPS at a trusted reverse proxy/Cloudflare Tunnel and do not forward untrusted client-IP headers as an identity source.
 
-- Secure classroom pairing tokens: 60-second expiry, single use, visual challenge and remote device revocation.
-- Persistent room-console state: room and selected staff are distinct; ordinary events have quick touch forms.
-- Nappy/toilet, food, sunscreen, sleep start/end/check, medicine, incident, staff note and supply event APIs.
-- Multiple-child entry, present-child selection, actual attendance and temporary room visits.
-- Performed-by and recorded-by staff attribution. Admin correction creates a separate audit row instead of overwriting history; finalised medicine/incident records reject bulk-style attribution corrections.
-- Parent sign-in, many-to-many child access, chronological daily timeline, operational note submission and access-controlled CSV export.
-- IndexedDB write queue in the classroom UI. New ordinary events receive a browser UUID, persist locally when offline, retry on reconnection, and use server-side idempotency keys.
-
-## Operations and backup
-
-Back up the PostgreSQL volume and `media_data` volume together. For a compose deployment, operators can run `docker compose exec db pg_dump -U essentials essentials_marked > essentials-marked.sql` from a trusted host, then test restoring into a separate database. Never store backups in publicly readable locations.
-
-## Security notes
-
-Credentials and staff PINs use Argon2 hashes. Sessions are HttpOnly, SameSite cookies and device sessions can be revoked. API queries scope objects to the authenticated centre; parent child IDs are checked against the parent-child relation. Login attempts have basic per-process rate limiting. Production still needs HTTPS, a persistent/distributed rate limiter, secret management, database backups, CSP tuning, upload routes with image validation, and an independent privacy/compliance assessment.
-
-## Development and test
+## Validation
 
 ```sh
-cd backend && python -m pytest
-cd frontend && npm install && npm run build
+cd backend && python -m pytest -q -p no:cacheprovider
+cd frontend && npm ci && npm run build
 docker compose up --build
 ```
 
-The test suite covers parent object access, high-consequence PIN enforcement and idempotent retry. The first demo uses fictional names only.
+`package-lock.json` is committed and the Docker web image uses `npm ci` for deterministic installs.
 
-## Project layout
+## Backups and retention
 
-`backend/` contains the FastAPI application, models, migration and tests. `frontend/` contains the tablet, parent and admin SPA. `docs/compliance/NZ-ECE-COMPLIANCE.md` contains the NZ guidance review and its source links.
+Back up PostgreSQL and the `media_data` volume together; back up deployment configuration/secrets separately. Example: `docker compose exec db pg_dump -U essentials essentials_marked > essentials-marked.sql`. Test restoration to a separate database. Parent viewing history is configurable and separate from internal record retention; this build does not automatically delete regulated records.
 
-## Known first-version limitations
+## Important limitations before live-centre use
 
-This is a strong operational demo foundation, not a legal-compliance certification. The current UI exposes the common teacher workflow and core data paths, but full incident/medication authority capture, signature canvas and revision acknowledgement, image uploads/import wizard, configurable retention administration, exhaustive admin CRUD, service-worker cache, and production-grade shared rate limiting remain the highest-priority additions before live-centre use. Validate workflow speed on actual tablets with educators before trialling it.
+The domain APIs are a foundation, not a completed regulatory product. The UI does not yet expose the complete medication authority/receipt/return, incident body-map/signature/notification, import, media-upload or comprehensive admin CRUD flows. Offline ordinary events are queued, but medication and incident finalisation intentionally do not queue because a PIN cannot safely be stored. Run hands-on teacher tablet sessions, conduct an independent privacy/compliance review, complete backup/recovery testing and verify current licensing requirements before any live trial.
+
+See [NZ ECE implementation matrix](docs/compliance/NZ-ECE-COMPLIANCE.md) for sources, implementation status and limitations.

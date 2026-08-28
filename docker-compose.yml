@@ -17,8 +17,10 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://essentials:change-me-before-production@db:5432/essentials_marked}
       SECRET_KEY: ${SECRET_KEY:-development-only-change-me}
+      APP_ENV: ${APP_ENV:-development}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
-      DEMO_SEED: ${DEMO_SEED:-true}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://localhost:8088}
+      DEMO_SEED: ${DEMO_SEED:-false}
     depends_on:
       db:
         condition: service_healthy

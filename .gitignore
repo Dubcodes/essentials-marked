@@ -5,5 +5,8 @@ __pycache__/
 .coverage
 node_modules/
 dist/
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
 media/
 .DS_Store
