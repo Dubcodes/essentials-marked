@@ -443,7 +443,7 @@ def timeline(child_id:str,day:str|None=None,p:Parent=Depends(parent),db:Session=
     return [event_out(e,db) for e in db.scalars(q)]
 
 @app.get('/api/parent/children/{child_id}/day')
-def parent_day(child_id:str,day:str|None=None,p:Parent=Depends(parent),db:Session=Depends(get_db)):
+def parent_day(child_id:str,day:date|None=None,p:Parent=Depends(parent),db:Session=Depends(get_db)):
     accessible=db.scalar(
         select(ParentChild).where(
             ParentChild.parent_id==p.id,
@@ -457,7 +457,7 @@ def parent_day(child_id:str,day:str|None=None,p:Parent=Depends(parent),db:Sessio
     zone=ZoneInfo(centre.timezone)
 
     target=(
-        datetime.fromisoformat(day).date()
+        day
         if day
         else now().astimezone(zone).date()
     )
