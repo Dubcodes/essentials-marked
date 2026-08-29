@@ -269,7 +269,7 @@ def test_parent_selected_day_export_matches_attendance_sleep_and_care():
         for op,action in [('export-sleep-put-01','put_down'),('export-sleep-asleep','fell_asleep'),('export-sleep-wake01','wake'),('export-sleep-gotup1','got_up')]:assert client.post('/api/classroom/sleep',json={**common,'client_id':op,'action':action}).status_code==200
         assert client.post('/api/classroom/presence',json={**presence,'action':'depart'}).status_code==200
         assert client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
-        csv=client.get(f'/api/parent/children/{child.id}/export?day={now().date().isoformat()}').text
+        csv=client.get(f'/api/parent/children/{child.id}/export?day={client.get("/api/parent/me").json()["today"]}').text
         assert 'Drop off' in csv and 'Pick up' in csv and 'Sleep' in csv and 'Food' in csv and 'Pasta' in csv
     finally:db.close()
 
