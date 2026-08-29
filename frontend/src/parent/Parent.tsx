@@ -51,6 +51,7 @@ const icons:Record<string,string>={
   incident:'⚠',
   staff_note:'📝'
 };
+export const canRequestOlderRecord=(status?:number,message='')=>status===403&&message.includes('history window');
 
 function time(value?:string|null){
   if(!value)return '—';
@@ -171,6 +172,7 @@ function eventDetail(event:CareEvent){
           ? d.body_areas.map(niceArea).join(', ')
           : null,
         d.involved
+        ,Array.isArray(d.actions)?d.actions.map((a:any)=>`${a.action_at?time(a.action_at):'time recorded'} ${a.description||a}`).join(', '):null
       ].filter(Boolean).join(' · ');
 
     default:
@@ -373,11 +375,14 @@ export default function ParentView(){
   const[login,setLogin]=useState(false);
   const[note,setNote]=useState('');
   const[error,setError]=useState('');
+  const[errorStatus,setErrorStatus]=useState<number>();
+  const[requestState,setRequestState]=useState<'idle'|'sending'|'sent'>('idle');
 
   useEffect(()=>{
     void api('/parent/me')
       .then(me=>{
         setData(me);
+        if(!new URLSearchParams(location.search).get('day')&&me.today)setDay(me.today);
 
         const requested=
           new URLSearchParams(location.search)
@@ -407,12 +412,13 @@ export default function ParentView(){
 
     setRecord(undefined);
     setError('');
+    setErrorStatus(undefined);setRequestState('idle');
 
     void api(
       `/parent/children/${child}/day?day=${day}`
     )
       .then(setRecord)
-      .catch(e=>setError(e.message));
+      .catch(e=>{setError(e.message);setErrorStatus(e.status)});
 
     localStorage.setItem('parent-child',child);
     updateLocation(child,day);
@@ -516,16 +522,15 @@ export default function ParentView(){
       (c:Child)=>c.id===child
     );
 
-  const today=todayString();
+  const today=data.today||todayString();
 
   return(
     <main className="parent parent-day">
       <header>
-        <strong>
-          Essentials <i>Marked</i>
-        </strong>
-
-        <span>{data.centre}</span>
+        {data.logo_url&&<img className="brand-logo" src={data.logo_url} alt=""/>}
+        <strong>{data.display_name||<>Essentials <i>Marked</i></>}</strong>
+        <span>{data.secondary_text||data.centre}</span>
+        <button className="minor" onClick={()=>void api('/auth/logout',{method:'POST'}).finally(()=>location.reload())}>Sign out</button>
       </header>
 
       <nav className="parent-child-tabs">
@@ -587,9 +592,7 @@ export default function ParentView(){
       </section>
 
       {error&&
-        <p className="error parent-status">
-          {error}
-        </p>
+        <section className="parent-status"><p className="error">{error}</p>{errorStatus===403&&error.includes('history window')&&<>{requestState==='sent'?<p className="notice">Request sent to the centre.</p>:<><p>Older records can be requested from the centre.</p><button disabled={requestState==='sending'} onClick={()=>{setRequestState('sending');void api('/parent/data-requests',{method:'POST',body:JSON.stringify({child_id:child,start_date:day,end_date:day,note:'Requested from daily record view'})}).then(()=>setRequestState('sent')).catch(e=>{setRequestState('idle');setError(e.message);setErrorStatus(e.status)})}}>{requestState==='sending'?'Sending…':'Request this date'}</button></>}</>}</section>
       }
 
       {!record&&!error&&
@@ -649,10 +652,10 @@ export default function ParentView(){
       <div className="parent-actions">
         <a
           href={
-            `/api/parent/children/${child}/export`
+            `/api/parent/children/${child}/export?day=${day}`
           }
         >
-          Download CSV record
+          Download this day (CSV)
         </a>
       </div>
 

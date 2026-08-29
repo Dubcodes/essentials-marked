@@ -21,7 +21,10 @@ export function ChildSelector({
   roomId,
   selected,
   setSelected,
-  filter
+  filter,
+  eligibilityLabel,
+  stateLabel,
+  bulkLabel='Select all present in this room'
 }:{
   children:Child[];
   rooms:Room[];
@@ -29,6 +32,9 @@ export function ChildSelector({
   selected:string[];
   setSelected:(ids:string[])=>void;
   filter?:(child:Child)=>boolean;
+  eligibilityLabel?:(child:Child)=>string;
+  stateLabel?:(child:Child)=>string;
+  bulkLabel?:string;
 }){
   const[q,setQ]=useState('');
 
@@ -38,19 +44,21 @@ export function ChildSelector({
 
   const shown=useMemo(
     ()=>children.filter(
-      c=>
-        (!filter||filter(c)) &&
-        (c.first_name+' '+c.last_name)
+      c=>(c.first_name+' '+c.last_name)
           .toLowerCase()
           .includes(q.toLowerCase())
     ),
-    [children,filter,q]
+    [children,q]
   );
 
   const groups=[
     [
-      'Currently in this room',
-      shown.filter(c=>isPhysicallyInRoom(c,roomId))
+      'In this room',
+      shown.filter(c=>isPhysicallyInRoom(c,roomId)&&c.room_id===roomId)
+    ],
+    [
+      'Visiting this room',
+      shown.filter(c=>isPhysicallyInRoom(c,roomId)&&c.room_id!==roomId)
     ],
     [
       'Enrolled here · absent/elsewhere',
@@ -68,18 +76,20 @@ export function ChildSelector({
     ],
     [
       'Other rooms',
-      shown.filter(
+      q?shown.filter(
         c=>!c.present&&c.room_id!==roomId
-      )
+      ):[]
     ]
   ] as [string,Child[]][];
 
-  const toggle=(id:string)=>
+  const toggle=(child:Child)=>{
+    if(filter&&!filter(child))return;
     setSelected(
-      selected.includes(id)
-        ? selected.filter(x=>x!==id)
-        : [...selected,id]
+      selected.includes(child.id)
+        ? selected.filter(x=>x!==child.id)
+        : [...selected,child.id]
     );
+  };
 
   return (
     <section className="picker">
@@ -100,7 +110,7 @@ export function ChildSelector({
             )
           }
         >
-          Select all present in this room
+          {bulkLabel}
         </button>
 
         <button
@@ -122,12 +132,9 @@ export function ChildSelector({
                 <button
                   type="button"
                   key={c.id}
-                  className={
-                    selected.includes(c.id)
-                      ? 'selected'
-                      : ''
-                  }
-                  onClick={()=>toggle(c.id)}
+                  className={`${selected.includes(c.id)?'selected':''} ${filter&&!filter(c)?'ineligible':''}`}
+                  aria-disabled={filter&&!filter(c)}
+                  onClick={()=>toggle(c)}
                 >
                   <b>
                     {c.first_name[0]}
@@ -137,12 +144,9 @@ export function ChildSelector({
                   <span>
                     {c.first_name}
                     <small>
-                      {physicalRoomStatus(
-                        c,
-                        roomId,
-                        names
-                      )}
+                      {stateLabel?.(c)||physicalRoomStatus(c,roomId,names)}
                     </small>
+                    {filter&&!filter(c)&&<small className="eligibility-reason">{eligibilityLabel?.(c)||'Unavailable for this action'}</small>}
                   </span>
                 </button>
               ))}

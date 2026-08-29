@@ -14,6 +14,9 @@ class Centre(Base):
     parent_history_days: Mapped[int] = mapped_column(Integer, default=7)
     timezone: Mapped[str] = mapped_column(String(64), default='Pacific/Auckland')
     sleep_check_minutes: Mapped[int] = mapped_column(Integer, default=10)
+    display_name: Mapped[str | None] = mapped_column(String(200))
+    secondary_text: Mapped[str | None] = mapped_column(String(240))
+    logo_path: Mapped[str | None] = mapped_column(String(300))
 class Room(Base):
     __tablename__ = 'rooms'
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
@@ -45,7 +48,10 @@ class ParentChild(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); parent_id: Mapped[str] = mapped_column(ForeignKey('parents.id'), index=True); child_id: Mapped[str] = mapped_column(ForeignKey('children.id'), index=True)
 class Attendance(Base):
     __tablename__ = 'attendance'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id'), index=True); child_id: Mapped[str] = mapped_column(ForeignKey('children.id')); room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); arrived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); departed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); visit_room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); last_visit_room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); visit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); visit_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id'), index=True); child_id: Mapped[str] = mapped_column(ForeignKey('children.id')); room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); arrived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); departed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); visit_room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); last_visit_room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); visit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); visit_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); recorded_by_staff_id: Mapped[str | None] = mapped_column(ForeignKey('staff.id')); device_id: Mapped[str | None] = mapped_column(ForeignKey('devices.id'))
+class RoomVisit(Base):
+    __tablename__='room_visits'
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); centre_id: Mapped[str]=mapped_column(ForeignKey('centres.id'),index=True); attendance_id: Mapped[str]=mapped_column(ForeignKey('attendance.id'),index=True); child_id: Mapped[str]=mapped_column(ForeignKey('children.id'),index=True); room_id: Mapped[str]=mapped_column(ForeignKey('rooms.id')); started_at: Mapped[datetime]=mapped_column(DateTime(timezone=True)); ended_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); started_by_staff_id: Mapped[str|None]=mapped_column(ForeignKey('staff.id')); ended_by_staff_id: Mapped[str|None]=mapped_column(ForeignKey('staff.id')); device_id: Mapped[str|None]=mapped_column(ForeignKey('devices.id'))
 class Event(Base):
     __tablename__ = 'events'; __table_args__ = (UniqueConstraint('centre_id','client_id', name='uq_event_client'),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id'), index=True); room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id'), index=True); child_id: Mapped[str] = mapped_column(ForeignKey('children.id'), index=True)
@@ -55,13 +61,16 @@ class Device(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id'), index=True); label: Mapped[str] = mapped_column(String(120)); default_room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now); last_active_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now); revoked: Mapped[bool] = mapped_column(Boolean, default=False)
 class Pairing(Base):
     __tablename__ = 'pairings'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id')); room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); token_hash: Mapped[str] = mapped_column(String(255), unique=True); challenge: Mapped[str] = mapped_column(String(6)); expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True)); consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id')); room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); label: Mapped[str]=mapped_column(String(120),default='Classroom tablet'); token_hash: Mapped[str] = mapped_column(String(255), unique=True); challenge: Mapped[str] = mapped_column(String(6)); expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True)); consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); device_id: Mapped[str|None]=mapped_column(ForeignKey('devices.id'))
 class Audit(Base):
     __tablename__ = 'audits'
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id'), index=True); entity: Mapped[str] = mapped_column(String(50)); entity_id: Mapped[str] = mapped_column(String(36)); action: Mapped[str] = mapped_column(String(50)); before: Mapped[dict | None] = mapped_column(JSON); after: Mapped[dict | None] = mapped_column(JSON); actor_id: Mapped[str | None] = mapped_column(String(36)); reason: Mapped[str | None] = mapped_column(Text); created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 class ParentNote(Base):
     __tablename__ = 'parent_notes'
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id'), index=True); child_id: Mapped[str] = mapped_column(ForeignKey('children.id')); body: Mapped[str] = mapped_column(Text); created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now); read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+class ParentDataRequest(Base):
+    __tablename__='parent_data_requests'
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); centre_id: Mapped[str]=mapped_column(ForeignKey('centres.id'),index=True); parent_id: Mapped[str]=mapped_column(ForeignKey('parents.id'),index=True); child_id: Mapped[str]=mapped_column(ForeignKey('children.id'),index=True); start_date: Mapped[date]=mapped_column(Date); end_date: Mapped[date]=mapped_column(Date); note: Mapped[str|None]=mapped_column(Text); status: Mapped[str]=mapped_column(String(20),default='new'); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); handled_by_id: Mapped[str|None]=mapped_column(ForeignKey('accounts.id'))
 
 class AppSession(Base):
     __tablename__ = 'app_sessions'

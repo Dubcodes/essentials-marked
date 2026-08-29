@@ -12,7 +12,10 @@ Essentials Marked is a focused browser application for recording daily early-chi
 - Fast nappy/toilet, food, sunscreen, staff note, supply, attendance and room-presence event APIs; room selection is sent and validated per operation.
 - Explicit sleep-session/check, medicine authority/receipt/administration and incident domain APIs.
 - Parent child-scoped timeline/export. Staff-only notes are filtered by the server and never exported.
-- IndexedDB outbox and draft-store foundation. Only offline/network failures and 502/503/504 ordinary event failures are queued; 401/403/409/422 operations are not queued.
+- IndexedDB outbox and draft-store foundation. Offline/network failures and 502/503/504 ordinary event failures are queued; Food also treats Vite's local proxy 500 during an upstream outage as retryable. 401/403/409/422 operations are not queued.
+- Cached last-confirmed emergency roll and a service-worker app shell support read-only emergency accountability after an offline relaunch.
+- Teacher workspaces keep the full roster visible, distinguish physical-room eligibility, preserve retries through stable operation IDs, and provide explicit sleep-session reconciliation.
+- Admin navigation exposes operational rooms, children, staff, devices/pairing, records, audit, family data requests, centre timezone and branding views.
 
 ## Run locally
 
@@ -39,6 +42,8 @@ The API container runs `alembic upgrade head` before starting Uvicorn. PostgreSQ
 
 ```sh
 cd backend && python -m pytest -q -p no:cacheprovider
+# Optional real PostgreSQL migration/domain probe:
+POSTGRES_TEST_URL=postgresql+psycopg://... python -m pytest -q -p no:cacheprovider tests/test_postgres_integration.py
 cd frontend && npm ci && npm test && npm run typecheck && npm run build
 docker compose config --quiet
 docker compose up --build
@@ -56,6 +61,6 @@ Back up PostgreSQL and the `media_data` volume together; back up deployment conf
 
 ## Important limitations before live-centre use
 
-The domain APIs are a foundation, not a completed regulatory product. The UI does not yet expose the complete medication authority/receipt/return, incident body-map/signature/notification, import, media-upload or comprehensive admin CRUD flows. Offline ordinary events are queued, but medication and incident finalisation intentionally do not queue because a PIN cannot safely be stored. Run hands-on teacher tablet sessions, conduct an independent privacy/compliance review, complete backup/recovery testing and verify current licensing requirements before any live trial.
+This remains a trial build, not a completed regulatory product. Medication receipt/administration/return, structured incident drafts, pairing, audit, branding and the core trial administration views are exposed, but enrolment/import, broad media workflows, incident notifications/signatures and comprehensive CRUD remain outside this pass. Offline ordinary events are queued, while medication and incident finalisation intentionally require a live connection because a PIN cannot safely be stored. The PostgreSQL integration test is opt-in and requires a reachable disposable PostgreSQL database; the default SQLite suite does not substitute for running it. Run hands-on teacher tablet sessions, conduct an independent privacy/compliance review, complete backup/recovery testing and verify current licensing requirements before any live trial.
 
 See [NZ ECE implementation matrix](docs/compliance/NZ-ECE-COMPLIANCE.md) for sources, implementation status and limitations.

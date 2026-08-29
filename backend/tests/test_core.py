@@ -1,5 +1,6 @@
 import os
 import hashlib
+import io
 from datetime import timedelta
 import pytest
 os.environ['DATABASE_URL']='sqlite:///./test.db'
@@ -8,7 +9,7 @@ from fastapi.testclient import TestClient
 import app.main as main_module
 from app.main import app, pwd, enforce_failure_limit, record_auth_failure, verify_staff_pin
 from app.db import Base, engine, SessionLocal
-from app.models import Centre, Account, Room, Staff, Child, Parent, ParentChild, Attendance, Event, MedicationAuthority, MedicationAdministration, MedicationReceipt, Signature, SleepSession, SleepCheck, Incident, IncidentAction, IncidentBodyArea, LoginAttempt, AppSession, now
+from app.models import Centre, Account, Room, Staff, Child, Parent, ParentChild, Attendance, RoomVisit, Audit, Event, MedicationAuthority, MedicationAdministration, MedicationReceipt, Signature, SleepSession, SleepCheck, Incident, IncidentAction, IncidentBodyArea, LoginAttempt, AppSession, now
 
 def setup():
     Base.metadata.drop_all(engine);Base.metadata.create_all(engine);db=SessionLocal()
@@ -148,6 +149,7 @@ def test_incident_draft_finalise_idempotency_and_parent_privacy():
         assert db.query(Incident).count()==1 and db.query(IncidentAction).count()==1 and db.query(IncidentBodyArea).count()==1
         final={**updated,'finalise':True,'finalise_operation_id':'incident-final-0001','staff_pin':'1234'}
         result=client.post('/api/classroom/incidents',json=final);assert result.status_code==200 and result.json()['status']=='finalised'
+        assert client.delete(f'/api/classroom/incidents/drafts/{incident_id}').status_code==409
         retry=client.post('/api/classroom/incidents',json=final);assert retry.status_code==200 and retry.json()['idempotent']
         assert client.post('/api/classroom/incidents',json={**final,'description':'Changed after finalisation'}).status_code==409
         assert client.post('/api/classroom/incidents',json={**final,'finalise_operation_id':'incident-final-0002'}).status_code==409
@@ -155,7 +157,8 @@ def test_incident_draft_finalise_idempotency_and_parent_privacy():
         assert client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
         parent_event=client.get(f'/api/parent/children/{children[0].id}/timeline').json()[0];wire=str(parent_event)
         assert children[1].id not in wire and children[1].first_name not in wire and 'another child' in wire
-        assert parent_event['data']['body_areas']==['head'] and parent_event['data']['actions']==['cold pack']
+        assert parent_event['data']['body_areas']==['head'] and parent_event['data']['actions'][0]['description']=='cold pack'
+        assert parent_event['data']['actions'][0]['action_at']
     finally: db.close()
 
 def test_server_session_sliding_expiry_revocation_and_rate_window():
@@ -206,6 +209,80 @@ def test_successful_admin_parent_and_pairing_auth_clear_failures():
         for _ in range(2):assert client.post('/api/device/pair',json={'token':pairing['token'],'challenge':'000'}).status_code==400
         assert client.post('/api/device/pair',json={'token':pairing['token'],'challenge':pairing['challenge']}).status_code==200
         key=hashlib.sha256(pairing['token'].encode()).hexdigest();assert db.query(LoginAttempt).filter_by(scope='pairing',key=key).count()==0
+    finally:db.close()
+
+def test_ordinary_replay_requires_identical_material_request():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room)
+        payload={'client_id':'ordinary-fingerprint-001','child_ids':[children[0].id],'type':'nappy','room_id':room.id,'performed_by_id':staff.id,'data':{'outcome':'Wet'}}
+        first=client.post('/api/classroom/events',json=payload);assert first.status_code==200
+        assert client.post('/api/classroom/events',json=payload).json()['idempotent']
+        assert client.post('/api/classroom/events',json={**payload,'data':{'outcome':'Dry'}}).status_code==409
+        assert db.query(Event).filter_by(type='nappy').count()==1
+    finally:db.close()
+
+def test_food_batch_is_atomic_and_fingerprint_idempotent():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room)
+        payload={'client_operation_id':'food-batch-fingerprint-01','room_id':room.id,'staff_id':staff.id,'meal':'lunch','description':None,'rows':[{'child_id':children[0].id,'food':'Pasta','servings':[1],'total_servings':1},{'child_id':children[1].id,'food':'Pasta','servings':[.5,.25],'total_servings':.75}]}
+        first=client.post('/api/classroom/food-batch',json=payload);assert first.status_code==200 and len(first.json()['events'])==2
+        assert client.post('/api/classroom/food-batch',json=payload).json()['idempotent']
+        assert client.post('/api/classroom/food-batch',json={**payload,'rows':[payload['rows'][0],{**payload['rows'][1],'servings':[1]}]}).status_code==409
+        invalid={**payload,'client_operation_id':'food-batch-invalid-0001','rows':[payload['rows'][0],{'child_id':'missing-child','total_servings':1}]}
+        assert client.post('/api/classroom/food-batch',json=invalid).status_code==404
+        assert db.query(Event).filter_by(type='food').count()==2
+    finally:db.close()
+
+def test_incident_draft_discard_removes_children_and_audits():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room);payload={'client_draft_id':'discard-draft-00001','child_id':children[0].id,'room_id':room.id,'staff_id':staff.id,'incident_type':'graze','body_areas':['left_hand'],'actions':[{'description':'washed','action_at':now().isoformat()}]}
+        created=client.post('/api/classroom/incidents',json=payload);assert created.status_code==200;incident_id=created.json()['id']
+        deleted=client.delete(f'/api/classroom/incidents/drafts/{incident_id}');assert deleted.status_code==200
+        assert db.query(Incident).count()==0 and db.query(IncidentAction).count()==0 and db.query(IncidentBodyArea).count()==0
+        audit_row=db.query(Audit).filter_by(entity='incident',entity_id=incident_id,action='draft_discarded').one();assert audit_row
+        assert client.delete(f'/api/classroom/incidents/drafts/{incident_id}').status_code==404
+    finally:db.close()
+
+def test_attendance_ui_payload_attribution_and_room_visit_history():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        visiting=Room(centre_id=centre.id,name='Visit');db.add(visiting);db.commit();client=TestClient(app);paired(client,room);base={'child_id':children[0].id,'staff_id':staff.id}
+        assert client.post('/api/classroom/presence',json={**base,'room_id':room.id,'action':'arrive'}).status_code==200
+        assert client.post('/api/classroom/presence',json={**base,'room_id':visiting.id,'action':'visit'}).status_code==200
+        assert client.post('/api/classroom/presence',json={**base,'room_id':visiting.id,'action':'end_visit'}).status_code==200
+        assert client.post('/api/classroom/presence',json={**base,'room_id':room.id,'action':'depart'}).status_code==200
+        attendance=db.query(Attendance).one();visit=db.query(RoomVisit).one();assert attendance.recorded_by_staff_id==staff.id and attendance.device_id
+        assert visit.started_by_staff_id==staff.id and visit.ended_by_staff_id==staff.id and visit.device_id and visit.ended_at
+        actions=db.query(Audit).filter_by(entity='attendance',actor_id=staff.id).all();assert {x.action for x in actions}=={'arrive','visit','end_visit','depart'}
+    finally:db.close()
+
+def test_parent_selected_day_export_matches_attendance_sleep_and_care():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room);child=children[0];presence={'child_id':child.id,'room_id':room.id,'staff_id':staff.id}
+        assert client.post('/api/classroom/presence',json={**presence,'action':'arrive'}).status_code==200
+        food={'client_operation_id':'export-food-batch-001','room_id':room.id,'staff_id':staff.id,'meal':'Lunch','rows':[{'child_id':child.id,'food':'Pasta','servings':[1]}]};assert client.post('/api/classroom/food-batch',json=food).status_code==200
+        common={'child_ids':[child.id],'room_id':room.id,'staff_id':staff.id}
+        for op,action in [('export-sleep-put-01','put_down'),('export-sleep-asleep','fell_asleep'),('export-sleep-wake01','wake'),('export-sleep-gotup1','got_up')]:assert client.post('/api/classroom/sleep',json={**common,'client_id':op,'action':action}).status_code==200
+        assert client.post('/api/classroom/presence',json={**presence,'action':'depart'}).status_code==200
+        assert client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
+        csv=client.get(f'/api/parent/children/{child.id}/export?day={now().date().isoformat()}').text
+        assert 'Drop off' in csv and 'Pick up' in csv and 'Sleep' in csv and 'Food' in csv and 'Pasta' in csv
+    finally:db.close()
+
+def test_branding_logo_upload_serve_and_remove():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        from PIL import Image
+        image=Image.new('RGB',(2,2),(40,120,80));buffer=io.BytesIO();image.save(buffer,format='PNG')
+        client=TestClient(app);assert client.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+        uploaded=client.post('/api/admin/branding/logo',files={'file':('centre.png',buffer.getvalue(),'image/png')});assert uploaded.status_code==200
+        served=client.get(uploaded.json()['logo_url']);assert served.status_code==200 and served.headers['content-type']=='image/webp'
+        assert client.delete('/api/admin/branding/logo').status_code==200
+        assert client.get(uploaded.json()['logo_url']).status_code==404
     finally:db.close()
 
 def test_production_startup_guard_rejects_defaults(monkeypatch):

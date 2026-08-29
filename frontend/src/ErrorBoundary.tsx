@@ -1,0 +1,2 @@
+import React from'react';
+export class ErrorBoundary extends React.Component<React.PropsWithChildren,{error:boolean}>{state={error:false};static getDerivedStateFromError(){return{error:true}}render(){return this.state.error?<main className="workflow-error"><h1>This screen needs to be reopened</h1><p>Your confirmed server records are safe. Local incident drafts and queued ordinary records are retained.</p><button onClick={()=>location.reload()}>Reload application</button></main>:this.props.children}}

@@ -5,6 +5,7 @@ export type Child={
   room_id:string;
   present?:boolean;
   visiting_room_id?:string|null;
+  arrived_at?:string|null;
 };
 
 export type Staff={
@@ -26,6 +27,9 @@ export type Bootstrap={
   staff:Staff[];
   children:Child[];
   unread_notes:number;
+  incident_drafts?:number;
+  last_confirmed_at?:string;
+  centre?:{display_name?:string;secondary_text?:string;logo_url?:string|null;timezone?:string};
 };
 
 export type WorkflowProps={

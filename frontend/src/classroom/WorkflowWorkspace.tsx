@@ -1,0 +1,4 @@
+import React from'react';
+export function WorkflowWorkspace({title,close,roster,children,footer,status}:{title:string;close:()=>void;roster?:React.ReactNode;children:React.ReactNode;footer?:React.ReactNode;status?:React.ReactNode}){
+ return <div className="workflow-workspace" role="dialog" aria-modal="true" aria-label={title}><section className={`workflow-panel ${roster?'':'workflow-single'}`}><header className="workflow-header"><div><h2>{title}</h2>{status}</div><button type="button" aria-label="Close" className="close" onClick={close}>×</button></header><div className="workflow-body">{roster&&<aside className="workflow-roster">{roster}</aside>}<div className="workflow-details">{children}</div></div><footer className="workflow-footer">{footer||<><span/><button type="button" className="minor" onClick={close}>Close</button></>}</footer></section></div>;
+}
