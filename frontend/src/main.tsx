@@ -49,6 +49,41 @@ function VersionMarker(){
   );
 }
 
+function QuickNav(){
+  const current=location.pathname;
+
+  const links=[
+    ['Admin','/'],
+    ['Classroom','/classroom'],
+    ['Parent','/parent'],
+    ['Pair tablet','/classroom/pair']
+  ] as const;
+
+  return(
+    <nav
+      className="quick-nav"
+      aria-label="Quick navigation"
+    >
+      {links.map(([label,href])=>{
+        const active=
+          href==='/'
+            ? current==='/'||current.startsWith('/admin')
+            : current===href;
+
+        return(
+          <a
+            key={href}
+            href={href}
+            className={active?'active':''}
+          >
+            {label}
+          </a>
+        );
+      })}
+    </nav>
+  );
+}
+
 const path=location.pathname;
 
 createRoot(
@@ -67,6 +102,7 @@ createRoot(
       }
     </ErrorBoundary>
 
+    <QuickNav/>
     <VersionMarker/>
   </>
 );
