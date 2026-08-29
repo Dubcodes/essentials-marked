@@ -25,4 +25,48 @@ function ParentRoute(){
 function Admin(){const[data,setData]=useState<any>(),[login,setLogin]=useState(false),[events,setEvents]=useState<any[]>([]),[pair,setPair]=useState<any>();useEffect(()=>{void api('/admin/bootstrap').then(setData).catch(()=>setLogin(true))},[]);useEffect(()=>{if(data)void api('/admin/events').then(setEvents)},[data]);if(login)return <Login parent={false} onDone={()=>location.reload()}/>;if(!data)return <main className="loading">Opening administration…</main>;return <main className="admin"><header><strong>Essentials <i>Marked</i></strong><span>{data.centre.name} administration</span><button onClick={()=>api('/admin/pairings',{method:'POST',body:JSON.stringify({room_id:data.rooms[0]?.id,label:'Classroom tablet'})}).then(setPair)}>Add classroom tablet</button></header><div className="adminbody"><aside><b>Operations</b><a>Dashboard</a><a>Rooms</a><a>Children</a><a>Families</a><a>Staff</a><a>Devices</a><a>Records</a><a>Audit log</a></aside><section><h1>Recent records</h1><div className="cards"><div><b>{data.children.length}</b> children</div><div><b>{data.rooms.length}</b> rooms</div><div><b>{data.devices.length}</b> devices</div></div>{pair&&<div className="pair"><h2>Pairing challenge</h2><code>{pair.token}</code><h1>{pair.challenge}</h1></div>}<table><thead><tr><th>Time</th><th>Child</th><th>Record</th><th>Performed by</th></tr></thead><tbody>{events.map(e=><tr key={e.id}><td>{new Date(e.effective_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</td><td>{e.child.first_name}</td><td>{e.type}</td><td>{e.performed_by}</td></tr>)}</tbody></table></section></div></main>}
 if('serviceWorker'in navigator)window.addEventListener('load',()=>void navigator.serviceWorker.register('/sw.js'));
 function AdminGate(){const[state,setState]=useState<'loading'|'ready'|'login'>('loading');useEffect(()=>{void api('/admin/bootstrap').then(()=>setState('ready')).catch(()=>setState('login'))},[]);if(state==='loading')return <main className="loading">Opening administration…</main>;if(state==='login')return <Login parent={false} onDone={()=>location.reload()}/>;return <AdminConsole/>}
-const path=location.pathname;createRoot(document.getElementById('root')!).render(<ErrorBoundary>{path==='/classroom'?<Classroom/>:path==='/classroom/pair'?<PairTablet/>:path==='/parent'?<ParentRoute/>:<AdminGate/>}</ErrorBoundary>);
+function VersionMarker(){
+  const built=new Date(__BUILD_TIME__);
+
+  const stamp=new Intl.DateTimeFormat(
+    'en-NZ',
+    {
+      day:'2-digit',
+      month:'short',
+      hour:'2-digit',
+      minute:'2-digit',
+      hour12:false
+    }
+  ).format(built);
+
+  return(
+    <div
+      className="version-marker"
+      aria-hidden="true"
+    >
+      EM v{__APP_VERSION__} · {stamp}
+    </div>
+  );
+}
+
+const path=location.pathname;
+
+createRoot(
+  document.getElementById('root')!
+).render(
+  <>
+    <ErrorBoundary>
+      {
+        path==='/classroom'
+          ?<Classroom/>
+          :path==='/classroom/pair'
+            ?<PairTablet/>
+            :path==='/parent'
+              ?<ParentRoute/>
+              :<AdminGate/>
+      }
+    </ErrorBoundary>
+
+    <VersionMarker/>
+  </>
+);

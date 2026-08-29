@@ -270,3 +270,25 @@ button:disabled{
   margin:10px 0 0;
   font-size:.9rem;
 }
+/* Quiet diagnostic build marker. */
+.version-marker{
+  position:fixed;
+  right:7px;
+  bottom:max(5px,env(safe-area-inset-bottom));
+  z-index:50;
+  pointer-events:none;
+  user-select:none;
+  color:#68746e;
+  opacity:.45;
+  font-size:10px;
+  font-weight:500;
+  line-height:1;
+  letter-spacing:.02em;
+  white-space:nowrap;
+}
+
+@media print{
+  .version-marker{
+    display:none!important;
+  }
+}
