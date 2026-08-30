@@ -330,12 +330,34 @@ button:disabled{
   outline:none;
 }
 
+.quick-nav button{
+  min-height:0;
+  padding:6px 7px;
+  border-radius:6px;
+  background:transparent;
+  color:#68746e;
+  font-size:10px;
+  font-weight:600;
+  line-height:1;
+  opacity:.68;
+}
+
+.quick-nav button:hover{
+  opacity:1;
+  background:#e5eee9;
+}
+
 @media(max-width:600px){
   .quick-nav{
     gap:1px;
   }
 
   .quick-nav a{
+    padding:6px 5px;
+    font-size:9px;
+  }
+
+  .quick-nav button{
     padding:6px 5px;
     font-size:9px;
   }

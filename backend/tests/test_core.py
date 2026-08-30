@@ -3,6 +3,7 @@ import hashlib
 import io
 from datetime import timedelta
 import pytest
+from sqlalchemy import select
 os.environ['DATABASE_URL']='sqlite:///./test.db'
 os.environ['DEMO_SEED']='false'
 from fastapi.testclient import TestClient
@@ -291,6 +292,112 @@ def test_production_startup_guard_rejects_defaults(monkeypatch):
     monkeypatch.setattr(main_module,'SECRET','x'*40);monkeypatch.setattr(main_module,'secure_cookie',True)
     monkeypatch.setenv('DEMO_SEED','false');monkeypatch.setenv('DATABASE_URL','postgresql+psycopg://user:unique@db/app');monkeypatch.setenv('PUBLIC_ORIGIN','https://example.test')
     assert main_module.seed() is None
+
+def test_fixed_account_roles_enforce_management_boundaries_and_revoke_sessions():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        admin_client=TestClient(app)
+        assert admin_client.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+        office=admin_client.post('/api/admin/accounts',json={'email':'office@test','password':'office-pass','role':'administration','active':True}).json()
+        teacher=admin_client.post('/api/admin/accounts',json={'email':'teacher@test','password':'teacher-pass','role':'teacher','active':True}).json()
+        assert admin_client.get('/api/admin/accounts').status_code==200
+        assert admin_client.patch(f'/api/admin/accounts/{office["id"]}',json={'email':'office-updated@test'}).status_code==200
+        assert admin_client.get('/api/admin/audit').status_code==200
+        assert admin_client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Admin tablet'}).status_code==200
+        office_client=TestClient(app);assert office_client.post('/api/auth/admin/login',json={'email':'office-updated@test','password':'office-pass'}).status_code==200
+        assert office_client.get('/api/auth/account/me').json()['role']=='administration'
+        assert office_client.get('/api/admin/bootstrap').status_code==200
+        assert office_client.post('/api/admin/children',json={'first_name':'Office child'}).status_code==200
+        assert office_client.post('/api/admin/staff',json={'first_name':'Office','last_name':'Teacher','pin':'4321'}).status_code==200
+        assert office_client.get('/api/admin/accounts').status_code==403
+        assert office_client.post('/api/admin/rooms',json={'name':'Forbidden'}).status_code==403
+        assert office_client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Forbidden'}).status_code==403
+        assert office_client.patch('/api/admin/branding',json={'display_name':'Forbidden'}).status_code==403
+        assert office_client.post('/api/admin/devices/not-a-device/revoke').status_code==403
+        assert office_client.patch('/api/admin/events/not-an-event/attribution',json={'performed_by_id':staff.id,'reason':'Not permitted'}).status_code==403
+        assert office_client.post(f'/api/admin/staff/{staff.id}/pin-reset',json={'account_password':'office-pass','pin':'4321'}).status_code==200
+        assert office_client.post(f'/api/admin/staff/{staff.id}/pin-reset',json={'account_password':'wrong','pin':'4321'}).status_code==403
+        teacher_client=TestClient(app);assert teacher_client.post('/api/auth/admin/login',json={'email':'teacher@test','password':'teacher-pass'}).status_code==200
+        assert teacher_client.get('/api/auth/account/me').json()['role']=='teacher'
+        assert teacher_client.get('/api/admin/bootstrap').status_code==403
+        assert teacher_client.get('/api/admin/accounts').status_code==403
+        assert teacher_client.get('/api/admin/events').status_code==403
+        assert teacher_client.get('/api/admin/audit').status_code==403
+        assert teacher_client.post('/api/admin/children',json={'first_name':'Forbidden'}).status_code==403
+        assert teacher_client.post('/api/admin/staff',json={'first_name':'Forbidden','last_name':'Teacher'}).status_code==403
+        assert teacher_client.patch('/api/admin/branding',json={'display_name':'Forbidden'}).status_code==403
+        assert teacher_client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Forbidden'}).status_code==403
+        assert teacher_client.post('/api/admin/devices/not-a-device/revoke').status_code==403
+        assert teacher_client.patch('/api/admin/events/not-an-event/attribution',json={'performed_by_id':staff.id,'reason':'Not permitted'}).status_code==403
+        assert admin_client.patch(f'/api/admin/accounts/{teacher["id"]}',json={'role':'administration'}).status_code==200
+        assert teacher_client.get('/api/auth/account/me').status_code==401
+        assert admin_client.post(f'/api/admin/accounts/{teacher["id"]}/password-reset',json={'current_password':'secret','new_password':'teacher-new-pass','confirm_new_password':'teacher-new-pass'}).status_code==200
+        assert teacher_client.post('/api/auth/admin/login',json={'email':'teacher@test','password':'teacher-pass'}).status_code==401
+        assert TestClient(app).post('/api/auth/admin/login',json={'email':'teacher@test','password':'teacher-new-pass'}).status_code==200
+        assert admin_client.patch(f'/api/admin/accounts/{account.id}',json={'active':False}).status_code==409
+        assert office['role']=='administration'
+    finally:db.close()
+
+def test_account_password_sessions_cross_centre_and_restricted_audit_scope():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        admin_client=TestClient(app)
+        assert admin_client.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+        office=admin_client.post('/api/admin/accounts',json={'email':'office@test','password':'office-pass','role':'administration','active':True}).json()
+        teacher=admin_client.post('/api/admin/accounts',json={'email':'teacher@test','password':'teacher-pass','role':'teacher','active':True}).json()
+
+        other_account=Account(centre_id=other_room.centre_id,email='other@test',password_hash=pwd.hash('other-pass'),role='admin')
+        db.add(other_account);db.commit()
+
+        assert admin_client.post('/api/admin/accounts',json={'email':'too-long@test','password':'x'*73,'role':'teacher'}).status_code==422
+        assert admin_client.patch(f'/api/admin/accounts/{other_account.id}',json={'active':False}).status_code==404
+        assert admin_client.post(f'/api/admin/accounts/{teacher["id"]}/password-reset',json={'current_password':'wrong','new_password':'teacher-next','confirm_new_password':'teacher-next'}).status_code==403
+
+        office_current=TestClient(app)
+        office_other=TestClient(app)
+        assert office_current.post('/api/auth/admin/login',json={'email':'office@test','password':'office-pass'}).status_code==200
+        assert office_other.post('/api/auth/admin/login',json={'email':'office@test','password':'office-pass'}).status_code==200
+        changed=office_current.post('/api/auth/account/password',json={'current_password':'office-pass','new_password':'office-next','confirm_new_password':'office-next'})
+        assert changed.status_code==200 and changed.json()['current_session_kept']
+        assert office_current.get('/api/auth/account/me').status_code==200
+        assert office_other.get('/api/auth/account/me').status_code==401
+        assert TestClient(app).post('/api/auth/admin/login',json={'email':'office@test','password':'office-pass'}).status_code==401
+        assert TestClient(app).post('/api/auth/admin/login',json={'email':'office@test','password':'office-next'}).status_code==200
+
+        device_client=TestClient(app)
+        paired(device_client,room)
+        assert device_client.post('/api/classroom/presence',json={'child_id':children[0].id,'room_id':room.id,'action':'arrive','staff_id':staff.id}).status_code==200
+        admin_audit=admin_client.get('/api/admin/audit').json()
+        office_audit=office_current.get('/api/admin/audit').json()
+        assert any(item['entity']=='account' for item in admin_audit)
+        assert any(item['entity']=='attendance' and item['action']=='arrive' for item in office_audit)
+        assert all((item['entity'],item['action']) in {('attendance','arrive'),('attendance','depart'),('attendance','visit'),('attendance','end_visit'),('incident','draft_discarded')} for item in office_audit)
+    finally:db.close()
+
+def test_account_logout_preserves_paired_device_and_login_fails_closed():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        legacy=Account(centre_id=centre.id,email='legacy@test',password_hash=pwd.hash('legacy-pass'),role='legacy')
+        db.add(legacy);db.commit()
+        client=TestClient(app)
+        assert client.post('/api/auth/admin/login',json={'email':'a@test','password':'x'*73}).status_code==401
+        assert client.post('/api/auth/admin/login',json={'email':'legacy@test','password':'legacy-pass'}).status_code==401
+        assert db.query(AppSession).filter(AppSession.subject_id==legacy.id).count()==0
+
+        paired(client,room)
+        assert client.get('/api/auth/account/me').status_code==200
+        assert client.get('/api/classroom/bootstrap').status_code==200
+        device_token=client.cookies.get('device')
+        assert device_token
+        device_session=db.scalar(select(AppSession).where(AppSession.token_hash==hashlib.sha256(device_token.encode()).hexdigest(),AppSession.subject_type=='device'))
+        assert device_session is not None and device_session.revoked_at is None
+
+        assert client.post('/api/auth/account/logout').status_code==200
+        assert client.get('/api/auth/account/me').status_code==401
+        assert client.get('/api/classroom/bootstrap').status_code==200
+        db.refresh(device_session)
+        assert device_session.revoked_at is None
+    finally:db.close()
 def test_admin_management_rooms_children_and_staff():
     db,centre,account,room,other_room,staff,children,parent=setup()
 
@@ -391,7 +498,7 @@ def test_admin_management_rooms_children_and_staff():
         wrong=client.post(
             f'/api/admin/staff/{staff_id}/pin-reset',
             json={
-                'admin_password':'wrong',
+                'account_password':'wrong',
                 'pin':'7654'
             }
         )
@@ -401,7 +508,7 @@ def test_admin_management_rooms_children_and_staff():
         good=client.post(
             f'/api/admin/staff/{staff_id}/pin-reset',
             json={
-                'admin_password':'secret',
+                'account_password':'secret',
                 'pin':'7654'
             }
         )

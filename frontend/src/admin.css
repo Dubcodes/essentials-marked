@@ -330,6 +330,94 @@ body{
   color:#17312d;
 }
 
+/* Account controls stay compact in the sticky operations header. */
+.admin header .account-password{
+  position:relative;
+  flex:0 0 auto;
+}
+
+.account-password summary{
+  cursor:pointer;
+  list-style:none;
+  background:#e5eee9;
+  color:#17312d;
+  border-radius:10px;
+  padding:9px 11px;
+  font-size:.86rem;
+  font-weight:650;
+}
+
+.account-password summary::-webkit-details-marker{
+  display:none;
+}
+
+.admin header .account-password-panel{
+  position:absolute;
+  right:0;
+  top:calc(100% + 8px);
+  z-index:8;
+  width:min(320px,calc(100vw - 24px));
+  padding:14px;
+  background:#fff;
+  border:1px solid #d7e2dc;
+  border-radius:12px;
+  box-shadow:0 12px 30px rgba(28,49,42,.16);
+}
+
+.account-password-panel b{
+  display:block;
+  margin-bottom:8px;
+}
+
+.account-password-panel label{
+  margin:8px 0;
+  font-size:.82rem;
+}
+
+.account-password-panel input{
+  width:100%;
+  min-width:0;
+  padding:9px 10px;
+  border:1px solid #b6c7bd;
+  border-radius:8px;
+}
+
+.account-password-panel button{
+  width:100%;
+  min-height:38px;
+  padding:8px 11px;
+}
+
+.settings-panels{
+  display:grid;
+  gap:10px;
+}
+
+.settings-panels>details,
+.accounts-settings{
+  min-width:0;
+  background:#fff;
+  border:1px solid #d7e2dc;
+  border-radius:12px;
+  padding:12px 14px;
+}
+
+.settings-panels>details>summary{
+  cursor:pointer;
+  font-weight:700;
+}
+
+.accounts-settings table{
+  display:block;
+  overflow-x:auto;
+  white-space:nowrap;
+}
+
+.accounts-settings th,
+.accounts-settings td{
+  padding:9px 10px;
+}
+
 @media(max-width:500px){
   .metrics{
     grid-template-columns:
@@ -359,5 +447,9 @@ body{
 
   .picker .childgrid{
     grid-template-columns:1fr;
+  }
+
+  .admin header .account-password-panel{
+    right:-8px;
   }
 }

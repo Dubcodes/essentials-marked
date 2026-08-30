@@ -1,0 +1,18 @@
+import React,{useEffect,useState}from'react';
+import{api}from'../api';
+
+type Account={id:string;email:string;role:'admin'|'administration'|'teacher';active:boolean};
+
+export default function AccountsSettings(){
+ const[accounts,setAccounts]=useState<Account[]>([]),[editing,setEditing]=useState<string>(),[message,setMessage]=useState('');
+ const load=()=>api('/admin/accounts').then(setAccounts).catch((e:any)=>setMessage(e.message));
+ useEffect(()=>{void load()},[]);
+ return <section className="accounts-settings"><h2>Accounts</h2><p>Admin manages internal identities and fixed roles.</p><AccountForm saved={load}/><table><thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Action</th></tr></thead><tbody>{accounts.map(account=><React.Fragment key={account.id}><tr><td>{account.email}</td><td>{account.role}</td><td>{account.active?'Active':'Inactive'}</td><td><button className="minor" onClick={()=>setEditing(editing===account.id?undefined:account.id)}>Edit</button></td></tr>{editing===account.id&&<tr><td colSpan={4}><AccountForm account={account} saved={async()=>{setEditing(undefined);await load()}}/></td></tr>}</React.Fragment>)}</tbody></table>{message&&<p className="error">{message}</p>}</section>
+}
+
+function AccountForm({account,saved}:{account?:Account;saved:()=>void|Promise<void>}){
+ const[email,setEmail]=useState(account?.email||''),[role,setRole]=useState(account?.role||'administration'),[active,setActive]=useState(account?.active??true),[password,setPassword]=useState(''),[confirm,setConfirm]=useState(''),[adminPassword,setAdminPassword]=useState(''),[message,setMessage]=useState('');
+ const save=async()=>{try{if(account){await api(`/admin/accounts/${account.id}`,{method:'PATCH',body:JSON.stringify({email,role,active})})}else{await api('/admin/accounts',{method:'POST',body:JSON.stringify({email,password,role,active})})}await saved()}catch(e:any){setMessage(e.message)}};
+ const reset=async()=>{try{await api(`/admin/accounts/${account!.id}/password-reset`,{method:'POST',body:JSON.stringify({current_password:adminPassword,new_password:password,confirm_new_password:confirm})});setMessage('Password reset; existing sessions were signed out.');setPassword('');setConfirm('');setAdminPassword('')}catch(e:any){setMessage(e.message)}};
+ return <div className="manager-editor"><div className="editor-grid"><label>Email<input value={email} onChange={e=>setEmail(e.target.value)}/></label><label>Role<select value={role} onChange={e=>setRole(e.target.value as Account['role'])}>{['admin','administration','teacher'].map(x=><option key={x}>{x}</option>)}</select></label><label className="check"><input type="checkbox" checked={active} onChange={e=>setActive(e.target.checked)}/> Active</label>{!account&&<><label>Initial password<input type="password" value={password} onChange={e=>setPassword(e.target.value)}/></label><label>Confirm password<input type="password" value={confirm} onChange={e=>setConfirm(e.target.value)}/></label></>}</div><button disabled={!email||(!account&&(password.length<8||password!==confirm))} onClick={()=>void save()}>{account?'Save account':'Create account'}</button>{account&&<details><summary>Reset password</summary><label>New password<input type="password" value={password} onChange={e=>setPassword(e.target.value)}/></label><label>Confirm new password<input type="password" value={confirm} onChange={e=>setConfirm(e.target.value)}/></label><label>Current Admin password<input type="password" value={adminPassword} onChange={e=>setAdminPassword(e.target.value)}/></label><button disabled={password.length<8||password!==confirm||!adminPassword} onClick={()=>void reset()}>Reset password</button></details>}{message&&<p role="status">{message}</p>}</div>
+}

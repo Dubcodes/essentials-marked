@@ -1,21 +1,10 @@
 import React,{useEffect,useMemo,useState}from'react';
 import{api}from'../api';
+import AccountPassword from'../account/AccountPassword';
+import AccountsSettings from'../account/AccountsSettings';
+import{managementPagesForRole,settingsSections,type AdminPage}from'../account/role-ui';
 
-const pages=[
-  'Dashboard',
-  'Rooms',
-  'Children',
-  'Families',
-  'Staff',
-  'Devices',
-  'Records',
-  'Audit log',
-  'Data requests',
-  'Branding',
-  'Help'
-]as const;
-
-type Page=(typeof pages)[number];
+type Page=AdminPage;
 
 type Notice=(message:string)=>void;
 
@@ -123,10 +112,6 @@ export default function AdminConsole(){
     (x:any)=>x.present
   );
 
-  const activeDevices=data.devices.filter(
-    (x:any)=>!x.revoked
-  );
-
   const notice:Notice=(value)=>{
     setMessage(value);
     window.setTimeout(
@@ -134,6 +119,8 @@ export default function AdminConsole(){
       6000
     );
   };
+  const isAdmin=data.account?.role==='admin';
+  const visiblePages=managementPagesForRole(data.account?.role);
 
   return(
     <main className="admin">
@@ -164,16 +151,18 @@ export default function AdminConsole(){
           ↻ Refresh
         </button>
 
-        <button
+        {isAdmin&&<button
           onClick={()=>setPage('Devices')}
         >
           Add classroom tablet
-        </button>
+        </button>}
+
+        <AccountPassword/>
 
         <button
           className="minor"
           onClick={()=>void api(
-            '/auth/logout',
+            '/auth/account/logout',
             {method:'POST'}
           ).finally(()=>location.reload())}
         >
@@ -185,7 +174,7 @@ export default function AdminConsole(){
         <aside>
           <b>Operations</b>
 
-          {pages.map(item=>
+          {visiblePages.map(item=>
             <button
               key={item}
               className={
@@ -234,14 +223,14 @@ export default function AdminConsole(){
                 <Card
                   value={data.rooms.length}
                   label="rooms"
-                  onClick={()=>setPage('Rooms')}
+                  onClick={isAdmin?()=>setPage('Rooms'):undefined}
                 />
 
-                <Card
-                  value={activeDevices.length}
+                {isAdmin&&<Card
+                  value={data.devices.filter((x:any)=>!x.revoked).length}
                   label="active devices"
                   onClick={()=>setPage('Devices')}
-                />
+                />}
 
                 <Card
                   value={data.incident_drafts||0}
@@ -317,7 +306,7 @@ export default function AdminConsole(){
             </section>
           }
 
-          {page==='Staff'&&
+          {page==='Teachers'&&
             <StaffManager
               data={data}
               reload={load}
@@ -560,15 +549,7 @@ export default function AdminConsole(){
             </>
           }
 
-          {page==='Branding'&&
-            <Branding
-              data={data}
-              saved={async()=>{
-                await load();
-                notice('Branding saved');
-              }}
-            />
-          }
+          {page==='Settings'&&isAdmin&&<section className="settings-panels"><details open={settingsSections[0].open}><summary>{settingsSections[0].title}</summary><AccountsSettings/></details><details open={settingsSections[1].open}><summary>{settingsSections[1].title}</summary><Branding data={data} saved={async()=>{await load();notice('Branding saved')}}/></details></section>}
 
           {page==='Help'&&
             <Help demo={data.demo_mode}/>
@@ -1346,9 +1327,9 @@ function StaffManager({
     <section>
       <div className="manager-toolbar">
         <div>
-          <h2>Staff</h2>
+          <h2>Teachers</h2>
           <p>
-            Staff are deactivated rather than
+            Teachers are deactivated rather than
             deleted so old records keep their
             attribution.
           </p>
@@ -1357,8 +1338,8 @@ function StaffManager({
         <div className="inline-actions">
           <input
             className="manager-search"
-            aria-label="Search staff"
-            placeholder="Search staff…"
+            aria-label="Search teachers"
+            placeholder="Search teachers…"
             value={search}
             onChange={e=>
               setSearch(e.target.value)
@@ -1369,7 +1350,7 @@ function StaffManager({
             <button
               onClick={()=>setAdding(true)}
             >
-              + Add staff
+              + Add teacher
             </button>
           }
 
@@ -1510,8 +1491,8 @@ function StaffEditor({
 
       notice(
         staff
-          ?'Staff member updated'
-          :'Staff member added'
+          ?'Teacher updated'
+          :'Teacher added'
       );
     }catch(e:any){
       notice(e.message);
@@ -1532,7 +1513,7 @@ function StaffEditor({
           method:'POST',
           body:JSON.stringify({
             pin:newPin,
-            admin_password:adminPassword
+            account_password:adminPassword
           })
         }
       );
@@ -1541,7 +1522,7 @@ function StaffEditor({
       setAdminPassword('');
       setResettingPin(false);
 
-      notice('Staff PIN reset');
+      notice('Teacher PIN reset');
     }catch(e:any){
       notice(e.message);
     }finally{
@@ -1671,14 +1652,14 @@ function StaffEditor({
               )
             }
           >
-            Reset PIN
+          Reset teacher PIN
           </button>
         }
       </div>
 
       {staff&&resettingPin&&
         <div className="danger-confirm">
-          <h3>Reset staff PIN</h3>
+          <h3>Reset teacher PIN</h3>
 
           <label>
             New 4-digit PIN
@@ -1698,7 +1679,7 @@ function StaffEditor({
           </label>
 
           <label>
-            Current Admin password
+            Your account password
             <input
               type="password"
               autoComplete="current-password"

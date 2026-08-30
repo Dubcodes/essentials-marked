@@ -52,8 +52,44 @@ def claim(request: Request, kind: str, db: Session):
     return session
 def admin(request: Request, db: Session=Depends(get_db)):
     session=claim(request,'admin',db); a=db.get(Account,session.subject_id)
-    if not a or not a.active: raise HTTPException(401,'Session revoked')
+    if not a or not a.active or a.role not in {'admin','administration','teacher'}: raise HTTPException(401,'Session revoked')
     return a
+
+ACCOUNT_ROLES={'admin','administration','teacher'}
+MAX_ACCOUNT_PASSWORD_BYTES=72
+
+def require_roles(*allowed_roles:str):
+    allowed=set(allowed_roles)
+    def guard(a:Account=Depends(admin)):
+        if a.role not in ACCOUNT_ROLES or a.role not in allowed:
+            raise HTTPException(403,'Your account role does not allow this action')
+        return a
+    return guard
+
+admin_only=require_roles('admin')
+operations_account=require_roles('admin','administration')
+
+def current_account_session_id(request:Request,db:Session):
+    raw=request.cookies.get('admin')
+    if not raw:return None
+    row=db.scalar(select(AppSession).where(
+        AppSession.token_hash==hashlib.sha256(raw.encode()).hexdigest(),
+        AppSession.subject_type=='admin'
+    ))
+    return row.id if row else None
+
+def revoke_account_sessions(db:Session,account_id:str,keep_session_id:str|None=None):
+    sessions=list(db.scalars(select(AppSession).where(
+        AppSession.subject_type=='admin',
+        AppSession.subject_id==account_id,
+        AppSession.revoked_at.is_(None)
+    )))
+    revoked=0
+    for session in sessions:
+        if keep_session_id and session.id==keep_session_id:
+            continue
+        session.revoked_at=now();revoked+=1
+    return revoked
 def parent(request: Request, db: Session=Depends(get_db)):
     session=claim(request,'parent',db); p=db.get(Parent,session.subject_id)
     if not p or not p.active: raise HTTPException(401,'Session revoked')
@@ -95,12 +131,35 @@ def room_for_device(db, d, room_id):
     return room
 
 
+def verify_account_password(db:Session,a:Account,password:str,scope:str='account_confirm',detail:str='Account password incorrect'):
+    enforce_failure_limit(db,scope,a.id)
+    try:
+        valid=bool(password) and len(password.encode('utf-8'))<=MAX_ACCOUNT_PASSWORD_BYTES and pwd.verify(password,a.password_hash)
+    except ValueError:
+        valid=False
+    if not valid:
+        record_auth_failure(db,scope,a.id)
+        raise HTTPException(403,detail)
+    clear_auth_failures(db,scope,a.id)
+
 def verify_admin_password(db:Session,a:Account,password:str):
-    enforce_failure_limit(db,'admin_confirm',a.id)
-    if not password or not pwd.verify(password,a.password_hash):
-        record_auth_failure(db,'admin_confirm',a.id)
-        raise HTTPException(403,'Admin password incorrect')
-    clear_auth_failures(db,'admin_confirm',a.id)
+    verify_account_password(db,a,password,'admin_confirm','Admin password incorrect')
+
+def normalise_account_email(value:str):
+    email=value.strip().lower()
+    if len(email)<3 or len(email)>255 or '@' not in email or email.startswith('@') or email.endswith('@'):
+        raise HTTPException(422,'Enter a valid account email address')
+    return email
+
+def validate_account_password(value:str):
+    if len(value.encode('utf-8'))>MAX_ACCOUNT_PASSWORD_BYTES:
+        raise HTTPException(422,'Password must be 72 bytes or fewer')
+
+def account_out(a:Account,db:Session|None=None):
+    result={'id':a.id,'email':a.email,'role':a.role,'active':a.active}
+    if db:
+        centre=db.get(Centre,a.centre_id);result['centre_id']=a.centre_id;result['centre_name']=centre.name if centre else None
+    return result
 
 class Login(BaseModel): email: str; password: str
 class ParentLogin(BaseModel): login: str; pin: str = Field(pattern=r'^\d{6}$')
@@ -130,6 +189,23 @@ class SignatureIn(BaseModel): signer_name:str=Field(min_length=2,max_length=200)
 class DataRequestIn(BaseModel): child_id:str; start_date:date; end_date:date; note:str|None=Field(default=None,max_length=1500)
 class DataRequestAction(BaseModel): status:Literal['new','in_progress','completed','declined']
 class BrandingIn(BaseModel): display_name:str|None=Field(default=None,max_length=200); secondary_text:str|None=Field(default=None,max_length=240); timezone:str|None=Field(default=None,max_length=80)
+class AccountPasswordChangeIn(BaseModel):
+    current_password:str=Field(min_length=1,max_length=300)
+    new_password:str=Field(min_length=8,max_length=300)
+    confirm_new_password:str=Field(min_length=8,max_length=300)
+class AccountCreateIn(BaseModel):
+    email:str=Field(min_length=3,max_length=255)
+    password:str=Field(min_length=8,max_length=300)
+    role:Literal['admin','administration','teacher']='administration'
+    active:bool=True
+class AccountUpdateIn(BaseModel):
+    email:str|None=Field(default=None,min_length=3,max_length=255)
+    role:Literal['admin','administration','teacher']|None=None
+    active:bool|None=None
+class AccountPasswordResetIn(BaseModel):
+    current_password:str=Field(min_length=1,max_length=300)
+    new_password:str=Field(min_length=8,max_length=300)
+    confirm_new_password:str=Field(min_length=8,max_length=300)
 
 class RoomAdminIn(BaseModel):
     name:str=Field(min_length=2,max_length=100)
@@ -155,7 +231,7 @@ class StaffAdminUpdateIn(BaseModel):
     active:bool|None=None
 
 class StaffPinResetIn(BaseModel):
-    admin_password:str=Field(min_length=1,max_length=300)
+    account_password:str=Field(min_length=1,max_length=300)
     pin:str=Field(pattern=r'^\d{4}$')
 
 class ChildAdminCreateIn(BaseModel):
@@ -178,8 +254,12 @@ class ChildAdminUpdateIn(BaseModel):
 def health(): return {'status':'ok'}
 @app.post('/api/auth/admin/login')
 def admin_login(body: Login, response: Response, request: Request, db: Session=Depends(get_db)):
-    key=body.email.lower();enforce_failure_limit(db,'admin',key);a=db.scalar(select(Account).where(Account.email==key))
-    if not a or not pwd.verify(body.password,a.password_hash):record_auth_failure(db,'admin',key);raise HTTPException(401,'Invalid credentials')
+    key=body.email.strip().lower();enforce_failure_limit(db,'admin',key);a=db.scalar(select(Account).where(Account.email==key))
+    try:
+        valid=bool(a and a.active and a.role in ACCOUNT_ROLES) and len(body.password.encode('utf-8'))<=MAX_ACCOUNT_PASSWORD_BYTES and pwd.verify(body.password,a.password_hash)
+    except ValueError:
+        valid=False
+    if not valid:record_auth_failure(db,'admin',key);raise HTTPException(401,'Invalid credentials')
     clear_auth_failures(db,'admin',key)
     issue_session(response,'admin',a.id,a.centre_id,720)
     return {'centre_id':a.centre_id,'role':a.role}
@@ -201,8 +281,106 @@ def logout(request:Request,response:Response,db:Session=Depends(get_db)):
     db.commit()
     return {'ok':True}
 
+@app.post('/api/auth/account/logout')
+def account_logout(request:Request,response:Response,db:Session=Depends(get_db)):
+    session=claim(request,'admin',db)
+    session.revoked_at=now()
+    response.delete_cookie('admin')
+    db.commit()
+    return {'ok':True}
+
+@app.get('/api/auth/account/me')
+def account_me(a:Account=Depends(admin),db:Session=Depends(get_db)):
+    return account_out(a,db)
+
+@app.post('/api/auth/account/password')
+def change_account_password(body:AccountPasswordChangeIn,request:Request,a:Account=Depends(admin),db:Session=Depends(get_db)):
+    if body.new_password!=body.confirm_new_password:
+        raise HTTPException(422,'New password confirmation does not match')
+    validate_account_password(body.new_password)
+    verify_account_password(db,a,body.current_password,'account_password_change','Current password incorrect')
+    if pwd.verify(body.new_password,a.password_hash):
+        raise HTTPException(409,'New password must be different from the current password')
+    keep=current_account_session_id(request,db)
+    a.password_hash=pwd.hash(body.new_password)
+    revoked=revoke_account_sessions(db,a.id,keep)
+    audit(db,a.centre_id,'account',a.id,'password_changed',after={'other_sessions_revoked':revoked},actor=a.id)
+    db.commit()
+    return {'ok':True,'other_sessions_revoked':revoked,'current_session_kept':True}
+
+@app.get('/api/admin/settings')
+def admin_settings(a:Account=Depends(admin_only),db:Session=Depends(get_db)):
+    centre=db.get(Centre,a.centre_id)
+    return {
+        'display_name':centre.display_name,
+        'secondary_text':centre.secondary_text,
+        'timezone':centre.timezone,
+        'account_count':db.scalar(select(func.count()).select_from(Account).where(Account.centre_id==a.centre_id))
+    }
+
+@app.get('/api/admin/accounts')
+def admin_accounts(a:Account=Depends(admin_only),db:Session=Depends(get_db)):
+    rows=db.scalars(select(Account).where(Account.centre_id==a.centre_id).order_by(Account.email))
+    return [account_out(x) for x in rows]
+
+@app.post('/api/admin/accounts')
+def create_account(body:AccountCreateIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
+    email=normalise_account_email(body.email)
+    validate_account_password(body.password)
+    if db.scalar(select(Account.id).where(Account.email==email)):
+        raise HTTPException(409,'An account with that email already exists')
+    account=Account(centre_id=a.centre_id,email=email,password_hash=pwd.hash(body.password),role=body.role,active=body.active)
+    db.add(account);db.flush()
+    audit(db,a.centre_id,'account',account.id,'created',after={'email':account.email,'role':account.role,'active':account.active,'password_set':True},actor=a.id)
+    db.commit()
+    return account_out(account)
+
+@app.patch('/api/admin/accounts/{account_id}')
+def update_account(account_id:str,body:AccountUpdateIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
+    target=db.scalar(select(Account).where(Account.id==account_id,Account.centre_id==a.centre_id))
+    if not target:raise HTTPException(404,'Account not found')
+    changes=body.model_dump(exclude_unset=True)
+    if target.id==a.id and (changes.get('active') is False or ('role' in changes and changes['role']!='admin')):
+        raise HTTPException(409,'Use another Admin account to deactivate or change the role of your current account')
+    removes_admin=target.active and target.role=='admin' and (changes.get('active') is False or changes.get('role') in {'administration','teacher'})
+    if removes_admin:
+        remaining=list(db.scalars(select(Account).where(Account.centre_id==a.centre_id,Account.active.is_(True),Account.role=='admin',Account.id!=target.id).with_for_update()))
+        if not remaining:raise HTTPException(409,'A centre must retain at least one active Admin account')
+    before={'email':target.email,'role':target.role,'active':target.active}
+    if 'email' in changes:
+        email=normalise_account_email(changes['email'])
+        duplicate=db.scalar(select(Account.id).where(Account.email==email,Account.id!=target.id))
+        if duplicate:raise HTTPException(409,'An account with that email already exists')
+        target.email=email
+    if 'role' in changes:target.role=changes['role']
+    if 'active' in changes:target.active=changes['active']
+    revoked=0
+    if target.id!=a.id and (changes.get('active') is False or 'role' in changes):
+        revoked=revoke_account_sessions(db,target.id)
+    after={'email':target.email,'role':target.role,'active':target.active}
+    audit(db,a.centre_id,'account',target.id,'updated',before=before,after={**after,'sessions_revoked':revoked},actor=a.id)
+    db.commit()
+    return account_out(target)
+
+@app.post('/api/admin/accounts/{account_id}/password-reset')
+def reset_account_password(account_id:str,body:AccountPasswordResetIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
+    if body.new_password!=body.confirm_new_password:
+        raise HTTPException(422,'New password confirmation does not match')
+    validate_account_password(body.new_password)
+    verify_account_password(db,a,body.current_password,'account_password_reset','Current Admin password incorrect')
+    target=db.scalar(select(Account).where(Account.id==account_id,Account.centre_id==a.centre_id))
+    if not target:raise HTTPException(404,'Account not found')
+    if target.id==a.id:raise HTTPException(409,'Use Change my password for your own account')
+    if pwd.verify(body.new_password,target.password_hash):
+        raise HTTPException(409,'New password must be different from the existing password')
+    target.password_hash=pwd.hash(body.new_password)
+    revoked=revoke_account_sessions(db,target.id)
+    audit(db,a.centre_id,'account',target.id,'password_reset',after={'sessions_revoked':revoked},actor=a.id)
+    db.commit()
+    return {'ok':True,'sessions_revoked':revoked}
+
 @app.get('/api/admin/bootstrap')
-def bootstrap(a:Account=Depends(admin),db:Session=Depends(get_db)):
+def bootstrap(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
     c=db.get(Centre,a.centre_id)
 
     attendance={
@@ -293,6 +471,7 @@ def bootstrap(a:Account=Depends(admin),db:Session=Depends(get_db)):
     )
 
     return {
+        'account':account_out(a),
         'centre':{
             'id':c.id,
             'name':c.name,
@@ -325,7 +504,7 @@ def bootstrap(a:Account=Depends(admin),db:Session=Depends(get_db)):
                 'revoked':x.revoked
             }
             for x in scoped(db,Device,a.centre_id)
-        ],
+        ] if a.role=='admin' else [],
         'incident_drafts':db.scalar(
             select(func.count())
             .select_from(Incident)
@@ -358,7 +537,7 @@ def bootstrap(a:Account=Depends(admin),db:Session=Depends(get_db)):
 @app.post('/api/admin/rooms')
 def create_room(
     body:RoomAdminIn,
-    a:Account=Depends(admin),
+    a:Account=Depends(admin_only),
     db:Session=Depends(get_db)
 ):
     room=Room(
@@ -399,7 +578,7 @@ def create_room(
 def update_room(
     room_id:str,
     body:RoomAdminIn,
-    a:Account=Depends(admin),
+    a:Account=Depends(admin_only),
     db:Session=Depends(get_db)
 ):
     room=db.scalar(
@@ -451,7 +630,7 @@ def update_room(
 def delete_room(
     room_id:str,
     body:RoomDeleteIn,
-    a:Account=Depends(admin),
+    a:Account=Depends(admin_only),
     db:Session=Depends(get_db)
 ):
     verify_admin_password(db,a,body.admin_password)
@@ -558,7 +737,7 @@ def delete_room(
 @app.post('/api/admin/staff')
 def create_staff(
     body:StaffAdminCreateIn,
-    a:Account=Depends(admin),
+    a:Account=Depends(operations_account),
     db:Session=Depends(get_db)
 ):
     staff=Staff(
@@ -608,7 +787,7 @@ def create_staff(
 def update_staff(
     staff_id:str,
     body:StaffAdminUpdateIn,
-    a:Account=Depends(admin),
+    a:Account=Depends(operations_account),
     db:Session=Depends(get_db)
 ):
     staff=db.scalar(
@@ -676,10 +855,10 @@ def update_staff(
 def reset_staff_pin(
     staff_id:str,
     body:StaffPinResetIn,
-    a:Account=Depends(admin),
+    a:Account=Depends(operations_account),
     db:Session=Depends(get_db)
 ):
-    verify_admin_password(db,a,body.admin_password)
+    verify_account_password(db,a,body.account_password,'teacher_pin_reset_confirm','Your account password is incorrect')
 
     staff=db.scalar(
         select(Staff).where(
@@ -701,7 +880,7 @@ def reset_staff_pin(
         'pin_reset',
         after={'pin_reset':True},
         actor=a.id,
-        reason='Password-confirmed admin PIN reset'
+        reason='Password-confirmed teacher PIN reset'
     )
 
     db.commit()
@@ -736,7 +915,7 @@ def admin_room(
 @app.post('/api/admin/children')
 def create_child(
     body:ChildAdminCreateIn,
-    a:Account=Depends(admin),
+    a:Account=Depends(operations_account),
     db:Session=Depends(get_db)
 ):
     admin_room(db,a.centre_id,body.room_id)
@@ -784,7 +963,7 @@ def create_child(
 def update_child(
     child_id:str,
     body:ChildAdminUpdateIn,
-    a:Account=Depends(admin),
+    a:Account=Depends(operations_account),
     db:Session=Depends(get_db)
 ):
     child=db.scalar(
@@ -888,21 +1067,21 @@ def update_child(
 
 
 @app.post('/api/admin/pairings')
-def create_pairing(body:PairIn,a:Account=Depends(admin),db:Session=Depends(get_db)):
+def create_pairing(body:PairIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     if body.room_id and not db.scalar(select(Room).where(Room.id==body.room_id,Room.centre_id==a.centre_id)): raise HTTPException(404,'Room not found')
-    raw=secrets.token_urlsafe(32); challenge=str(secrets.randbelow(900)+100); p=Pairing(centre_id=a.centre_id,room_id=body.room_id,label=body.label,token_hash=hashlib.sha256(raw.encode()).hexdigest(),challenge=challenge,expires_at=now()+timedelta(seconds=90));db.add(p);db.commit();origin=os.getenv('PUBLIC_ORIGIN','http://localhost:5173').rstrip('/');url=f'{origin}/classroom/pair?token={raw}'
+    raw=secrets.token_urlsafe(32); challenge=str(secrets.randbelow(900)+100); p=Pairing(centre_id=a.centre_id,room_id=body.room_id,label=body.label,token_hash=hashlib.sha256(raw.encode()).hexdigest(),challenge=challenge,expires_at=now()+timedelta(seconds=90));db.add(p);db.flush();audit(db,a.centre_id,'pairing',p.id,'created',after={'room_id':p.room_id,'label':p.label,'expires_at':p.expires_at.isoformat()},actor=a.id);db.commit();origin=os.getenv('PUBLIC_ORIGIN','http://localhost:5173').rstrip('/');url=f'{origin}/classroom/pair?token={raw}'
     try:
         import qrcode
         image=qrcode.make(url);buffer=io.BytesIO();image.save(buffer,format='PNG');qr='data:image/png;base64,'+base64.b64encode(buffer.getvalue()).decode()
     except ImportError:qr=None
     return {'id':p.id,'token':raw,'challenge':challenge,'expires_at':p.expires_at,'label':p.label,'pairing_url':url,'qr_data_url':qr}
 @app.get('/api/admin/pairings/{pairing_id}')
-def pairing_status(pairing_id:str,a:Account=Depends(admin),db:Session=Depends(get_db)):
+def pairing_status(pairing_id:str,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     p=db.scalar(select(Pairing).where(Pairing.id==pairing_id,Pairing.centre_id==a.centre_id))
     if not p:raise HTTPException(404,'Pairing not found')
     return {'id':p.id,'label':p.label,'expires_at':p.expires_at,'consumed_at':p.consumed_at,'device_id':p.device_id}
 @app.get('/api/admin/events')
-def events(day:str|None=None,room_id:str|None=None,staff_id:str|None=None,a:Account=Depends(admin),db:Session=Depends(get_db)):
+def events(day:str|None=None,room_id:str|None=None,staff_id:str|None=None,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
     q=select(Event).where(Event.centre_id==a.centre_id)
     if room_id:q=q.where(Event.room_id==room_id)
     if staff_id:q=q.where(Event.performed_by_id==staff_id)
@@ -910,7 +1089,7 @@ def events(day:str|None=None,room_id:str|None=None,staff_id:str|None=None,a:Acco
         local=datetime.fromisoformat(day).date();zone=ZoneInfo(db.get(Centre,a.centre_id).timezone);start=datetime.combine(local,datetime.min.time(),tzinfo=zone).astimezone(timezone.utc);end=datetime.combine(local+timedelta(days=1),datetime.min.time(),tzinfo=zone).astimezone(timezone.utc);q=q.where(Event.effective_at>=start,Event.effective_at<end)
     return [event_out(e,db) for e in db.scalars(q.order_by(Event.created_at.desc()).limit(500))]
 @app.patch('/api/admin/events/{event_id}/attribution')
-def correct(event_id:str,body:Correction,a:Account=Depends(admin),db:Session=Depends(get_db)):
+def correct(event_id:str,body:Correction,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     e=db.scalar(select(Event).where(Event.id==event_id,Event.centre_id==a.centre_id))
     if not e:raise HTTPException(404,'Record not found')
     if e.type in ('medicine','incident') and e.finalised:raise HTTPException(409,'Finalised high-consequence records require individual revision workflow')
@@ -918,19 +1097,43 @@ def correct(event_id:str,body:Correction,a:Account=Depends(admin),db:Session=Dep
     if not st:raise HTTPException(404,'Staff not found')
     before={'performed_by_id':e.performed_by_id};e.performed_by_id=st.id;e.updated_at=now();audit(db,a.centre_id,'event',e.id,'attribution_corrected',before,{'performed_by_id':st.id},a.id,body.reason);db.commit();return event_out(e,db)
 @app.get('/api/admin/audit')
-def audits(a:Account=Depends(admin),db:Session=Depends(get_db)): return [{'id':x.id,'entity':x.entity,'entity_id':x.entity_id,'action':x.action,'before':x.before,'after':x.after,'reason':x.reason,'created_at':x.created_at} for x in db.scalars(select(Audit).where(Audit.centre_id==a.centre_id).order_by(Audit.created_at.desc()).limit(200))]
+def audits(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    q=select(Audit).where(Audit.centre_id==a.centre_id)
+    if a.role=='administration':
+        # Administration may review only the exact classroom actions that are
+        # currently recorded in Audit. Entity-only filtering would also expose
+        # Admin-only attribution corrections on the event entity.
+        classroom_actions=[
+            ('attendance','arrive'),('attendance','depart'),
+            ('attendance','visit'),('attendance','end_visit'),
+            ('incident','draft_discarded')
+        ]
+        q=q.where(or_(*[
+            (Audit.entity==entity) & (Audit.action==action)
+            for entity,action in classroom_actions
+        ]))
+    rows=db.scalars(q.order_by(Audit.created_at.desc()).limit(200))
+    return [
+        {'id':x.id,'entity':x.entity,'entity_id':x.entity_id,'action':x.action,
+         'before':x.before,'after':x.after,'actor_id':x.actor_id,
+         'reason':x.reason,'created_at':x.created_at}
+        for x in rows
+    ]
 @app.post('/api/admin/devices/{device_id}/revoke')
-def revoke(device_id:str,a:Account=Depends(admin),db:Session=Depends(get_db)):
-    d=db.scalar(select(Device).where(Device.id==device_id,Device.centre_id==a.centre_id));
+def revoke(device_id:str,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
+    d=db.scalar(select(Device).where(Device.id==device_id,Device.centre_id==a.centre_id))
     if not d:raise HTTPException(404,'Device not found')
-    d.revoked=True;db.commit();return {'ok':True}
+    before={'revoked':d.revoked,'label':d.label,'default_room_id':d.default_room_id}
+    d.revoked=True
+    audit(db,a.centre_id,'device',d.id,'revoked',before=before,after={'revoked':True},actor=a.id)
+    db.commit();return {'ok':True}
 @app.patch('/api/admin/data-requests/{request_id}')
-def update_data_request(request_id:str,body:DataRequestAction,a:Account=Depends(admin),db:Session=Depends(get_db)):
+def update_data_request(request_id:str,body:DataRequestAction,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
     item=db.scalar(select(ParentDataRequest).where(ParentDataRequest.id==request_id,ParentDataRequest.centre_id==a.centre_id))
     if not item:raise HTTPException(404,'Request not found')
     before={'status':item.status};item.status=body.status;item.updated_at=now();item.handled_by_id=a.id;audit(db,a.centre_id,'parent_data_request',item.id,'status_changed',before,{'status':item.status},a.id);db.commit();return {'id':item.id,'status':item.status}
 @app.patch('/api/admin/branding')
-def update_branding(body:BrandingIn,a:Account=Depends(admin),db:Session=Depends(get_db)):
+def update_branding(body:BrandingIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     centre=db.get(Centre,a.centre_id);centre.display_name=body.display_name or None;centre.secondary_text=body.secondary_text or None
     if body.timezone:
         try:ZoneInfo(body.timezone)
@@ -938,7 +1141,7 @@ def update_branding(body:BrandingIn,a:Account=Depends(admin),db:Session=Depends(
         centre.timezone=body.timezone
     audit(db,a.centre_id,'centre',centre.id,'branding_updated',actor=a.id);db.commit();return {'display_name':centre.display_name,'secondary_text':centre.secondary_text,'timezone':centre.timezone}
 @app.post('/api/admin/branding/logo')
-async def upload_branding_logo(file:UploadFile=File(...),a:Account=Depends(admin),db:Session=Depends(get_db)):
+async def upload_branding_logo(file:UploadFile=File(...),a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     if file.content_type not in {'image/png','image/jpeg','image/webp'}:raise HTTPException(422,'Logo must be PNG, JPEG, or WebP')
     raw=await file.read(5_000_001)
     if len(raw)>5_000_000:raise HTTPException(422,'Logo must be 5 MB or smaller')
@@ -949,12 +1152,12 @@ async def upload_branding_logo(file:UploadFile=File(...),a:Account=Depends(admin
     os.makedirs(MEDIA_DIR,exist_ok=True);name=f'centre-{a.centre_id}.webp';path=os.path.join(MEDIA_DIR,name);image.save(path,'WEBP',quality=88)
     centre=db.get(Centre,a.centre_id);centre.logo_path=name;audit(db,a.centre_id,'centre',centre.id,'logo_updated',actor=a.id);db.commit();return {'logo_url':f'/api/branding/{centre.id}/logo'}
 @app.delete('/api/admin/branding/logo')
-def remove_branding_logo(a:Account=Depends(admin),db:Session=Depends(get_db)):
+def remove_branding_logo(a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     centre=db.get(Centre,a.centre_id)
     if centre.logo_path:
         path=os.path.join(MEDIA_DIR,os.path.basename(centre.logo_path))
         if os.path.isfile(path):os.remove(path)
-    centre.logo_path=None;db.commit();return {'ok':True}
+    centre.logo_path=None;audit(db,a.centre_id,'centre',centre.id,'logo_removed',actor=a.id);db.commit();return {'ok':True}
 @app.get('/api/branding/{centre_id}/logo')
 def branding_logo(centre_id:str,db:Session=Depends(get_db)):
     centre=db.get(Centre,centre_id)
@@ -1157,7 +1360,7 @@ def classroom_sleep_status(d:Device=Depends(device),db:Session=Depends(get_db)):
     return {'active':len(sessions),'status':worst,'sessions':items}
 
 @app.post('/api/medication/authorities')
-def medication_authority(body:MedicationAuthorityIn,a:Account=Depends(admin),db:Session=Depends(get_db)):
+def medication_authority(body:MedicationAuthorityIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     child=db.scalar(select(Child).where(Child.id==body.child_id,Child.centre_id==a.centre_id))
     if not child: raise HTTPException(404,'Child not found')
     authority=MedicationAuthority(centre_id=a.centre_id,child_id=child.id,status='draft',**body.model_dump(exclude={'child_id','signer_name'}))
