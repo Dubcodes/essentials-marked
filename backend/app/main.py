@@ -94,6 +94,14 @@ def room_for_device(db, d, room_id):
     if not room: raise HTTPException(404,'Room not found for this centre')
     return room
 
+
+def verify_admin_password(db:Session,a:Account,password:str):
+    enforce_failure_limit(db,'admin_confirm',a.id)
+    if not password or not pwd.verify(password,a.password_hash):
+        record_auth_failure(db,'admin_confirm',a.id)
+        raise HTTPException(403,'Admin password incorrect')
+    clear_auth_failures(db,'admin_confirm',a.id)
+
 class Login(BaseModel): email: str; password: str
 class ParentLogin(BaseModel): login: str; pin: str = Field(pattern=r'^\d{6}$')
 class EventIn(BaseModel): client_id: str = Field(min_length=10,max_length=80); child_ids: list[str] = Field(min_length=1,max_length=50); type: Literal['nappy','toilet','food','sunscreen','staff_note','supply']; room_id: str; effective_at: datetime | None=None; performed_by_id: str | None=None; data: dict = Field(default_factory=dict)
@@ -122,6 +130,49 @@ class SignatureIn(BaseModel): signer_name:str=Field(min_length=2,max_length=200)
 class DataRequestIn(BaseModel): child_id:str; start_date:date; end_date:date; note:str|None=Field(default=None,max_length=1500)
 class DataRequestAction(BaseModel): status:Literal['new','in_progress','completed','declined']
 class BrandingIn(BaseModel): display_name:str|None=Field(default=None,max_length=200); secondary_text:str|None=Field(default=None,max_length=240); timezone:str|None=Field(default=None,max_length=80)
+
+class RoomAdminIn(BaseModel):
+    name:str=Field(min_length=2,max_length=100)
+    accent:str=Field(default='#176b5b',pattern=r'^#[0-9A-Fa-f]{6}$')
+    icon:str=Field(default='??',min_length=1,max_length=40)
+
+class RoomDeleteIn(BaseModel):
+    admin_password:str=Field(min_length=1,max_length=300)
+
+class StaffAdminCreateIn(BaseModel):
+    first_name:str=Field(min_length=1,max_length=100)
+    last_name:str=Field(min_length=1,max_length=100)
+    preferred_name:str|None=Field(default=None,max_length=100)
+    employment_type:str=Field(default='permanent',min_length=2,max_length=40)
+    active:bool=True
+    pin:str|None=Field(default=None,pattern=r'^\d{4}$')
+
+class StaffAdminUpdateIn(BaseModel):
+    first_name:str|None=Field(default=None,min_length=1,max_length=100)
+    last_name:str|None=Field(default=None,min_length=1,max_length=100)
+    preferred_name:str|None=Field(default=None,max_length=100)
+    employment_type:str|None=Field(default=None,min_length=2,max_length=40)
+    active:bool|None=None
+
+class StaffPinResetIn(BaseModel):
+    admin_password:str=Field(min_length=1,max_length=300)
+    pin:str=Field(pattern=r'^\d{4}$')
+
+class ChildAdminCreateIn(BaseModel):
+    first_name:str=Field(min_length=1,max_length=100)
+    last_name:str=Field(default='',max_length=100)
+    preferred_name:str|None=Field(default=None,max_length=100)
+    dob:str|None=Field(default=None,pattern=r'^\d{4}-\d{2}-\d{2}$')
+    room_id:str|None=None
+    active:bool=True
+
+class ChildAdminUpdateIn(BaseModel):
+    first_name:str|None=Field(default=None,min_length=1,max_length=100)
+    last_name:str|None=Field(default=None,max_length=100)
+    preferred_name:str|None=Field(default=None,max_length=100)
+    dob:str|None=Field(default=None,pattern=r'^\d{4}-\d{2}-\d{2}$')
+    room_id:str|None=None
+    active:bool|None=None
 
 @app.get('/api/health')
 def health(): return {'status':'ok'}
@@ -153,17 +204,689 @@ def logout(request:Request,response:Response,db:Session=Depends(get_db)):
 @app.get('/api/admin/bootstrap')
 def bootstrap(a:Account=Depends(admin),db:Session=Depends(get_db)):
     c=db.get(Centre,a.centre_id)
-    attendance={x.child_id:x for x in db.scalars(select(Attendance).where(Attendance.centre_id==a.centre_id,Attendance.departed_at.is_(None)))}
-    rooms=list(scoped(db,Room,a.centre_id));room_names={r.id:r.name for r in rooms}
+
+    attendance={
+        x.child_id:x
+        for x in db.scalars(
+            select(Attendance).where(
+                Attendance.centre_id==a.centre_id,
+                Attendance.departed_at.is_(None)
+            )
+        )
+    }
+
+    rooms=list(scoped(db,Room,a.centre_id))
+    room_names={r.id:r.name for r in rooms}
+
+    child_models=list(scoped(db,Child,a.centre_id))
     children=[]
-    for child in scoped(db,Child,a.centre_id):
-        row=attendance.get(child.id);physical=row.visit_room_id if row and row.visit_room_id and row.visit_ended_at is None else child.room_id
-        children.append(public_child(child)|{'present':bool(row),'arrived_at':row.arrived_at if row else None,'physical_room_id':physical,'physical_room':room_names.get(physical),'enrolled_room':room_names.get(child.room_id)})
-    requests=list(db.scalars(select(ParentDataRequest).where(ParentDataRequest.centre_id==a.centre_id).order_by(ParentDataRequest.created_at.desc())))
-    return {'centre': {'id':c.id,'name':c.name,'branch':c.branch,'parent_history_days':c.parent_history_days,'timezone':c.timezone,'display_name':c.display_name,'secondary_text':c.secondary_text,'logo_url':f'/api/branding/{c.id}/logo' if c.logo_path else None}, 'rooms':[{'id':x.id,'name':x.name,'accent':x.accent,'icon':x.icon} for x in rooms], 'staff':[{'id':x.id,'name':(x.preferred_name or x.first_name)+' '+x.last_name[:1]+'.','active':x.active} for x in scoped(db,Staff,a.centre_id)], 'children':children, 'families':db.scalar(select(func.count()).select_from(Parent).where(Parent.centre_id==a.centre_id)), 'devices':[{'id':x.id,'label':x.label,'default_room_id':x.default_room_id,'default_room':room_names.get(x.default_room_id),'last_active_at':x.last_active_at,'revoked':x.revoked} for x in scoped(db,Device,a.centre_id)],'incident_drafts':db.scalar(select(func.count()).select_from(Incident).where(Incident.centre_id==a.centre_id,Incident.status=='draft')),'data_requests':[{'id':x.id,'child_id':x.child_id,'child_name':(db.get(Child,x.child_id).preferred_name or db.get(Child,x.child_id).first_name),'start_date':x.start_date,'end_date':x.end_date,'note':x.note,'status':x.status,'created_at':x.created_at} for x in requests],'demo_mode':os.getenv('DEMO_SEED','false').lower()=='true'}
+
+    for child in child_models:
+        row=attendance.get(child.id)
+
+        physical=(
+            row.visit_room_id
+            if row and row.visit_room_id and row.visit_ended_at is None
+            else child.room_id
+        )
+
+        children.append({
+            'id':child.id,
+            'first_name':child.first_name,
+            'last_name':child.last_name,
+            'preferred_name':child.preferred_name,
+            'display_name':child.preferred_name or child.first_name,
+            'dob':child.dob,
+            'room_id':child.room_id,
+            'active':child.active,
+            'present':bool(row),
+            'arrived_at':row.arrived_at if row else None,
+            'physical_room_id':physical,
+            'physical_room':room_names.get(physical),
+            'enrolled_room':room_names.get(child.room_id)
+        })
+
+    room_data=[]
+
+    for room in rooms:
+        room_data.append({
+            'id':room.id,
+            'name':room.name,
+            'accent':room.accent,
+            'icon':room.icon,
+            'enrolled_count':sum(
+                1
+                for child in child_models
+                if child.active and child.room_id==room.id
+            ),
+            'present_count':sum(
+                1
+                for child in children
+                if child['present'] and child['physical_room_id']==room.id
+            )
+        })
+
+    staff=[]
+
+    for item in scoped(db,Staff,a.centre_id):
+        staff.append({
+            'id':item.id,
+            'first_name':item.first_name,
+            'last_name':item.last_name,
+            'preferred_name':item.preferred_name,
+            'name':(
+                (item.preferred_name or item.first_name)
+                +' '
+                +item.last_name[:1]
+                +'.'
+            ),
+            'employment_type':item.employment_type,
+            'active':item.active
+        })
+
+    requests=list(
+        db.scalars(
+            select(ParentDataRequest)
+            .where(ParentDataRequest.centre_id==a.centre_id)
+            .order_by(ParentDataRequest.created_at.desc())
+        )
+    )
+
+    return {
+        'centre':{
+            'id':c.id,
+            'name':c.name,
+            'branch':c.branch,
+            'parent_history_days':c.parent_history_days,
+            'timezone':c.timezone,
+            'display_name':c.display_name,
+            'secondary_text':c.secondary_text,
+            'logo_url':(
+                f'/api/branding/{c.id}/logo'
+                if c.logo_path
+                else None
+            )
+        },
+        'rooms':room_data,
+        'staff':staff,
+        'children':children,
+        'families':db.scalar(
+            select(func.count())
+            .select_from(Parent)
+            .where(Parent.centre_id==a.centre_id)
+        ),
+        'devices':[
+            {
+                'id':x.id,
+                'label':x.label,
+                'default_room_id':x.default_room_id,
+                'default_room':room_names.get(x.default_room_id),
+                'last_active_at':x.last_active_at,
+                'revoked':x.revoked
+            }
+            for x in scoped(db,Device,a.centre_id)
+        ],
+        'incident_drafts':db.scalar(
+            select(func.count())
+            .select_from(Incident)
+            .where(
+                Incident.centre_id==a.centre_id,
+                Incident.status=='draft'
+            )
+        ),
+        'data_requests':[
+            {
+                'id':x.id,
+                'child_id':x.child_id,
+                'child_name':(
+                    db.get(Child,x.child_id).preferred_name
+                    or db.get(Child,x.child_id).first_name
+                ),
+                'start_date':x.start_date,
+                'end_date':x.end_date,
+                'note':x.note,
+                'status':x.status,
+                'created_at':x.created_at
+            }
+            for x in requests
+        ],
+        'demo_mode':(
+            os.getenv('DEMO_SEED','false').lower()=='true'
+        )
+    }
+
 @app.post('/api/admin/rooms')
-def create_room(body:RoomIn,a:Account=Depends(admin),db:Session=Depends(get_db)):
-    r=Room(centre_id=a.centre_id,**body.model_dump());db.add(r);db.commit();return {'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon}
+def create_room(
+    body:RoomAdminIn,
+    a:Account=Depends(admin),
+    db:Session=Depends(get_db)
+):
+    room=Room(
+        centre_id=a.centre_id,
+        name=body.name.strip(),
+        accent=body.accent.upper(),
+        icon=body.icon.strip()
+    )
+
+    db.add(room)
+    db.flush()
+
+    audit(
+        db,
+        a.centre_id,
+        'room',
+        room.id,
+        'created',
+        after={
+            'name':room.name,
+            'accent':room.accent,
+            'icon':room.icon
+        },
+        actor=a.id
+    )
+
+    db.commit()
+
+    return {
+        'id':room.id,
+        'name':room.name,
+        'accent':room.accent,
+        'icon':room.icon
+    }
+
+
+@app.patch('/api/admin/rooms/{room_id}')
+def update_room(
+    room_id:str,
+    body:RoomAdminIn,
+    a:Account=Depends(admin),
+    db:Session=Depends(get_db)
+):
+    room=db.scalar(
+        select(Room).where(
+            Room.id==room_id,
+            Room.centre_id==a.centre_id
+        )
+    )
+
+    if not room:
+        raise HTTPException(404,'Room not found')
+
+    before={
+        'name':room.name,
+        'accent':room.accent,
+        'icon':room.icon
+    }
+
+    room.name=body.name.strip()
+    room.accent=body.accent.upper()
+    room.icon=body.icon.strip()
+
+    audit(
+        db,
+        a.centre_id,
+        'room',
+        room.id,
+        'updated',
+        before=before,
+        after={
+            'name':room.name,
+            'accent':room.accent,
+            'icon':room.icon
+        },
+        actor=a.id
+    )
+
+    db.commit()
+
+    return {
+        'id':room.id,
+        'name':room.name,
+        'accent':room.accent,
+        'icon':room.icon
+    }
+
+
+@app.post('/api/admin/rooms/{room_id}/delete')
+def delete_room(
+    room_id:str,
+    body:RoomDeleteIn,
+    a:Account=Depends(admin),
+    db:Session=Depends(get_db)
+):
+    verify_admin_password(db,a,body.admin_password)
+
+    room=db.scalar(
+        select(Room).where(
+            Room.id==room_id,
+            Room.centre_id==a.centre_id
+        )
+    )
+
+    if not room:
+        raise HTTPException(404,'Room not found')
+
+    references={
+        'children':db.scalar(
+            select(func.count())
+            .select_from(Child)
+            .where(Child.room_id==room.id)
+        ),
+        'devices':db.scalar(
+            select(func.count())
+            .select_from(Device)
+            .where(Device.default_room_id==room.id)
+        ),
+        'attendance':db.scalar(
+            select(func.count())
+            .select_from(Attendance)
+            .where(
+                or_(
+                    Attendance.room_id==room.id,
+                    Attendance.visit_room_id==room.id,
+                    Attendance.last_visit_room_id==room.id
+                )
+            )
+        ),
+        'room visits':db.scalar(
+            select(func.count())
+            .select_from(RoomVisit)
+            .where(RoomVisit.room_id==room.id)
+        ),
+        'care records':db.scalar(
+            select(func.count())
+            .select_from(Event)
+            .where(Event.room_id==room.id)
+        ),
+        'sleep sessions':db.scalar(
+            select(func.count())
+            .select_from(SleepSession)
+            .where(SleepSession.room_id==room.id)
+        ),
+        'sleep checks':db.scalar(
+            select(func.count())
+            .select_from(SleepCheck)
+            .where(SleepCheck.room_id==room.id)
+        ),
+        'pairings':db.scalar(
+            select(func.count())
+            .select_from(Pairing)
+            .where(Pairing.room_id==room.id)
+        ),
+        'incidents':db.scalar(
+            select(func.count())
+            .select_from(Incident)
+            .where(Incident.room_id==room.id)
+        )
+    }
+
+    used=[
+        name
+        for name,count in references.items()
+        if count
+    ]
+
+    if used:
+        raise HTTPException(
+            409,
+            'Room cannot be permanently deleted because it is used by: '
+            +', '.join(used)
+            +'. Keep the room for history or move/archive the dependencies first.'
+        )
+
+    room_id_copy=room.id
+    room_name=room.name
+
+    db.delete(room)
+
+    audit(
+        db,
+        a.centre_id,
+        'room',
+        room_id_copy,
+        'deleted',
+        before={'name':room_name},
+        actor=a.id,
+        reason='Password-confirmed admin deletion'
+    )
+
+    db.commit()
+
+    return {'ok':True}
+
+
+@app.post('/api/admin/staff')
+def create_staff(
+    body:StaffAdminCreateIn,
+    a:Account=Depends(admin),
+    db:Session=Depends(get_db)
+):
+    staff=Staff(
+        centre_id=a.centre_id,
+        first_name=body.first_name.strip(),
+        last_name=body.last_name.strip(),
+        preferred_name=(
+            body.preferred_name.strip()
+            if body.preferred_name
+            else None
+        ),
+        employment_type=body.employment_type.strip(),
+        active=body.active,
+        pin_hash=(
+            pwd.hash(body.pin)
+            if body.pin
+            else None
+        )
+    )
+
+    db.add(staff)
+    db.flush()
+
+    audit(
+        db,
+        a.centre_id,
+        'staff',
+        staff.id,
+        'created',
+        after={
+            'first_name':staff.first_name,
+            'last_name':staff.last_name,
+            'preferred_name':staff.preferred_name,
+            'employment_type':staff.employment_type,
+            'active':staff.active,
+            'pin_set':bool(body.pin)
+        },
+        actor=a.id
+    )
+
+    db.commit()
+
+    return {'id':staff.id}
+
+
+@app.patch('/api/admin/staff/{staff_id}')
+def update_staff(
+    staff_id:str,
+    body:StaffAdminUpdateIn,
+    a:Account=Depends(admin),
+    db:Session=Depends(get_db)
+):
+    staff=db.scalar(
+        select(Staff).where(
+            Staff.id==staff_id,
+            Staff.centre_id==a.centre_id
+        )
+    )
+
+    if not staff:
+        raise HTTPException(404,'Staff member not found')
+
+    before={
+        'first_name':staff.first_name,
+        'last_name':staff.last_name,
+        'preferred_name':staff.preferred_name,
+        'employment_type':staff.employment_type,
+        'active':staff.active
+    }
+
+    updates=body.model_dump(exclude_unset=True)
+
+    if 'first_name' in updates:
+        staff.first_name=updates['first_name'].strip()
+
+    if 'last_name' in updates:
+        staff.last_name=updates['last_name'].strip()
+
+    if 'preferred_name' in updates:
+        staff.preferred_name=(
+            updates['preferred_name'].strip()
+            if updates['preferred_name']
+            else None
+        )
+
+    if 'employment_type' in updates:
+        staff.employment_type=updates['employment_type'].strip()
+
+    if 'active' in updates:
+        staff.active=updates['active']
+
+    audit(
+        db,
+        a.centre_id,
+        'staff',
+        staff.id,
+        'updated',
+        before=before,
+        after={
+            'first_name':staff.first_name,
+            'last_name':staff.last_name,
+            'preferred_name':staff.preferred_name,
+            'employment_type':staff.employment_type,
+            'active':staff.active
+        },
+        actor=a.id
+    )
+
+    db.commit()
+
+    return {'ok':True}
+
+
+@app.post('/api/admin/staff/{staff_id}/pin-reset')
+def reset_staff_pin(
+    staff_id:str,
+    body:StaffPinResetIn,
+    a:Account=Depends(admin),
+    db:Session=Depends(get_db)
+):
+    verify_admin_password(db,a,body.admin_password)
+
+    staff=db.scalar(
+        select(Staff).where(
+            Staff.id==staff_id,
+            Staff.centre_id==a.centre_id
+        )
+    )
+
+    if not staff:
+        raise HTTPException(404,'Staff member not found')
+
+    staff.pin_hash=pwd.hash(body.pin)
+
+    audit(
+        db,
+        a.centre_id,
+        'staff',
+        staff.id,
+        'pin_reset',
+        after={'pin_reset':True},
+        actor=a.id,
+        reason='Password-confirmed admin PIN reset'
+    )
+
+    db.commit()
+
+    return {'ok':True}
+
+
+def admin_room(
+    db:Session,
+    centre_id:str,
+    room_id:str|None
+):
+    if not room_id:
+        return None
+
+    room=db.scalar(
+        select(Room).where(
+            Room.id==room_id,
+            Room.centre_id==centre_id
+        )
+    )
+
+    if not room:
+        raise HTTPException(
+            422,
+            'Choose a valid room for this centre'
+        )
+
+    return room
+
+
+@app.post('/api/admin/children')
+def create_child(
+    body:ChildAdminCreateIn,
+    a:Account=Depends(admin),
+    db:Session=Depends(get_db)
+):
+    admin_room(db,a.centre_id,body.room_id)
+
+    child=Child(
+        centre_id=a.centre_id,
+        room_id=body.room_id,
+        first_name=body.first_name.strip(),
+        last_name=body.last_name.strip(),
+        preferred_name=(
+            body.preferred_name.strip()
+            if body.preferred_name
+            else None
+        ),
+        dob=body.dob,
+        active=body.active
+    )
+
+    db.add(child)
+    db.flush()
+
+    audit(
+        db,
+        a.centre_id,
+        'child',
+        child.id,
+        'created',
+        after={
+            'first_name':child.first_name,
+            'last_name':child.last_name,
+            'preferred_name':child.preferred_name,
+            'dob':child.dob,
+            'room_id':child.room_id,
+            'active':child.active
+        },
+        actor=a.id
+    )
+
+    db.commit()
+
+    return {'id':child.id}
+
+
+@app.patch('/api/admin/children/{child_id}')
+def update_child(
+    child_id:str,
+    body:ChildAdminUpdateIn,
+    a:Account=Depends(admin),
+    db:Session=Depends(get_db)
+):
+    child=db.scalar(
+        select(Child).where(
+            Child.id==child_id,
+            Child.centre_id==a.centre_id
+        )
+    )
+
+    if not child:
+        raise HTTPException(404,'Child not found')
+
+    before={
+        'first_name':child.first_name,
+        'last_name':child.last_name,
+        'preferred_name':child.preferred_name,
+        'dob':child.dob,
+        'room_id':child.room_id,
+        'active':child.active
+    }
+
+    updates=body.model_dump(exclude_unset=True)
+
+    if 'room_id' in updates:
+        admin_room(
+            db,
+            a.centre_id,
+            updates['room_id']
+        )
+        child.room_id=updates['room_id']
+
+    if 'first_name' in updates:
+        child.first_name=updates['first_name'].strip()
+
+    if 'last_name' in updates:
+        child.last_name=updates['last_name'].strip()
+
+    if 'preferred_name' in updates:
+        child.preferred_name=(
+            updates['preferred_name'].strip()
+            if updates['preferred_name']
+            else None
+        )
+
+    if 'dob' in updates:
+        child.dob=updates['dob']
+
+    if 'active' in updates and updates['active'] is False and child.active:
+        open_sleep=db.scalar(
+            select(SleepSession.id).where(
+                SleepSession.centre_id==a.centre_id,
+                SleepSession.child_id==child.id,
+                SleepSession.got_up_at.is_(None)
+            )
+        )
+
+        if open_sleep:
+            raise HTTPException(
+                409,
+                'Record Got up before archiving a child with an open sleep session'
+            )
+
+        present=db.scalar(
+            select(Attendance.id).where(
+                Attendance.centre_id==a.centre_id,
+                Attendance.child_id==child.id,
+                Attendance.departed_at.is_(None)
+            )
+        )
+
+        if present:
+            raise HTTPException(
+                409,
+                'Depart the child before archiving them'
+            )
+
+    if 'active' in updates:
+        child.active=updates['active']
+
+    audit(
+        db,
+        a.centre_id,
+        'child',
+        child.id,
+        'updated',
+        before=before,
+        after={
+            'first_name':child.first_name,
+            'last_name':child.last_name,
+            'preferred_name':child.preferred_name,
+            'dob':child.dob,
+            'room_id':child.room_id,
+            'active':child.active
+        },
+        actor=a.id
+    )
+
+    db.commit()
+
+    return {'ok':True}
+
+
 @app.post('/api/admin/pairings')
 def create_pairing(body:PairIn,a:Account=Depends(admin),db:Session=Depends(get_db)):
     if body.room_id and not db.scalar(select(Room).where(Room.id==body.room_id,Room.centre_id==a.centre_id)): raise HTTPException(404,'Room not found')
@@ -250,7 +973,7 @@ def pair(body:PairComplete,response:Response,db:Session=Depends(get_db)):
     d=Device(centre_id=p.centre_id,label=p.label,default_room_id=p.room_id);p.consumed_at=now();db.add(d);db.flush();p.device_id=d.id;db.commit();issue_session(response,'device',d.id,d.centre_id,10080);return {'id':d.id,'room_id':d.default_room_id,'label':d.label}
 @app.get('/api/classroom/bootstrap')
 def classroom_bootstrap(d:Device=Depends(device),db:Session=Depends(get_db)):
-    centre=db.get(Centre,d.centre_id);children=list(scoped(db,Child,d.centre_id)); active_att={x.child_id:x for x in db.scalars(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None)))}
+    centre=db.get(Centre,d.centre_id);children=list(db.scalars(select(Child).where(Child.centre_id==d.centre_id,Child.active.is_(True)))); active_att={x.child_id:x for x in db.scalars(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None)))}
     return {'device_id':d.id,'default_room_id':d.default_room_id,'centre':{'id':centre.id,'name':centre.name,'display_name':centre.display_name,'secondary_text':centre.secondary_text,'logo_url':f'/api/branding/{centre.id}/logo' if centre.logo_path else None,'timezone':centre.timezone},'last_confirmed_at':now(),'rooms':[{'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon} for r in scoped(db,Room,d.centre_id)],'staff':[{'id':s.id,'name':(s.preferred_name or s.first_name)+' '+s.last_name[:1]+'.'} for s in scoped(db,Staff,d.centre_id) if s.active],'children':[public_child(c)|{'present':c.id in active_att,'arrived_at':active_att[c.id].arrived_at if c.id in active_att else None,'visiting_room_id':active_att[c.id].visit_room_id if c.id in active_att and active_att[c.id].visit_ended_at is None else None} for c in children],'unread_notes':db.scalar(select(func.count()).select_from(ParentNote).where(ParentNote.centre_id==d.centre_id,ParentNote.read_at.is_(None))),'incident_drafts':db.scalar(select(func.count()).select_from(Incident).where(Incident.centre_id==d.centre_id,Incident.status=='draft'))}
 @app.get('/api/classroom/parent-notes')
 def classroom_parent_notes(d:Device=Depends(device),db:Session=Depends(get_db)):
@@ -295,8 +1018,8 @@ def presence(body:PresenceIn,d:Device=Depends(device),db:Session=Depends(get_db)
 @app.post('/api/classroom/events')
 def create_event(body:EventIn,d:Device=Depends(device),db:Session=Depends(get_db)):
     room_for_device(db,d,body.room_id)
-    staff=db.get(Staff,body.performed_by_id) if body.performed_by_id else None
-    if not staff or staff.centre_id!=d.centre_id:raise HTTPException(422,'Select a valid staff member')
+    staff=db.scalar(select(Staff).where(Staff.id==body.performed_by_id,Staff.centre_id==d.centre_id,Staff.active.is_(True))) if body.performed_by_id else None
+    if not staff:raise HTTPException(422,'Select a valid active staff member')
     data=clean_domain_data(body.data);material={'child_ids':sorted(set(body.child_ids)),'type':body.type,'room_id':body.room_id,'effective_at':body.effective_at,'performed_by_id':staff.id,'data':data};fingerprint=request_fingerprint(material)
     prior=db.scalar(select(DomainOperation).where(DomainOperation.centre_id==d.centre_id,DomainOperation.domain=='ordinary',DomainOperation.client_operation_id==body.client_id))
     if prior:

@@ -291,3 +291,268 @@ def test_production_startup_guard_rejects_defaults(monkeypatch):
     monkeypatch.setattr(main_module,'SECRET','x'*40);monkeypatch.setattr(main_module,'secure_cookie',True)
     monkeypatch.setenv('DEMO_SEED','false');monkeypatch.setenv('DATABASE_URL','postgresql+psycopg://user:unique@db/app');monkeypatch.setenv('PUBLIC_ORIGIN','https://example.test')
     assert main_module.seed() is None
+def test_admin_management_rooms_children_and_staff():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+
+    try:
+        client=TestClient(app)
+
+        assert client.post(
+            '/api/auth/admin/login',
+            json={
+                'email':'a@test',
+                'password':'secret'
+            }
+        ).status_code==200
+
+        created_room=client.post(
+            '/api/admin/rooms',
+            json={
+                'name':'Demo New Room',
+                'accent':'#123ABC',
+                'icon':'🚀'
+            }
+        )
+
+        assert created_room.status_code==200
+        room_id=created_room.json()['id']
+
+        edited_room=client.patch(
+            f'/api/admin/rooms/{room_id}',
+            json={
+                'name':'Demo Edited Room',
+                'accent':'#ABC123',
+                'icon':'⭐'
+            }
+        )
+
+        assert edited_room.status_code==200
+        assert edited_room.json()['name']=='Demo Edited Room'
+
+        child_response=client.post(
+            '/api/admin/children',
+            json={
+                'first_name':'Demo',
+                'last_name':'Child',
+                'preferred_name':'Demi',
+                'dob':'2023-05-01',
+                'room_id':room_id,
+                'active':True
+            }
+        )
+
+        assert child_response.status_code==200
+        child_id=child_response.json()['id']
+
+        bootstrap=client.get(
+            '/api/admin/bootstrap'
+        ).json()
+
+        created_child=next(
+            item
+            for item in bootstrap['children']
+            if item['id']==child_id
+        )
+
+        assert created_child['first_name']=='Demo'
+        assert created_child['preferred_name']=='Demi'
+        assert created_child['room_id']==room_id
+
+        assert client.patch(
+            f'/api/admin/children/{child_id}',
+            json={'active':False}
+        ).status_code==200
+
+        staff_response=client.post(
+            '/api/admin/staff',
+            json={
+                'first_name':'Demo',
+                'last_name':'Teacher',
+                'preferred_name':'DT',
+                'employment_type':'reliever',
+                'active':True,
+                'pin':'4567'
+            }
+        )
+
+        assert staff_response.status_code==200
+        staff_id=staff_response.json()['id']
+
+        db.expire_all()
+        created_staff=db.get(Staff,staff_id)
+
+        assert created_staff is not None
+        assert created_staff.pin_hash!='4567'
+        assert pwd.verify(
+            '4567',
+            created_staff.pin_hash
+        )
+
+        wrong=client.post(
+            f'/api/admin/staff/{staff_id}/pin-reset',
+            json={
+                'admin_password':'wrong',
+                'pin':'7654'
+            }
+        )
+
+        assert wrong.status_code==403
+
+        good=client.post(
+            f'/api/admin/staff/{staff_id}/pin-reset',
+            json={
+                'admin_password':'secret',
+                'pin':'7654'
+            }
+        )
+
+        assert good.status_code==200
+
+        db.expire_all()
+        assert pwd.verify(
+            '7654',
+            db.get(Staff,staff_id).pin_hash
+        )
+
+        blocked_delete=client.post(
+            f'/api/admin/rooms/{room_id}/delete',
+            json={'admin_password':'secret'}
+        )
+
+        assert blocked_delete.status_code==409
+
+        empty_room=client.post(
+            '/api/admin/rooms',
+            json={
+                'name':'Disposable Room',
+                'accent':'#112233',
+                'icon':'🧪'
+            }
+        ).json()
+
+        assert client.post(
+            f"/api/admin/rooms/{empty_room['id']}/delete",
+            json={'admin_password':'wrong'}
+        ).status_code==403
+
+        assert client.post(
+            f"/api/admin/rooms/{empty_room['id']}/delete",
+            json={'admin_password':'secret'}
+        ).status_code==200
+
+        db.expire_all()
+
+        assert db.query(Audit).filter(
+            Audit.entity.in_([
+                'room',
+                'child',
+                'staff'
+            ])
+        ).count()>=6
+
+    finally:
+        db.close()
+
+def test_admin_archive_visibility_and_inactive_staff_guard():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+
+    try:
+        client=TestClient(app)
+
+        paired(client,room)
+
+        child=children[0]
+
+        # An operationally present child cannot simply disappear
+        # from classroom management by being archived.
+        arrived=client.post(
+            '/api/classroom/presence',
+            json={
+                'child_id':child.id,
+                'room_id':room.id,
+                'action':'arrive',
+                'staff_id':staff.id
+            }
+        )
+
+        assert arrived.status_code==200
+
+        blocked=client.patch(
+            f'/api/admin/children/{child.id}',
+            json={'active':False}
+        )
+
+        assert blocked.status_code==409
+        assert 'Depart' in blocked.text
+
+        departed=client.post(
+            '/api/classroom/presence',
+            json={
+                'child_id':child.id,
+                'room_id':room.id,
+                'action':'depart',
+                'staff_id':staff.id
+            }
+        )
+
+        assert departed.status_code==200
+
+        archived=client.patch(
+            f'/api/admin/children/{child.id}',
+            json={'active':False}
+        )
+
+        assert archived.status_code==200
+
+        classroom=client.get(
+            '/api/classroom/bootstrap'
+        )
+
+        assert classroom.status_code==200
+
+        visible_ids={
+            item['id']
+            for item in classroom.json()['children']
+        }
+
+        assert child.id not in visible_ids
+
+        # Historical staff remain in the DB, but cannot continue
+        # recording new ordinary care after deactivation.
+        disabled=client.patch(
+            f'/api/admin/staff/{staff.id}',
+            json={'active':False}
+        )
+
+        assert disabled.status_code==200
+
+        classroom=client.get(
+            '/api/classroom/bootstrap'
+        ).json()
+
+        staff_ids={
+            item['id']
+            for item in classroom['staff']
+        }
+
+        assert staff.id not in staff_ids
+
+        ordinary=client.post(
+            '/api/classroom/events',
+            json={
+                'client_id':'inactive-staff-op-001',
+                'child_ids':[children[1].id],
+                'type':'sunscreen',
+                'room_id':room.id,
+                'performed_by_id':staff.id,
+                'data':{
+                    'application':'exposed skin'
+                }
+            }
+        )
+
+        assert ordinary.status_code==422
+        assert 'active staff' in ordinary.text
+
+    finally:
+        db.close()

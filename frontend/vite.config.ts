@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-const APP_VERSION = '0.1.0-demo';
+const APP_VERSION = '0.1.1-demo';
 const BUILD_TIME = new Date().toISOString();
 
 export default defineConfig({
