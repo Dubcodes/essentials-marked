@@ -1,7 +1,7 @@
 import os
 import hashlib
 import io
-from datetime import timedelta
+from datetime import timedelta,datetime,timezone
 import pytest
 from sqlalchemy import select
 os.environ['DATABASE_URL']='sqlite:///./test.db'
@@ -397,6 +397,136 @@ def test_account_logout_preserves_paired_device_and_login_fails_closed():
         assert client.get('/api/classroom/bootstrap').status_code==200
         db.refresh(device_session)
         assert device_session.revoked_at is None
+    finally:db.close()
+
+def test_family_management_activity_correction_and_immediate_sleep():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        admin=TestClient(app);assert admin.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+        family=admin.post('/api/admin/families',json={'name':'New family','login':'new-family','pin':'654321','child_ids':[children[0].id]}).json()
+        assert family['children'][0]['id']==children[0].id
+        assert admin.patch(f'/api/admin/families/{family["id"]}',json={'active':False,'child_ids':[children[1].id]}).status_code==200
+        assert admin.post(f'/api/admin/families/{family["id"]}/pin-reset',json={'account_password':'wrong','pin':'111111'}).status_code==403
+        assert admin.post(f'/api/admin/families/{family["id"]}/pin-reset',json={'account_password':'secret','pin':'111111'}).status_code==200
+        assert TestClient(app).post('/api/auth/parent/login',json={'login':'new-family','pin':'111111'}).status_code==401
+
+        device=TestClient(app);paired(device,room)
+        event=device.post('/api/classroom/events',json={'client_id':'correctable-event-001','child_ids':[children[0].id],'type':'nappy','room_id':room.id,'performed_by_id':staff.id,'data':{'outcome':'wet'}}).json()['events'][0]
+        office=admin.post('/api/admin/accounts',json={'email':'office@test','password':'office-pass','role':'administration'}).json()
+        office_client=TestClient(app);assert office_client.post('/api/auth/admin/login',json={'email':'office@test','password':'office-pass'}).status_code==200
+        assert office_client.get('/api/admin/activity').status_code==200
+        corrected=office_client.patch(f'/api/admin/activity/events/{event["id"]}',json={'reason':'Corrected entry','data':{'outcome':'soiled'}})
+        assert corrected.status_code==200 and corrected.json()['revision']==2
+        assert db.query(Audit).filter_by(entity='event',entity_id=event['id'],action='ordinary_corrected').one().reason=='Corrected entry'
+        assert office_client.patch(f'/api/admin/activity/events/{event["id"]}',json={'reason':'No generic data','data':{'unexpected':'value'}}).status_code==422
+        assert office_client.patch('/api/admin/activity/not-an-audit',json={'reason':'no'}).status_code==404
+
+        medicine=Event(centre_id=centre.id,room_id=room.id,child_id=children[0].id,type='medicine',effective_at=now(),client_id='test-medicine-event',data={},finalised=True)
+        db.add(medicine);db.commit()
+        assert office_client.patch(f'/api/admin/activity/events/{medicine.id}',json={'reason':'No medicine correction'}).status_code==409
+
+        immediate=device.post('/api/classroom/sleep',json={'client_id':'immediate-sleep-001','child_ids':[children[0].id],'room_id':room.id,'action':'fell_asleep','staff_id':staff.id})
+        assert immediate.status_code==200 and immediate.json()['sessions'][0]['session_id']
+        assert device.post('/api/classroom/sleep',json={'client_id':'immediate-sleep-001','child_ids':[children[0].id],'room_id':room.id,'action':'fell_asleep','staff_id':staff.id}).json()['idempotent']
+        session=db.query(SleepSession).filter_by(child_id=children[0].id).one()
+        assert office_client.patch(f'/api/admin/activity/sleep-sessions/{session.id}',json={'reason':'Impossible sleep order','got_up_at':(session.put_down_at-timedelta(minutes=1)).isoformat()}).status_code==422
+        assert office_client.patch(f'/api/admin/activity/sleep-sessions/{session.id}',json={'reason':'Clarified sleep note','note':'Settled quickly'}).status_code==200
+        assert device.post('/api/classroom/sleep',json={'client_id':'sleep-check-001','child_ids':[children[0].id],'room_id':room.id,'action':'check','staff_id':staff.id}).status_code==200
+        check=db.query(SleepCheck).filter_by(sleep_session_id=session.id).one()
+        assert office_client.patch(f'/api/admin/activity/sleep-checks/{check.id}',json={'reason':'Bad enum','warmth':'unsafe'}).status_code==422
+        assert office_client.patch(f'/api/admin/activity/sleep-checks/{check.id}',json={'reason':'Corrected check','warmth':'warm'}).status_code==200
+
+        visitor_room=Room(centre_id=centre.id,name='Visitor room');db.add(visitor_room);db.commit()
+        assert device.post('/api/classroom/presence',json={'child_id':children[1].id,'room_id':room.id,'action':'arrive','staff_id':staff.id}).status_code==200
+        attendance=db.query(Attendance).filter_by(child_id=children[1].id).one()
+        assert office_client.patch(f'/api/admin/activity/attendance/{attendance.id}',json={'reason':'Impossible departure','departed_at':(attendance.arrived_at-timedelta(minutes=1)).isoformat()}).status_code==422
+        assert office_client.patch(f'/api/admin/activity/attendance/{attendance.id}',json={'reason':'Corrected attendance attribution','recorded_by_staff_id':staff.id}).status_code==200
+        assert device.post('/api/classroom/presence',json={'child_id':children[1].id,'room_id':visitor_room.id,'action':'visit','staff_id':staff.id}).status_code==200
+        assert device.post('/api/classroom/presence',json={'child_id':children[1].id,'room_id':visitor_room.id,'action':'end_visit','staff_id':staff.id}).status_code==200
+        recent=device.get('/api/classroom/bootstrap').json()['recent_visitors']
+        assert children[1].id in recent[visitor_room.id]
+        assert all(item['child_id']==children[0].id for item in office_client.get(f'/api/admin/activity?child_id={children[0].id}').json()['items'] if item.get('child_id'))
+        assert office_client.get('/api/admin/activity?category=management').status_code==403
+    finally:db.close()
+
+def test_activity_categories_local_dates_and_source_filters_before_limit():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);assert client.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+        boundary=datetime(2026,8,30,12,0,tzinfo=timezone.utc)
+        target=Event(centre_id=centre.id,room_id=room.id,child_id=children[0].id,type='nappy',effective_at=boundary,client_id='target-local-boundary',data={'outcome':'wet'})
+        db.add(target)
+        for index in range(30):db.add(Event(centre_id=centre.id,room_id=room.id,child_id=children[1].id,type='nappy',effective_at=now()+timedelta(minutes=index),client_id=f'unrelated-{index}',data={'outcome':'dry'}))
+        db.add_all([Audit(centre_id=centre.id,entity='child',entity_id=children[0].id,action='updated',after={}),Audit(centre_id=centre.id,entity='account',entity_id=account.id,action='password_reset',after={}),Audit(centre_id=centre.id,entity='future_sensitive',entity_id='unknown',action='future_action',after={})]);db.commit()
+        assert any(item['id']==target.id for item in client.get(f'/api/admin/activity?child_id={children[0].id}&limit=1').json()['items'])
+        assert any(item['id']==target.id for item in client.get('/api/admin/activity?from_date=2026-08-31&to_date=2026-08-31').json()['items'])
+        assert not any(item['id']==target.id for item in client.get('/api/admin/activity?from_date=2026-08-30&to_date=2026-08-30').json()['items'])
+        management=client.get('/api/admin/activity?category=management').json()['items'];security=client.get('/api/admin/activity?category=security').json()['items']
+        assert all(item['category']=='management' for item in management) and any(item['entity']=='child' for item in management)
+        assert all(item['category']=='security' for item in security) and any(item['entity']=='future_sensitive' for item in security)
+        office=client.post('/api/admin/accounts',json={'email':'office-filter@test','password':'office-pass','role':'administration'}).json();office_client=TestClient(app);assert office_client.post('/api/auth/admin/login',json={'email':'office-filter@test','password':'office-pass'}).status_code==200
+        assert office_client.get('/api/admin/activity?category=security').status_code==403
+    finally:db.close()
+
+def test_recent_visitors_excludes_current_visitors_before_taking_five():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        device=TestClient(app);paired(device,room)
+        extra=[Child(centre_id=centre.id,room_id=room.id,first_name=f'Visitor{index}') for index in range(7)]
+        db.add_all(extra);db.flush()
+        for index,child in enumerate(extra):
+            when=now()-timedelta(minutes=index)
+            active=index<2
+            attendance=Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=when,departed_at=None,visit_room_id=room.id if active else None,visit_started_at=when,visit_ended_at=None if active else when+timedelta(seconds=1),recorded_by_staff_id=staff.id)
+            db.add(attendance);db.flush();db.add(RoomVisit(centre_id=centre.id,attendance_id=attendance.id,child_id=child.id,room_id=room.id,started_at=when,ended_at=None if active else when+timedelta(seconds=1),started_by_staff_id=staff.id))
+        db.commit()
+        assert device.get('/api/classroom/bootstrap').json()['recent_visitors'][room.id]==[child.id for child in extra[2:7]]
+    finally:db.close()
+
+def test_corrections_preserve_lifecycle_shape_and_activity_candidates():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        admin=TestClient(app);assert admin.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+        device=TestClient(app);paired(device,room)
+        assert device.post('/api/classroom/presence',json={'child_id':children[0].id,'room_id':room.id,'action':'arrive','staff_id':staff.id}).status_code==200
+        attendance=db.query(Attendance).filter_by(child_id=children[0].id).one()
+        assert admin.patch(f'/api/admin/activity/attendance/{attendance.id}',json={'reason':'Not a departure','departed_at':(attendance.arrived_at+timedelta(minutes=10)).isoformat()}).status_code==422
+        visitor_room=Room(centre_id=centre.id,name='Correction visitor room');db.add(visitor_room);db.commit()
+        assert device.post('/api/classroom/presence',json={'child_id':children[0].id,'room_id':visitor_room.id,'action':'visit','staff_id':staff.id}).status_code==200
+        visit=db.query(RoomVisit).filter_by(attendance_id=attendance.id).one()
+        assert admin.patch(f'/api/admin/activity/room-visits/{visit.id}',json={'reason':'Not an operational end','ended_at':(visit.started_at+timedelta(minutes=5)).isoformat()}).status_code==422
+        assert device.post('/api/classroom/presence',json={'child_id':children[0].id,'room_id':visitor_room.id,'action':'end_visit','staff_id':staff.id}).status_code==200
+        db.refresh(attendance);db.refresh(visit)
+        corrected_start=visit.started_at+timedelta(minutes=1);corrected_end=visit.ended_at+timedelta(minutes=1)
+        assert admin.patch(f'/api/admin/activity/room-visits/{visit.id}',json={'reason':'Corrected completed visit','started_at':corrected_start.isoformat(),'ended_at':corrected_end.isoformat()}).status_code==200
+        db.refresh(attendance);db.refresh(visit)
+        assert attendance.visit_started_at==visit.started_at and attendance.visit_ended_at==visit.ended_at
+        other_staff=Staff(centre_id=centre.id,first_name='Other',last_name='Teacher',pin_hash=pwd.hash('4567'));db.add(other_staff);db.commit()
+        assert device.post('/api/classroom/presence',json={'child_id':children[0].id,'room_id':visitor_room.id,'action':'visit','staff_id':staff.id}).status_code==200
+        assert device.post('/api/classroom/presence',json={'child_id':children[0].id,'room_id':visitor_room.id,'action':'end_visit','staff_id':staff.id}).status_code==200
+        db.refresh(attendance)
+        current_started,current_ended,current_room=attendance.visit_started_at,attendance.visit_ended_at,attendance.last_visit_room_id
+        attribution=admin.patch(f'/api/admin/activity/room-visits/{visit.id}',json={'reason':'Corrected historical end attribution','ended_by_staff_id':other_staff.id})
+        assert attribution.status_code==200 and db.query(Audit).filter_by(entity='room_visit',entity_id=visit.id,action='ordinary_corrected').count()>=2
+        db.refresh(attendance);db.refresh(visit)
+        assert (attendance.visit_started_at,attendance.visit_ended_at,attendance.last_visit_room_id)==(current_started,current_ended,current_room)
+        assert visit.ended_by_staff_id==other_staff.id
+        assert admin.patch(f'/api/admin/activity/room-visits/{visit.id}',json={'reason':'Old visit timestamp is not represented','ended_at':(visit.ended_at+timedelta(seconds=1)).isoformat()}).status_code==409
+        assert device.post('/api/classroom/sleep',json={'client_id':'shape-sleep','child_ids':[children[1].id],'room_id':room.id,'action':'put_down','staff_id':staff.id}).status_code==200
+        session=db.query(SleepSession).filter_by(child_id=children[1].id).one()
+        assert admin.patch(f'/api/admin/activity/sleep-sessions/{session.id}',json={'reason':'Not asleep transition','fell_asleep_at':(session.put_down_at+timedelta(minutes=2)).isoformat()}).status_code==422
+        assert admin.patch(f'/api/admin/activity/sleep-sessions/{session.id}',json={'reason':'Not wake transition','woke_at':(session.put_down_at+timedelta(minutes=3)).isoformat()}).status_code==422
+        assert admin.patch(f'/api/admin/activity/sleep-sessions/{session.id}',json={'reason':'Not get-up transition','got_up_at':(session.put_down_at+timedelta(minutes=4)).isoformat()}).status_code==422
+        assert admin.patch(f'/api/admin/activity/sleep-sessions/{session.id}',json={'reason':'No wake metadata yet','quality':'rested'}).status_code==422
+        assert admin.patch(f'/api/admin/activity/sleep-sessions/{session.id}',json={'reason':'No closure attribution yet','closed_by_staff_id':staff.id}).status_code==422
+        target=Event(centre_id=centre.id,room_id=room.id,child_id=children[0].id,type='staff_note',effective_at=now()-timedelta(days=1),client_id='older-search-match',data={'note':'needle phrase'})
+        db.add(target)
+        for index in range(240):db.add(Audit(centre_id=centre.id,entity='account',entity_id=account.id,action='password_reset',after={},created_at=now()+timedelta(minutes=index)))
+        management=Audit(centre_id=centre.id,entity='child',entity_id=children[0].id,action='updated',after={},created_at=now()-timedelta(days=1));db.add(management)
+        for index in range(30):db.add(Event(centre_id=centre.id,room_id=room.id,child_id=children[1].id,type='staff_note',effective_at=now()+timedelta(minutes=index),client_id=f'newer-search-{index}',data={'note':'other'}))
+        db.commit()
+        assert any(item['id']==management.id for item in admin.get('/api/admin/activity?category=management&limit=20').json()['items'])
+        assert any(item['id']==target.id for item in admin.get('/api/admin/activity?search=needle&limit=1').json()['items'])
     finally:db.close()
 def test_admin_management_rooms_children_and_staff():
     db,centre,account,room,other_room,staff,children,parent=setup()

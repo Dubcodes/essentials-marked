@@ -55,6 +55,10 @@ export const restoreContext=(data:Bootstrap)=>({
         ''
 });
 
+export const escapeClosesView=(view:View)=>view!=='medicine'&&view!=='incident';
+export const ignoresClassroomShortcut=(target:HTMLElement|null)=>!!(target&&(['INPUT','TEXTAREA','SELECT'].includes(target.tagName)||target.isContentEditable));
+export const noticeFadeDelay=59500;
+
 export default function Classroom(){
   const[data,setData]=useState<Bootstrap>();
   const[roomId,setRoomState]=useState('');
@@ -64,11 +68,39 @@ export default function Classroom(){
     useState<SleepAction>('put_down');
 
   const[notice,setNotice]=useState('');
+  const[noticeFading,setNoticeFading]=useState(false);
+  const[noticeVersion,setNoticeVersion]=useState(0);
   const[syncState,setSyncState]=useState('Synced');
   const[sleeps,setSleeps]=useState<SleepSession[]>([]);
   const[meds,setMeds]=useState<any[]>([]);
   const[wake,setWake]=useState('Wake lock starting');
   const[offlineSnapshot,setOfflineSnapshot]=useState(false);
+
+  useEffect(()=>{
+    if(!notice)return;
+    setNoticeFading(false);
+    const fade=window.setTimeout(()=>setNoticeFading(true),noticeFadeDelay);
+    const remove=window.setTimeout(()=>setNotice(''),60000);
+    return()=>{window.clearTimeout(fade);window.clearTimeout(remove)};
+  },[notice,noticeVersion]);
+
+  const showNotice=(value:string)=>{setNoticeFading(false);setNotice(value);setNoticeVersion(version=>version+1)};
+
+  useEffect(()=>{
+    const onKey=(event:KeyboardEvent)=>{
+      const target=event.target as HTMLElement|null;
+      if(ignoresClassroomShortcut(target))return;
+      if(event.key==='Escape'&&escapeClosesView(view)){setView('');return}
+      if(event.key==='/'){window.dispatchEvent(new Event('classroom-focus-search'));event.preventDefault();return}
+      if(event.key==='?'){setView('help');return}
+      if(!event.altKey)return;
+      const views:Record<string,View>={'1':'toileting','3':'sleep-check','4':'food','5':'sunscreen','6':'medicine','7':'incident','8':'presence'};
+      if(event.key==='2'){setSleepAction('put_down');setView('sleep');event.preventDefault();return}
+      if(views[event.key]){setView(views[event.key]);event.preventDefault()}
+    };
+    window.addEventListener('keydown',onKey);
+    return()=>window.removeEventListener('keydown',onKey);
+  },[view]);
 
   const refresh=async()=>{
     const[
@@ -236,7 +268,7 @@ export default function Classroom(){
     refresh:async()=>{
       await refresh();
     },
-    notice:setNotice
+    notice:showNotice
   };
 
   return(
@@ -366,7 +398,7 @@ export default function Classroom(){
 
         {notice&&
           <p
-            className="notice"
+            className={`notice ${noticeFading?'fading':''}`}
             role="status"
           >
             {notice}

@@ -2,6 +2,8 @@ import React,{useEffect,useMemo,useState}from'react';
 import{api}from'../api';
 import AccountPassword from'../account/AccountPassword';
 import AccountsSettings from'../account/AccountsSettings';
+import FamiliesManager from'./FamiliesManager';
+import ActivityLog from'./ActivityLog';
 import{managementPagesForRole,settingsSections,type AdminPage}from'../account/role-ui';
 
 type Page=AdminPage;
@@ -10,9 +12,9 @@ type Notice=(message:string)=>void;
 
 export default function AdminConsole(){
   const[data,setData]=useState<any>();
-  const[events,setEvents]=useState<any[]>([]);
-  const[audit,setAudit]=useState<any[]>([]);
   const[page,setPage]=useState<Page>('Dashboard');
+  const[activityChild,setActivityChild]=useState('');
+  const[activityRecord,setActivityRecord]=useState<any>();
 
   const[pair,setPair]=useState<any>();
   const[pairState,setPairState]=useState('');
@@ -27,8 +29,6 @@ export default function AdminConsole(){
     setRoom((value:string)=>
       value||boot.rooms[0]?.id||''
     );
-    setEvents(await api('/admin/events'));
-    setAudit(await api('/admin/audit'));
   };
 
   useEffect(()=>{
@@ -151,14 +151,6 @@ export default function AdminConsole(){
           ↻ Refresh
         </button>
 
-        {isAdmin&&<button
-          onClick={()=>setPage('Devices')}
-        >
-          Add classroom tablet
-        </button>}
-
-        <AccountPassword/>
-
         <button
           className="minor"
           onClick={()=>void api(
@@ -203,7 +195,7 @@ export default function AdminConsole(){
 
           {page==='Dashboard'&&
             <>
-              <div className="cards">
+              <section className="dashboard-section"><h2>Overview</h2><div className="cards">
                 <Card
                   value={present.length}
                   label="present now"
@@ -232,10 +224,13 @@ export default function AdminConsole(){
                   onClick={()=>setPage('Devices')}
                 />}
 
+              </div></section>
+
+              <section className="dashboard-section"><h2>Needs attention</h2><div className="cards">
                 <Card
                   value={data.incident_drafts||0}
                   label="incident drafts"
-                  onClick={()=>setPage('Records')}
+                  onClick={()=>setPage('Activity log')}
                 />
 
                 <Card
@@ -254,18 +249,10 @@ export default function AdminConsole(){
                     setPage('Data requests')
                   }
                 />
-              </div>
+              </div></section>
 
-              <h2>Recent records</h2>
-
-              <Table
-                items={events.slice(0,20)}
-                fields={[
-                  'effective_at',
-                  'type',
-                  'performed_by'
-                ]}
-              />
+              <section className="dashboard-section"><h2>Quick actions</h2><div className="inline-actions"><button onClick={()=>openClassroom(data.rooms[0]?.id)}>Open Classroom</button><button onClick={()=>setPage('Children')}>Children</button><button onClick={()=>setPage('Activity log')}>Activity log</button>{isAdmin&&<button onClick={()=>setPage('Devices')}>Pair new tablet</button>}</div></section>
+              <DashboardActivity notice={notice} openAll={()=>setPage('Activity log')} openRecord={item=>{setActivityRecord(item);setPage('Activity log')}}/>
             </>
           }
 
@@ -282,29 +269,12 @@ export default function AdminConsole(){
               data={data}
               reload={load}
               notice={notice}
+              openHistory={(childId)=>{setActivityRecord(undefined);setActivityChild(childId);setPage('Activity log')}}
+              openRecord={item=>{setActivityRecord(item);setPage('Activity log')}}
             />
           }
 
-          {page==='Families'&&
-            <section className="manager-empty">
-              <div className="manager-toolbar">
-                <div>
-                  <h2>Families</h2>
-                  <p>
-                    {data.families||0} family
-                    accounts.
-                  </p>
-                </div>
-              </div>
-
-              <p>
-                Connected family search,
-                account editing, child links and
-                PIN controls are the next
-                management pass.
-              </p>
-            </section>
-          }
+          {page==='Families'&&<FamiliesManager children={data.children} notice={notice}/>}
 
           {page==='Teachers'&&
             <StaffManager
@@ -370,7 +340,7 @@ export default function AdminConsole(){
                       )
                   }
                 >
-                  Generate 90-second pairing
+                  Pair new tablet
                 </button>
 
                 {pair&&
@@ -432,7 +402,7 @@ export default function AdminConsole(){
                 }
               </div>
 
-              {data.devices.map((device:any)=>
+              {data.devices.filter((device:any)=>!device.revoked).sort((a:any,b:any)=>String(b.last_active_at).localeCompare(String(a.last_active_at))).map((device:any)=>
                 <div
                   className="presence-row"
                   key={device.id}
@@ -440,16 +410,11 @@ export default function AdminConsole(){
                   <span>
                     <b>{device.label}</b>
                     <small>
-                      {device.default_room||
-                       'No default room'} ·{' '}
-                      {device.revoked
-                        ?'revoked'
-                        :'active'}
+                        {device.default_room||'No default room'} · active · {device.last_active_at?new Date(device.last_active_at).toLocaleString():'Never active'}
                     </small>
                   </span>
 
-                  {!device.revoked&&
-                    <button
+                   <button
                       className="danger"
                       onClick={()=>
                         void api(
@@ -460,35 +425,13 @@ export default function AdminConsole(){
                     >
                       Revoke
                     </button>
-                  }
                 </div>
               )}
+              {data.devices.some((device:any)=>device.revoked)&&<details><summary>Revoked / old devices ({data.devices.filter((device:any)=>device.revoked).length})</summary>{data.devices.filter((device:any)=>device.revoked).map((device:any)=><div className="presence-row" key={device.id}><span><b>{device.label}</b><small>{device.default_room||'No default room'} · revoked</small></span></div>)}</details>}
             </>
           }
 
-          {page==='Records'&&
-            <Table
-              items={events}
-              fields={[
-                'effective_at',
-                'type',
-                'performed_by',
-                'room'
-              ]}
-            />
-          }
-
-          {page==='Audit log'&&
-            <Table
-              items={audit}
-              fields={[
-                'created_at',
-                'entity',
-                'action',
-                'reason'
-              ]}
-            />
-          }
+          {page==='Activity log'&&<ActivityLog data={data} isAdmin={isAdmin} notice={notice} initialChildId={activityChild} initialRecord={activityRecord}/>}
 
           {page==='Data requests'&&
             <>
@@ -549,7 +492,7 @@ export default function AdminConsole(){
             </>
           }
 
-          {page==='Settings'&&isAdmin&&<section className="settings-panels"><details open={settingsSections[0].open}><summary>{settingsSections[0].title}</summary><AccountsSettings/></details><details open={settingsSections[1].open}><summary>{settingsSections[1].title}</summary><Branding data={data} saved={async()=>{await load();notice('Branding saved')}}/></details></section>}
+          {page==='Settings'&&<section className="settings-panels"><details><summary>My sign-in</summary><AccountPassword embedded/></details>{isAdmin&&<><details open={settingsSections[0].open}><summary>{settingsSections[0].title}</summary><AccountsSettings/></details><details open={settingsSections[1].open}><summary>{settingsSections[1].title}</summary><Branding data={data} saved={async()=>{await load();notice('Branding saved')}}/></details></>}</section>}
 
           {page==='Help'&&
             <Help demo={data.demo_mode}/>
@@ -599,6 +542,12 @@ function Card({
       <span>{label}</span>
     </div>
   );
+}
+
+function DashboardActivity({notice,openAll,openRecord}:{notice:Notice;openAll:()=>void;openRecord:(item:any)=>void}){
+  const[items,setItems]=useState<any[]>([]);
+  useEffect(()=>{void api('/admin/activity?limit=10').then((result:any)=>setItems(result.items)).catch((error:any)=>notice(error.message))},[]);
+  return <section className="dashboard-section"><div className="manager-toolbar"><h2>Recent activity</h2><button className="minor" onClick={openAll}>View all activity</button></div><div className="person-list">{items.map(item=><button className="person-row" key={`${item.source}-${item.id}`} onClick={()=>openRecord(item)}><span><b>{item.activity||item.type}</b><small>{item.child_name||'Centre'} · {item.teacher||'No teacher'} · {item.room||'No room'}{item.corrected?' · corrected':''}</small></span><small>{new Date(item.effective_at).toLocaleString()}</small></button>)}</div></section>;
 }
 
 
@@ -806,6 +755,10 @@ function RoomEditor({
           />
         </label>
 
+        <div className="icon-presets" aria-label="Room icon presets">
+          {['🌿','☀️','🌳','🌸','🌈','🐝','🦋','🐞','⭐','🌙','🐦'].map(value=><button type="button" className={value===icon?'active':'minor'} key={value} onClick={()=>setIcon(value)}>{value}</button>)}
+        </div>
+
         <label>
           Name
           <input
@@ -925,15 +878,20 @@ function RoomEditor({
 function ChildrenManager({
   data,
   reload,
-  notice
+  notice,
+  openHistory,
+  openRecord
 }:{
   data:any;
   reload:()=>Promise<void>;
   notice:Notice;
+  openHistory:(childId:string)=>void;
+  openRecord:(item:any)=>void;
 }){
-  const[editing,setEditing]=useState(false);
   const[adding,setAdding]=useState(false);
   const[search,setSearch]=useState('');
+  const[selectedChildId,setSelectedChildId]=useState('');
+  const selected=data.children.find((child:any)=>child.id===selectedChildId);
 
   const filtered=useMemo(()=>{
     const query=search
@@ -982,22 +940,10 @@ function ChildrenManager({
             }
           />
 
-          {editing&&
-            <button
-              onClick={()=>setAdding(true)}
-            >
-              + Add child
-            </button>
-          }
-
           <button
-            className="minor"
-            onClick={()=>{
-              setEditing(value=>!value);
-              setAdding(false);
-            }}
+            onClick={()=>setAdding(true)}
           >
-            {editing?'Done':'Edit'}
+            + Add child
           </button>
 
           <button
@@ -1022,22 +968,25 @@ function ChildrenManager({
         />
       }
 
-      <div className="person-card-grid">
-        {filtered.map((child:any)=>
-          editing
-            ?(
-              <ChildEditor
-                key={child.id}
-                child={child}
-                rooms={data.rooms}
-                reload={reload}
-                notice={notice}
-              />
-            )
-            :(
-              <article
+      {selected&&
+        <section className="manager-editor child-detail">
+          <button className="close" onClick={()=>setSelectedChildId('')}>×</button>
+          <h3>{selected.preferred_name||selected.first_name} {selected.last_name}</h3>
+          <p>{selected.present?'Present':'Absent'} · Enrolled: {selected.enrolled_room||'No room'} · Physical: {selected.physical_room||'Not at centre'}</p>
+          <ChildEditor child={selected} rooms={data.rooms} reload={reload} notice={notice}/>
+          <h4>Linked families</h4>
+          <div className="person-list">{selected.families?.length?selected.families.map((family:any)=><div className="person-row" key={family.id}><span><b>{family.name}</b><small>{family.login}</small></span><small>{family.active?'Active':'Inactive'}</small></div>):<p>No family login linked.</p>}</div>
+          <ChildHistory child={selected} notice={notice} openHistory={openHistory} openRecord={openRecord}/>
+        </section>
+      }
+
+      <div className="person-list">
+        {filtered.map((child:any)=>(
+              <button
+                type="button"
+                onClick={()=>setSelectedChildId(child.id)}
                 className={
-                  `person-card ${
+                  `person-row ${
                     child.active
                       ?''
                       :'inactive'
@@ -1045,7 +994,7 @@ function ChildrenManager({
                 }
                 key={child.id}
               >
-                <div>
+                <span>
                   <b>
                     {child.preferred_name||
                      child.first_name}{' '}
@@ -1076,26 +1025,19 @@ function ChildrenManager({
                       Archived
                     </small>
                   }
-                </div>
-
-                {child.room_id&&child.active&&
-                  <button
-                    className="minor"
-                    onClick={()=>
-                      openClassroom(
-                        child.room_id
-                      )
-                    }
-                  >
-                    Open classroom
-                  </button>
-                }
-              </article>
-            )
-        )}
+                </span>
+                <small>{child.active?'Active':'Archived'}</small>
+              </button>
+        ))}
       </div>
     </section>
   );
+}
+
+function ChildHistory({child,notice,openHistory,openRecord}:{child:any;notice:Notice;openHistory:(id:string)=>void;openRecord:(item:any)=>void}){
+  const[items,setItems]=useState<any[]>([]);
+  useEffect(()=>{void api(`/admin/activity?child_id=${child.id}&limit=12`).then((result:any)=>setItems(result.items)).catch((error:any)=>notice(error.message))},[child.id]);
+  return <section className="child-history"><div className="manager-toolbar"><h4>Recent activity</h4><button className="minor" onClick={()=>openHistory(child.id)}>View full history</button></div>{items.map(item=><button className="person-row" key={`${item.source}-${item.id}`} onClick={()=>openRecord(item)}><span><b>{item.activity||item.type}</b><small>{item.teacher||'No teacher'} · {item.room||'No room'}{item.corrected?' · corrected':''}</small></span><small>{new Date(item.effective_at).toLocaleString()}</small></button>)}</section>;
 }
 
 
@@ -1132,6 +1074,15 @@ function ChildEditor({
     child?.active??true
   );
   const[busy,setBusy]=useState(false);
+
+  useEffect(()=>{
+    setFirstName(child?.first_name||'');
+    setLastName(child?.last_name||'');
+    setPreferredName(child?.preferred_name||'');
+    setDob(child?.dob||'');
+    setRoomId(child?.room_id||rooms[0]?.id||'');
+    setActive(child?.active??true);
+  },[child,rooms]);
 
   const save=async()=>{
     try{

@@ -28,6 +28,7 @@ export type Bootstrap={
   children:Child[];
   unread_notes:number;
   incident_drafts?:number;
+  recent_visitors?:Record<string,string[]>;
   last_confirmed_at?:string;
   centre?:{display_name?:string;secondary_text?:string;logo_url?:string|null;timezone?:string};
 };

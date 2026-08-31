@@ -1,7 +1,7 @@
 import React,{useState}from'react';
 import{api}from'../api';
 
-export default function AccountPassword(){
+export default function AccountPassword({embedded=false}:{embedded?:boolean}){
   const[current,setCurrent]=useState('');
   const[next,setNext]=useState('');
   const[confirm,setConfirm]=useState('');
@@ -32,10 +32,7 @@ export default function AccountPassword(){
     }
   };
 
-  return(
-    <details className="account-password">
-      <summary>My account</summary>
-      <div className="account-password-panel">
+  const panel=<div className="account-password-panel">
         <b>Change my password</b>
         <label>
           Current password
@@ -53,7 +50,6 @@ export default function AccountPassword(){
           {busy?'Changing…':'Change password'}
         </button>
         {message&&<small role="status">{message}</small>}
-      </div>
-    </details>
-  );
+      </div>;
+  return embedded?<section className="account-password account-password-embedded">{panel}</section>:<details className="account-password"><summary>My account</summary>{panel}</details>;
 }

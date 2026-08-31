@@ -1,4 +1,4 @@
-import React,{useMemo,useState}from'react';
+import React,{useEffect,useMemo,useRef,useState}from'react';
 import{
   currentRoomPresentIds,
   isPhysicallyInRoom,
@@ -15,6 +15,20 @@ export const selectAllPhysical=(
   return currentRoomPresentIds(eligible,roomId);
 };
 
+export const groupedChildren=(children:Child[],rooms:Room[],roomId:string,recentVisitorIds:string[]=[],query='',presentOnly=false):[string,Child[]][]=>{
+  const names=Object.fromEntries(rooms.map(room=>[room.id,room.name]));
+  const shown=children.filter(c=>(c.first_name+' '+c.last_name).toLowerCase().includes(query.toLowerCase())).filter(c=>!presentOnly||!!c.present);
+  const visiting=shown.filter(c=>isPhysicallyInRoom(c,roomId)&&c.room_id!==roomId);
+  const visitingIds=new Set(visiting.map(c=>c.id));
+  return [[names[roomId]||'Current room',shown.filter(c=>c.room_id===roomId)],['Visiting',visiting],['Recent',recentVisitorIds.map(id=>shown.find(c=>c.id===id)).filter((c):c is Child=>!!c&&!visitingIds.has(c.id))],...rooms.filter(room=>room.id!==roomId).map(room=>[room.name,shown.filter(c=>c.room_id===room.id)] as [string,Child[]])];
+};
+
+export const rosterGroupInfo=(label:string,rooms:Room[],roomId:string)=>{
+  const room=rooms.find(item=>item.name===label);
+  if(room)return {icon:room.icon,accent:room.accent,className:`roster-heading room-heading ${room.id===roomId?'current-room':''}`};
+  return {icon:label==='Visiting'?'↔':'◷',accent:'',className:`roster-heading ${label==='Visiting'?'visiting-heading':'recent-heading'}`};
+};
+
 export function ChildSelector({
   children,
   rooms,
@@ -24,6 +38,7 @@ export function ChildSelector({
   filter,
   eligibilityLabel,
   stateLabel,
+  recentVisitorIds=[],
   bulkLabel='Select all present in this room'
 }:{
   children:Child[];
@@ -34,53 +49,16 @@ export function ChildSelector({
   filter?:(child:Child)=>boolean;
   eligibilityLabel?:(child:Child)=>string;
   stateLabel?:(child:Child)=>string;
+  recentVisitorIds?:string[];
   bulkLabel?:string;
 }){
   const[q,setQ]=useState('');
+  const[presentOnly,setPresentOnly]=useState(false);
+  const searchRef=useRef<HTMLInputElement>(null);
+  useEffect(()=>{const focus=()=>searchRef.current?.focus();window.addEventListener('classroom-focus-search',focus);return()=>window.removeEventListener('classroom-focus-search',focus)},[]);
 
-  const names=Object.fromEntries(
-    rooms.map(r=>[r.id,r.name])
-  );
-
-  const shown=useMemo(
-    ()=>children.filter(
-      c=>(c.first_name+' '+c.last_name)
-          .toLowerCase()
-          .includes(q.toLowerCase())
-    ),
-    [children,q]
-  );
-
-  const groups=[
-    [
-      'In this room',
-      shown.filter(c=>isPhysicallyInRoom(c,roomId)&&c.room_id===roomId)
-    ],
-    [
-      'Visiting this room',
-      shown.filter(c=>isPhysicallyInRoom(c,roomId)&&c.room_id!==roomId)
-    ],
-    [
-      'Enrolled here · absent/elsewhere',
-      shown.filter(
-        c=>c.room_id===roomId&&!isPhysicallyInRoom(c,roomId)
-      )
-    ],
-    [
-      'Other present children',
-      shown.filter(
-        c=>c.present &&
-          c.room_id!==roomId &&
-          !isPhysicallyInRoom(c,roomId)
-      )
-    ],
-    [
-      'Other rooms',
-      q?shown.filter(
-        c=>!c.present&&c.room_id!==roomId
-      ):[]
-    ]
-  ] as [string,Child[]][];
+  const names=Object.fromEntries(rooms.map(r=>[r.id,r.name]));
+  const groups=useMemo(()=>groupedChildren(children,rooms,roomId,recentVisitorIds,q,presentOnly),[children,rooms,roomId,recentVisitorIds,q,presentOnly]);
 
   const toggle=(child:Child)=>{
     if(filter&&!filter(child))return;
@@ -95,11 +73,14 @@ export function ChildSelector({
     <section className="picker">
       <div className="picker-tools">
         <input
+          ref={searchRef}
           aria-label="Search children"
           value={q}
           placeholder="Search children"
           onChange={e=>setQ(e.target.value)}
         />
+
+        <button type="button" className={presentOnly?'active':'minor'} onClick={()=>setPresentOnly(value=>!value)}>Present</button>
 
         <button
           type="button"
@@ -124,10 +105,10 @@ export function ChildSelector({
 
       {groups.map(([label,items])=>
         items.length ? (
-          <div key={label}>
-            <h3>{label}</h3>
+          <div key={label} className="roster-group">
+            {(()=>{const info=rosterGroupInfo(label,rooms,roomId);return <h3 className={info.className} style={{'--room-accent':info.accent} as any}><span>{info.icon}</span>{label}</h3>})()}
 
-            <div className="childgrid">
+            <div className="child-roster">
               {items.map(c=>(
                 <button
                   type="button"

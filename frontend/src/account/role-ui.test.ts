@@ -15,8 +15,8 @@ describe('role-aware account UI',()=>{
     expect(managementPagesForRole('admin')).toContain('Teachers');
     expect(managementPagesForRole('admin')).not.toContain('Staff');
     expect(managementPagesForRole('administration')).toEqual([
-      'Dashboard','Children','Families','Teachers','Records',
-      'Audit log','Data requests','Help'
+      'Dashboard','Children','Families','Teachers','Activity log',
+      'Data requests','Settings','Help'
     ]);
     expect(managementPagesForRole('teacher')).toEqual([]);
   });
@@ -48,9 +48,9 @@ describe('role-aware account UI',()=>{
     expect(host.textContent).not.toContain('Operations');
   });
 
-  it('opens account management before the optional branding panel',()=>{
+  it('keeps Settings accordions collapsed until requested',()=>{
     expect(settingsSections).toEqual([
-      {title:'Accounts',open:true},{title:'Branding',open:false}
+      {title:'Accounts',open:false},{title:'Branding',open:false}
     ]);
   });
 });

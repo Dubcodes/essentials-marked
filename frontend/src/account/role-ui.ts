@@ -5,8 +5,7 @@ export const adminPages=[
   'Families',
   'Teachers',
   'Devices',
-  'Records',
-  'Audit log',
+  'Activity log',
   'Data requests',
   'Settings',
   'Help'
@@ -22,7 +21,7 @@ export function managementPagesForRole(role?:string):AdminPage[]{
   if(role==='admin')return [...adminPages];
   if(role==='administration'){
     return adminPages.filter(
-      page=>!['Rooms','Devices','Settings'].includes(page)
+      page=>!['Rooms','Devices'].includes(page)
     );
   }
   return [];
@@ -44,6 +43,6 @@ export function quickNavForRole(role?:string,parentContext=false){
 }
 
 export const settingsSections=[
-  {title:'Accounts',open:true},
+  {title:'Accounts',open:false},
   {title:'Branding',open:false}
 ]as const;

@@ -104,7 +104,10 @@ export function SleepWorkflow({
     }
 
     if(!s||!sameRoom){
-      return false;
+      // A tired, physically present child can fall asleep without an
+      // intermediate settling action. The server creates that session
+      // atomically, so this remains safe for an offline/retry-prone tablet.
+      return action==='fell_asleep' && !s && isPhysicallyInRoom(child,props.roomId);
     }
 
     if(s.stale){
@@ -151,7 +154,9 @@ export function SleepWorkflow({
     }
 
     if(!s){
-      return 'No active sleep session';
+      return action==='fell_asleep'&&isPhysicallyInRoom(child,props.roomId)
+        ?'Available to record asleep immediately'
+        :'No active sleep session';
     }
 
     return `Currently ${s.state.replace('_',' ')}`;
@@ -242,6 +247,7 @@ export function SleepWorkflow({
           filter={eligible}
           eligibilityLabel={reason}
           stateLabel={state}
+          recentVisitorIds={props.data.recent_visitors?.[props.roomId]}
           bulkLabel={
             check
               ?'Select all sleeping'

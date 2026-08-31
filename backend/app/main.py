@@ -5,9 +5,9 @@ from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, Response, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, ConfigDict
 from passlib.context import CryptContext
-from sqlalchemy import select, func, delete, or_
+from sqlalchemy import select, func, delete, or_, and_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .db import get_db
@@ -90,6 +90,10 @@ def revoke_account_sessions(db:Session,account_id:str,keep_session_id:str|None=N
             continue
         session.revoked_at=now();revoked+=1
     return revoked
+def revoke_parent_sessions(db:Session,parent_id:str):
+    sessions=list(db.scalars(select(AppSession).where(AppSession.subject_type=='parent',AppSession.subject_id==parent_id,AppSession.revoked_at.is_(None))))
+    for session in sessions:session.revoked_at=now()
+    return len(sessions)
 def parent(request: Request, db: Session=Depends(get_db)):
     session=claim(request,'parent',db); p=db.get(Parent,session.subject_id)
     if not p or not p.active: raise HTTPException(401,'Session revoked')
@@ -161,6 +165,17 @@ def account_out(a:Account,db:Session|None=None):
         centre=db.get(Centre,a.centre_id);result['centre_id']=a.centre_id;result['centre_name']=centre.name if centre else None
     return result
 
+def parent_out(parent:Parent,db:Session):
+    children=list(db.scalars(select(Child).join(ParentChild,ParentChild.child_id==Child.id).where(ParentChild.parent_id==parent.id)))
+    rooms={room.id:room.name for room in db.scalars(select(Room).where(Room.id.in_([child.room_id for child in children])))} if children else {}
+    return {'id':parent.id,'name':parent.name,'login':parent.login,'active':parent.active,'children':[{'id':child.id,'name':child.preferred_name or child.first_name,'first_name':child.first_name,'last_name':child.last_name,'preferred_name':child.preferred_name,'enrolled_room':rooms.get(child.room_id)} for child in children]}
+
+def family_children(db:Session,centre_id:str,child_ids:list[str]):
+    ids=list(dict.fromkeys(child_ids))
+    children=list(db.scalars(select(Child).where(Child.id.in_(ids),Child.centre_id==centre_id))) if ids else []
+    if len(children)!=len(ids):raise HTTPException(422,'Choose only children from this centre')
+    return children
+
 class Login(BaseModel): email: str; password: str
 class ParentLogin(BaseModel): login: str; pin: str = Field(pattern=r'^\d{6}$')
 class EventIn(BaseModel): client_id: str = Field(min_length=10,max_length=80); child_ids: list[str] = Field(min_length=1,max_length=50); type: Literal['nappy','toilet','food','sunscreen','staff_note','supply']; room_id: str; effective_at: datetime | None=None; performed_by_id: str | None=None; data: dict = Field(default_factory=dict)
@@ -189,6 +204,45 @@ class SignatureIn(BaseModel): signer_name:str=Field(min_length=2,max_length=200)
 class DataRequestIn(BaseModel): child_id:str; start_date:date; end_date:date; note:str|None=Field(default=None,max_length=1500)
 class DataRequestAction(BaseModel): status:Literal['new','in_progress','completed','declined']
 class BrandingIn(BaseModel): display_name:str|None=Field(default=None,max_length=200); secondary_text:str|None=Field(default=None,max_length=240); timezone:str|None=Field(default=None,max_length=80)
+class FamilyCreateIn(BaseModel):
+    name:str=Field(min_length=1,max_length=200); login:str=Field(min_length=1,max_length=100); pin:str=Field(pattern=r'^\d{6}$'); active:bool=True; child_ids:list[str]=Field(default_factory=list,max_length=50)
+class FamilyUpdateIn(BaseModel):
+    name:str|None=Field(default=None,min_length=1,max_length=200); login:str|None=Field(default=None,min_length=1,max_length=100); active:bool|None=None; child_ids:list[str]|None=Field(default=None,max_length=50)
+class ParentPinResetIn(BaseModel):
+    account_password:str=Field(min_length=1,max_length=300); pin:str=Field(pattern=r'^\d{6}$')
+class EventCorrectionData(BaseModel):
+    """The finite, care-record fields that Administration may correct.
+
+    This deliberately is not a free-form Event.data payload.  The endpoint
+    below further narrows these fields by Event type before persisting them.
+    """
+    model_config=ConfigDict(extra='forbid')
+    outcome:str|None=Field(default=None,max_length=100)
+    consistency:str|None=Field(default=None,max_length=40)
+    clothing_changed:bool|None=None
+    what:str|None=Field(default=None,max_length=40)
+    note:str|None=Field(default=None,max_length=1500)
+    meal:str|None=Field(default=None,max_length=100)
+    food:str|None=Field(default=None,max_length=500)
+    servings:list[float]|None=Field(default=None,max_length=20)
+    total_servings:float|None=Field(default=None,ge=0,le=200)
+    enjoyment:str|None=Field(default=None,max_length=40)
+    application:str|None=Field(default=None,max_length=100)
+
+class OrdinaryCorrectionIn(BaseModel):
+    reason:str=Field(min_length=3,max_length=500); child_id:str|None=None; room_id:str|None=None; performed_by_id:str|None=None; effective_at:datetime|None=None; data:EventCorrectionData|None=None
+class AttendanceCorrectionIn(BaseModel):
+    reason:str=Field(min_length=3,max_length=500)
+    arrived_at:datetime|None=None; departed_at:datetime|None=None; recorded_by_staff_id:str|None=None
+class RoomVisitCorrectionIn(BaseModel):
+    reason:str=Field(min_length=3,max_length=500)
+    started_at:datetime|None=None; ended_at:datetime|None=None; started_by_staff_id:str|None=None; ended_by_staff_id:str|None=None
+class SleepCorrectionIn(BaseModel):
+    reason:str=Field(min_length=3,max_length=500)
+    put_down_at:datetime|None=None; fell_asleep_at:datetime|None=None; woke_at:datetime|None=None; got_up_at:datetime|None=None; opened_by_staff_id:str|None=None; closed_by_staff_id:str|None=None; note:str|None=Field(default=None,max_length=1500); quality:str|None=Field(default=None,max_length=40); wake_state:str|None=Field(default=None,max_length=40)
+class SleepCheckCorrectionIn(BaseModel):
+    reason:str=Field(min_length=3,max_length=500)
+    checked_at:datetime|None=None; staff_id:str|None=None; warmth:Literal['normal','warm','cool']|None=None; breathing:Literal['normal','changed']|None=None; wellbeing:Literal['well','concern']|None=None; note:str|None=Field(default=None,max_length=1500)
 class AccountPasswordChangeIn(BaseModel):
     current_password:str=Field(min_length=1,max_length=300)
     new_password:str=Field(min_length=8,max_length=300)
@@ -266,7 +320,7 @@ def admin_login(body: Login, response: Response, request: Request, db: Session=D
 @app.post('/api/auth/parent/login')
 def parent_login(body: ParentLogin,response: Response,request:Request,db:Session=Depends(get_db)):
     key=body.login.lower();enforce_failure_limit(db,'parent',key);p=db.scalar(select(Parent).where(Parent.login==key))
-    if not p or not pwd.verify(body.pin,p.pin_hash):record_auth_failure(db,'parent',key);raise HTTPException(401,'Invalid login or PIN')
+    if not p or not p.active or not pwd.verify(body.pin,p.pin_hash):record_auth_failure(db,'parent',key);raise HTTPException(401,'Invalid login or PIN')
     clear_auth_failures(db,'parent',key)
     issue_session(response,'parent',p.id,p.centre_id,43200)
     return {'ok':True}
@@ -397,6 +451,9 @@ def bootstrap(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
     room_names={r.id:r.name for r in rooms}
 
     child_models=list(scoped(db,Child,a.centre_id))
+    parent_links={child.id:[] for child in child_models}
+    for link,parent in db.execute(select(ParentChild,Parent).join(Parent,Parent.id==ParentChild.parent_id).where(Parent.centre_id==a.centre_id)).all():
+        if link.child_id in parent_links:parent_links[link.child_id].append({'id':parent.id,'name':parent.name,'login':parent.login,'active':parent.active})
     children=[]
 
     for child in child_models:
@@ -421,7 +478,8 @@ def bootstrap(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
             'arrived_at':row.arrived_at if row else None,
             'physical_room_id':physical,
             'physical_room':room_names.get(physical),
-            'enrolled_room':room_names.get(child.room_id)
+            'enrolled_room':room_names.get(child.room_id),
+            'families':parent_links[child.id]
         })
 
     room_data=[]
@@ -1066,6 +1124,45 @@ def update_child(
     return {'ok':True}
 
 
+@app.get('/api/admin/families')
+def families(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    return [parent_out(parent,db) for parent in db.scalars(select(Parent).where(Parent.centre_id==a.centre_id).order_by(Parent.name))]
+
+@app.post('/api/admin/families')
+def create_family(body:FamilyCreateIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    login=body.login.strip().lower()
+    if db.scalar(select(Parent.id).where(Parent.login==login)):raise HTTPException(409,'A family with that login already exists')
+    children=family_children(db,a.centre_id,body.child_ids)
+    parent=Parent(centre_id=a.centre_id,name=body.name.strip(),login=login,pin_hash=pwd.hash(body.pin),active=body.active)
+    db.add(parent);db.flush();db.add_all([ParentChild(parent_id=parent.id,child_id=child.id) for child in children])
+    audit(db,a.centre_id,'parent',parent.id,'created',after={'name':parent.name,'login':parent.login,'active':parent.active,'child_ids':[child.id for child in children],'pin_set':True},actor=a.id)
+    db.commit();return parent_out(parent,db)
+
+@app.patch('/api/admin/families/{parent_id}')
+def update_family(parent_id:str,body:FamilyUpdateIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    parent=db.scalar(select(Parent).where(Parent.id==parent_id,Parent.centre_id==a.centre_id))
+    if not parent:raise HTTPException(404,'Family not found')
+    before=parent_out(parent,db);changes=body.model_dump(exclude_unset=True)
+    revoke_sessions=False
+    if 'login' in changes:
+        login=changes['login'].strip().lower();duplicate=db.scalar(select(Parent.id).where(Parent.login==login,Parent.id!=parent.id))
+        if duplicate:raise HTTPException(409,'A family with that login already exists')
+        revoke_sessions=login!=parent.login;parent.login=login
+    if 'name' in changes:parent.name=changes['name'].strip()
+    if 'active' in changes:
+        revoke_sessions=revoke_sessions or (parent.active and not changes['active']);parent.active=changes['active']
+    if 'child_ids' in changes:
+        children=family_children(db,a.centre_id,changes['child_ids']);db.execute(delete(ParentChild).where(ParentChild.parent_id==parent.id));db.add_all([ParentChild(parent_id=parent.id,child_id=child.id) for child in children])
+    revoked=revoke_parent_sessions(db,parent.id) if revoke_sessions else 0
+    db.flush();after=parent_out(parent,db);audit(db,a.centre_id,'parent',parent.id,'updated',before=before,after={**after,'sessions_revoked':revoked},actor=a.id);db.commit();return after
+
+@app.post('/api/admin/families/{parent_id}/pin-reset')
+def reset_parent_pin(parent_id:str,body:ParentPinResetIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    verify_account_password(db,a,body.account_password,'family_pin_reset_confirm','Your account password is incorrect')
+    parent=db.scalar(select(Parent).where(Parent.id==parent_id,Parent.centre_id==a.centre_id))
+    if not parent:raise HTTPException(404,'Family not found')
+    parent.pin_hash=pwd.hash(body.pin);revoked=revoke_parent_sessions(db,parent.id);audit(db,a.centre_id,'parent',parent.id,'pin_reset',after={'pin_reset':True,'sessions_revoked':revoked},actor=a.id,reason='Password-confirmed family PIN reset');db.commit();return {'ok':True,'sessions_revoked':revoked}
+
 @app.post('/api/admin/pairings')
 def create_pairing(body:PairIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     if body.room_id and not db.scalar(select(Room).where(Room.id==body.room_id,Room.centre_id==a.centre_id)): raise HTTPException(404,'Room not found')
@@ -1080,6 +1177,244 @@ def pairing_status(pairing_id:str,a:Account=Depends(admin_only),db:Session=Depen
     p=db.scalar(select(Pairing).where(Pairing.id==pairing_id,Pairing.centre_id==a.centre_id))
     if not p:raise HTTPException(404,'Pairing not found')
     return {'id':p.id,'label':p.label,'expires_at':p.expires_at,'consumed_at':p.consumed_at,'device_id':p.device_id}
+def activity_event_out(event:Event,db:Session):
+    child=db.get(Child,event.child_id);room=db.get(Room,event.room_id) if event.room_id else None;staff=db.get(Staff,event.performed_by_id) if event.performed_by_id else None
+    return {'id':event.id,'source':'event','category':'classroom','type':event.type,'child_id':event.child_id,'child_name':(child.preferred_name or child.first_name) if child else None,'room_id':event.room_id,'room':room.name if room else None,'staff_id':event.performed_by_id,'teacher':(staff.preferred_name or staff.first_name) if staff else None,'effective_at':event.effective_at,'recorded_at':event.created_at,'data':clean_domain_data(event.data),'revision':event.revision,'corrected':event.revision>1,'correction_reason':db.scalar(select(Audit.reason).where(Audit.centre_id==event.centre_id,Audit.entity=='event',Audit.entity_id==event.id,Audit.action=='ordinary_corrected').order_by(Audit.created_at.desc())),'finalised':event.finalised}
+
+def corrected_event_data(event:Event, correction:EventCorrectionData|None):
+    """Merge only recognised, type-specific care fields into an Event."""
+    if correction is None:
+        return event.data
+    allowed={
+        'nappy':{'outcome','consistency','clothing_changed','note'},
+        'toilet':{'what','outcome','clothing_changed','note'},
+        'food':{'meal','food','servings','total_servings','enjoyment'},
+        'sunscreen':{'application','note'},
+        'staff_note':{'note'},
+        'supply':{'note'},
+    }.get(event.type)
+    if not allowed:
+        raise HTTPException(409,'This care record requires its specialised workflow')
+    updates=correction.model_dump(exclude_none=True)
+    invalid=set(updates)-allowed
+    if invalid:
+        raise HTTPException(422,'Those fields do not belong to this activity type')
+    if 'servings' in updates and any(amount<0 or amount>10 for amount in updates['servings']):
+        raise HTTPException(422,'Serving amounts are invalid')
+    if 'servings' in updates and 'total_servings' not in updates:
+        updates['total_servings']=round(sum(updates['servings']),2)
+    return {**event.data,**updates}
+
+def activity_names(db:Session,child_id:str|None=None,room_id:str|None=None,staff_id:str|None=None):
+    child=db.get(Child,child_id) if child_id else None; room=db.get(Room,room_id) if room_id else None; staff=db.get(Staff,staff_id) if staff_id else None
+    return {'child_name':(child.preferred_name or child.first_name) if child else None,'room':room.name if room else None,'teacher':(staff.preferred_name or staff.first_name) if staff else None}
+
+def activity_correction(db:Session,centre_id:str,entity:str,entity_id:str):
+    latest=db.scalar(select(Audit).where(Audit.centre_id==centre_id,Audit.entity==entity,Audit.entity_id==entity_id,Audit.action.like('%corrected')).order_by(Audit.created_at.desc()))
+    return {'corrected':bool(latest),'correction_reason':latest.reason if latest else None}
+
+def valid_centre_staff(db:Session,centre_id:str,staff_id:str|None,field:str):
+    if staff_id is not None and not db.scalar(select(Staff.id).where(Staff.id==staff_id,Staff.centre_id==centre_id)):
+        raise HTTPException(422,f'Choose a {field} from this centre')
+
+def activity_classroom_rows(db:Session,centre_id:str,limit:int,child_id:str|None=None,room_id:str|None=None,staff_id:str|None=None,type:str|None=None,start:datetime|None=None,end:datetime|None=None):
+    rows=[]
+    event_q=select(Event).where(Event.centre_id==centre_id,Event.type.not_in({'medicine','incident','sleep'}))
+    if child_id:event_q=event_q.where(Event.child_id==child_id)
+    if room_id:event_q=event_q.where(Event.room_id==room_id)
+    if staff_id:event_q=event_q.where(Event.performed_by_id==staff_id)
+    if type:event_q=event_q.where(Event.type==type)
+    if start:event_q=event_q.where(Event.effective_at>=start)
+    if end:event_q=event_q.where(Event.effective_at<end)
+    for event in db.scalars(event_q.order_by(Event.effective_at.desc()).limit(limit)):
+        rows.append(activity_event_out(event,db))
+    attendance_q=select(Attendance).where(Attendance.centre_id==centre_id)
+    if type and type!='attendance':attendance_q=attendance_q.where(False)
+    if child_id:attendance_q=attendance_q.where(Attendance.child_id==child_id)
+    if room_id:attendance_q=attendance_q.where(Attendance.room_id==room_id)
+    if staff_id:attendance_q=attendance_q.where(Attendance.recorded_by_staff_id==staff_id)
+    if start:attendance_q=attendance_q.where(Attendance.arrived_at>=start)
+    if end:attendance_q=attendance_q.where(Attendance.arrived_at<end)
+    for attendance in db.scalars(attendance_q.order_by(Attendance.arrived_at.desc()).limit(limit)):
+        meta=activity_correction(db,centre_id,'attendance',attendance.id)
+        rows.append({'id':attendance.id,'source':'attendance','category':'classroom','type':'attendance','activity':'attendance','child_id':attendance.child_id,'room_id':attendance.room_id,'staff_id':attendance.recorded_by_staff_id,'effective_at':attendance.arrived_at,'recorded_at':attendance.arrived_at,'data':{'arrived_at':attendance.arrived_at.isoformat() if attendance.arrived_at else None,'departed_at':attendance.departed_at.isoformat() if attendance.departed_at else None},'revision':None,'finalised':True,**meta,**activity_names(db,attendance.child_id,attendance.room_id,attendance.recorded_by_staff_id)})
+    visit_q=select(RoomVisit).where(RoomVisit.centre_id==centre_id)
+    if type and type!='room_visit':visit_q=visit_q.where(False)
+    if child_id:visit_q=visit_q.where(RoomVisit.child_id==child_id)
+    if room_id:visit_q=visit_q.where(RoomVisit.room_id==room_id)
+    if staff_id:visit_q=visit_q.where(or_(RoomVisit.started_by_staff_id==staff_id,RoomVisit.ended_by_staff_id==staff_id))
+    if start:visit_q=visit_q.where(RoomVisit.started_at>=start)
+    if end:visit_q=visit_q.where(RoomVisit.started_at<end)
+    for visit in db.scalars(visit_q.order_by(RoomVisit.started_at.desc()).limit(limit)):
+        rows.append({'id':visit.id,'source':'room_visit','category':'classroom','type':'room_visit','activity':'room visit','child_id':visit.child_id,'room_id':visit.room_id,'staff_id':visit.started_by_staff_id,'ended_by_staff_id':visit.ended_by_staff_id,'effective_at':visit.started_at,'recorded_at':visit.started_at,'data':{'started_at':visit.started_at.isoformat(),'ended_at':visit.ended_at.isoformat() if visit.ended_at else None},'revision':None,'finalised':True,**activity_correction(db,centre_id,'room_visit',visit.id),**activity_names(db,visit.child_id,visit.room_id,visit.started_by_staff_id)})
+    sleep_q=select(SleepSession).where(SleepSession.centre_id==centre_id)
+    if type and type!='sleep':sleep_q=sleep_q.where(False)
+    if child_id:sleep_q=sleep_q.where(SleepSession.child_id==child_id)
+    if room_id:sleep_q=sleep_q.where(SleepSession.room_id==room_id)
+    if staff_id:sleep_q=sleep_q.where(or_(SleepSession.opened_by_staff_id==staff_id,SleepSession.closed_by_staff_id==staff_id))
+    if start:sleep_q=sleep_q.where(SleepSession.put_down_at>=start)
+    if end:sleep_q=sleep_q.where(SleepSession.put_down_at<end)
+    for session in db.scalars(sleep_q.order_by(SleepSession.put_down_at.desc()).limit(limit)):
+        rows.append({'id':session.id,'source':'sleep_session','category':'classroom','type':'sleep','activity':'sleep','child_id':session.child_id,'room_id':session.room_id,'staff_id':session.opened_by_staff_id,'closed_by_staff_id':session.closed_by_staff_id,'effective_at':session.put_down_at,'recorded_at':session.created_at,'data':{'put_down_at':session.put_down_at.isoformat(),'fell_asleep_at':session.fell_asleep_at.isoformat() if session.fell_asleep_at else None,'woke_at':session.woke_at.isoformat() if session.woke_at else None,'got_up_at':session.got_up_at.isoformat() if session.got_up_at else None,'quality':session.quality,'wake_state':session.wake_state,'note':session.note},'revision':None,'finalised':bool(session.got_up_at),**activity_correction(db,centre_id,'sleep_session',session.id),**activity_names(db,session.child_id,session.room_id,session.opened_by_staff_id)})
+    check_q=select(SleepCheck).where(SleepCheck.centre_id==centre_id)
+    if type and type!='sleep_check':check_q=check_q.where(False)
+    if child_id:check_q=check_q.where(SleepCheck.child_id==child_id)
+    if room_id:check_q=check_q.where(SleepCheck.room_id==room_id)
+    if staff_id:check_q=check_q.where(SleepCheck.staff_id==staff_id)
+    if start:check_q=check_q.where(SleepCheck.checked_at>=start)
+    if end:check_q=check_q.where(SleepCheck.checked_at<end)
+    for check in db.scalars(check_q.order_by(SleepCheck.checked_at.desc()).limit(limit)):
+        rows.append({'id':check.id,'source':'sleep_check','category':'classroom','type':'sleep_check','activity':'sleep check','child_id':check.child_id,'room_id':check.room_id,'staff_id':check.staff_id,'effective_at':check.checked_at,'recorded_at':check.created_at,'data':{'warmth':check.warmth,'breathing':check.breathing,'wellbeing':check.wellbeing,'note':check.note},'revision':None,'finalised':True,**activity_correction(db,centre_id,'sleep_check',check.id),**activity_names(db,check.child_id,check.room_id,check.staff_id)})
+    med_q=select(MedicationAdministration).where(MedicationAdministration.centre_id==centre_id)
+    if type and type!='medicine':med_q=med_q.where(False)
+    if child_id:med_q=med_q.where(MedicationAdministration.child_id==child_id)
+    if staff_id:med_q=med_q.where(MedicationAdministration.staff_id==staff_id)
+    if start:med_q=med_q.where(MedicationAdministration.administered_at>=start)
+    if end:med_q=med_q.where(MedicationAdministration.administered_at<end)
+    for administration in db.scalars(med_q.order_by(MedicationAdministration.administered_at.desc()).limit(limit)):
+        authority=db.get(MedicationAuthority,administration.authority_id)
+        rows.append({'id':administration.id,'source':'medication_administration','category':'classroom','type':'medicine','activity':'medication','child_id':administration.child_id,'room_id':None,'staff_id':administration.staff_id,'effective_at':administration.administered_at,'recorded_at':administration.administered_at,'data':{'medication':authority.medication_name if authority else None,'dose':administration.dose,'outcome':administration.outcome,'note':administration.note},'revision':administration.revision,'corrected':administration.revision>1,'finalised':administration.finalised,**activity_names(db,administration.child_id,None,administration.staff_id)})
+    incident_q=select(Incident).where(Incident.centre_id==centre_id)
+    if type and type!='incident':incident_q=incident_q.where(False)
+    if child_id:incident_q=incident_q.where(Incident.child_id==child_id)
+    if room_id:incident_q=incident_q.where(Incident.room_id==room_id)
+    if staff_id:incident_q=incident_q.where(Incident.created_by_id==staff_id)
+    if start:incident_q=incident_q.where(Incident.effective_at>=start)
+    if end:incident_q=incident_q.where(Incident.effective_at<end)
+    for incident in db.scalars(incident_q.order_by(Incident.effective_at.desc()).limit(limit)):
+        rows.append({'id':incident.id,'source':'incident','category':'classroom','type':'incident','activity':'incident','child_id':incident.child_id,'room_id':incident.room_id,'staff_id':incident.created_by_id,'effective_at':incident.effective_at,'recorded_at':incident.created_at,'data':{'incident_type':incident.incident_type,'location':incident.location,'description':incident.description,'status':incident.status},'revision':incident.revision,'corrected':incident.revision>1,'finalised':incident.status=='finalised',**activity_names(db,incident.child_id,incident.room_id,incident.created_by_id)})
+    return rows
+
+def management_audit_condition():
+    """The explicit allow-list; every other audit operation is Security."""
+    return or_(
+        *[and_(Audit.entity==entity,Audit.action.in_(['created','updated','handled','ordinary_corrected','logo_removed','logo_uploaded'])) for entity in {'child','parent','staff','room','centre','data_request'}]
+    )
+
+def audit_category(item:Audit):
+    return 'management' if item.entity in {'child','parent','staff','room','centre','data_request'} and item.action in {'created','updated','handled','ordinary_corrected','logo_removed','logo_uploaded'} else 'security'
+
+@app.get('/api/admin/activity')
+def activity(from_date:date|None=None,to_date:date|None=None,room_id:str|None=None,staff_id:str|None=None,child_id:str|None=None,type:str|None=None,category:Literal['classroom','management','security']|None=None,search:str|None=None,limit:int=100,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    limit=max(1,min(limit,200));centre=db.get(Centre,a.centre_id);zone=ZoneInfo(centre.timezone);start=datetime.combine(from_date,datetime.min.time(),tzinfo=zone).astimezone(timezone.utc) if from_date else None;end=datetime.combine(to_date+timedelta(days=1),datetime.min.time(),tzinfo=zone).astimezone(timezone.utc) if to_date else None
+    if a.role!='admin' and category in {'management','security'}:raise HTTPException(403,'This activity category is not available to your role')
+    # Normalised search needs enough bounded candidates to survive newer,
+    # non-matching rows in each independent source.  Keep it finite rather
+    # than silently treating the requested page size as a search limit.
+    candidate_limit=1000 if search and search.strip() else limit
+    rows=activity_classroom_rows(db,a.centre_id,candidate_limit,child_id,room_id,staff_id,type,start,end)
+    if a.role=='admin' and category in {'management','security'}:
+        q=select(Audit).where(Audit.centre_id==a.centre_id)
+        if start:q=q.where(Audit.created_at>=start)
+        if end:q=q.where(Audit.created_at<end)
+        management=management_audit_condition()
+        q=q.where(management if category=='management' else ~management)
+        audits=list(db.scalars(q.order_by(Audit.created_at.desc()).limit(candidate_limit)))
+        rows=[{'id':item.id,'source':'audit','category':audit_category(item),'type':item.action,'entity':item.entity,'effective_at':item.created_at,'recorded_at':item.created_at,'data':clean_domain_data(item.after),'before':clean_domain_data(item.before),'reason':item.reason,'actor_id':item.actor_id,'corrected':False} for item in audits]
+    if search:
+        needle=search.strip().lower();rows=[row for row in rows if needle in ' '.join(str(value) for value in [row.get('type'),row.get('activity'),row.get('child_name'),row.get('room'),row.get('teacher'),row.get('entity'),row.get('data'),row.get('reason')]).lower()]
+    rows.sort(key=lambda row:row['effective_at'],reverse=True)
+    return {'items':rows[:limit],'limit':limit}
+
+@app.patch('/api/admin/activity/events/{event_id}')
+def correct_ordinary_event(event_id:str,body:OrdinaryCorrectionIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    event=db.scalar(select(Event).where(Event.id==event_id,Event.centre_id==a.centre_id))
+    if not event:raise HTTPException(404,'Activity record not found')
+    if event.type in {'medicine','incident'}:raise HTTPException(409,'High-consequence records require their specialised workflow')
+    if body.child_id:
+        child=db.scalar(select(Child).where(Child.id==body.child_id,Child.centre_id==a.centre_id))
+        if not child:raise HTTPException(422,'Choose a child from this centre')
+    if body.room_id:admin_room(db,a.centre_id,body.room_id)
+    if body.performed_by_id and not db.scalar(select(Staff).where(Staff.id==body.performed_by_id,Staff.centre_id==a.centre_id)):raise HTTPException(422,'Choose a teacher from this centre')
+    before={'child_id':event.child_id,'room_id':event.room_id,'performed_by_id':event.performed_by_id,'effective_at':event.effective_at.isoformat(),'data':clean_domain_data(event.data),'revision':event.revision}
+    if body.child_id:event.child_id=body.child_id
+    if body.room_id:event.room_id=body.room_id
+    if body.performed_by_id:event.performed_by_id=body.performed_by_id
+    if body.effective_at:event.effective_at=body.effective_at
+    event.data=corrected_event_data(event,body.data)
+    event.revision+=1;event.updated_at=now();after={'child_id':event.child_id,'room_id':event.room_id,'performed_by_id':event.performed_by_id,'effective_at':event.effective_at.isoformat(),'data':clean_domain_data(event.data),'revision':event.revision};audit(db,a.centre_id,'event',event.id,'ordinary_corrected',before,after,a.id,body.reason);db.commit();return activity_event_out(event,db)
+
+def time_value(value): return value.isoformat() if value else None
+def ensure_ordered(*values):
+    present=[utc(value) for value in values if value]
+    if present!=sorted(present):raise HTTPException(422,'Times must remain in chronological order')
+
+@app.patch('/api/admin/activity/attendance/{attendance_id}')
+def correct_attendance(attendance_id:str,body:AttendanceCorrectionIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    record=db.scalar(select(Attendance).where(Attendance.id==attendance_id,Attendance.centre_id==a.centre_id))
+    if not record:raise HTTPException(404,'Attendance record not found')
+    if 'arrived_at' in body.model_fields_set and body.arrived_at is None:raise HTTPException(422,'Arrival time cannot be cleared by correction')
+    if 'departed_at' in body.model_fields_set and (record.departed_at is None or body.departed_at is None):raise HTTPException(422,'Use the normal departure action; corrections cannot change attendance lifecycle')
+    valid_centre_staff(db,a.centre_id,body.recorded_by_staff_id,'teacher')
+    before={'arrived_at':time_value(record.arrived_at),'departed_at':time_value(record.departed_at),'recorded_by_staff_id':record.recorded_by_staff_id}
+    arrived=body.arrived_at or record.arrived_at;departed=body.departed_at if body.departed_at is not None else record.departed_at
+    ensure_ordered(arrived,departed)
+    visits=list(db.scalars(select(RoomVisit).where(RoomVisit.attendance_id==record.id)))
+    if any(utc(visit.started_at)<utc(arrived) or departed and (utc(visit.started_at)>utc(departed) or visit.ended_at and utc(visit.ended_at)>utc(departed)) for visit in visits):raise HTTPException(422,'Attendance times must contain linked room visits')
+    if body.arrived_at:record.arrived_at=body.arrived_at
+    if body.departed_at:record.departed_at=body.departed_at
+    if body.recorded_by_staff_id is not None:record.recorded_by_staff_id=body.recorded_by_staff_id
+    after={'arrived_at':time_value(record.arrived_at),'departed_at':time_value(record.departed_at),'recorded_by_staff_id':record.recorded_by_staff_id};audit(db,a.centre_id,'attendance',record.id,'ordinary_corrected',before,after,a.id,body.reason);db.commit();return {'ok':True,'id':record.id}
+
+@app.patch('/api/admin/activity/room-visits/{visit_id}')
+def correct_room_visit(visit_id:str,body:RoomVisitCorrectionIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    visit=db.scalar(select(RoomVisit).where(RoomVisit.id==visit_id,RoomVisit.centre_id==a.centre_id))
+    if not visit:raise HTTPException(404,'Room visit not found')
+    if 'started_at' in body.model_fields_set and body.started_at is None:raise HTTPException(422,'Visit start time cannot be cleared by correction')
+    if 'ended_at' in body.model_fields_set and (visit.ended_at is None or body.ended_at is None):raise HTTPException(422,'Use the normal end-visit action; corrections cannot change visit lifecycle')
+    valid_centre_staff(db,a.centre_id,body.started_by_staff_id,'teacher');valid_centre_staff(db,a.centre_id,body.ended_by_staff_id,'teacher')
+    before={'started_at':time_value(visit.started_at),'ended_at':time_value(visit.ended_at),'started_by_staff_id':visit.started_by_staff_id,'ended_by_staff_id':visit.ended_by_staff_id}
+    started=body.started_at or visit.started_at;ended=body.ended_at if body.ended_at is not None else visit.ended_at;ensure_ordered(started,ended)
+    attendance=db.scalar(select(Attendance).where(Attendance.id==visit.attendance_id,Attendance.centre_id==a.centre_id))
+    if not attendance or utc(started)<utc(attendance.arrived_at) or attendance.departed_at and (utc(started)>utc(attendance.departed_at) or ended and utc(ended)>utc(attendance.departed_at)):raise HTTPException(422,'Room visit must remain within attendance')
+    started_changed='started_at' in body.model_fields_set and utc(body.started_at)!=utc(visit.started_at)
+    ended_changed='ended_at' in body.model_fields_set and utc(body.ended_at)!=utc(visit.ended_at)
+    represented=(attendance.visit_room_id==visit.room_id and attendance.visit_ended_at is None and attendance.visit_started_at and utc(attendance.visit_started_at)==utc(visit.started_at)) or (attendance.last_visit_room_id==visit.room_id and attendance.visit_started_at and attendance.visit_ended_at and visit.ended_at and utc(attendance.visit_started_at)==utc(visit.started_at) and utc(attendance.visit_ended_at)==utc(visit.ended_at))
+    if (started_changed or ended_changed) and not represented:raise HTTPException(409,'This room visit is not the attendance visit represented by the current attendance state')
+    if started_changed:visit.started_at=body.started_at;attendance.visit_started_at=body.started_at
+    if ended_changed:visit.ended_at=body.ended_at;attendance.visit_ended_at=body.ended_at
+    if body.started_by_staff_id is not None:visit.started_by_staff_id=body.started_by_staff_id
+    if body.ended_by_staff_id is not None:visit.ended_by_staff_id=body.ended_by_staff_id
+    after={'started_at':time_value(visit.started_at),'ended_at':time_value(visit.ended_at),'started_by_staff_id':visit.started_by_staff_id,'ended_by_staff_id':visit.ended_by_staff_id};audit(db,a.centre_id,'room_visit',visit.id,'ordinary_corrected',before,after,a.id,body.reason);db.commit();return {'ok':True,'id':visit.id}
+
+@app.patch('/api/admin/activity/sleep-sessions/{session_id}')
+def correct_sleep(session_id:str,body:SleepCorrectionIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    session=db.scalar(select(SleepSession).where(SleepSession.id==session_id,SleepSession.centre_id==a.centre_id))
+    if not session:raise HTTPException(404,'Sleep session not found')
+    valid_centre_staff(db,a.centre_id,body.opened_by_staff_id,'teacher');valid_centre_staff(db,a.centre_id,body.closed_by_staff_id,'teacher')
+    lifecycle=['put_down_at','fell_asleep_at','woke_at','got_up_at']
+    if any(key in body.model_fields_set and (getattr(body,key) is None or getattr(session,key) is None) for key in lifecycle):raise HTTPException(422,'Use the classroom sleep workflow for lifecycle transitions; corrections may only adjust existing timestamps')
+    if not session.woke_at and ({'quality','wake_state'} & body.model_fields_set):raise HTTPException(422,'Wake metadata may only be corrected after the child has been woken')
+    if not session.got_up_at and 'closed_by_staff_id' in body.model_fields_set:raise HTTPException(422,'Closure attribution may only be corrected after the child has got up')
+    before={key:time_value(getattr(session,key)) if key.endswith('_at') else getattr(session,key) for key in ['put_down_at','fell_asleep_at','woke_at','got_up_at','opened_by_staff_id','closed_by_staff_id','note','quality','wake_state']}
+    values={key:(getattr(body,key) if key in body.model_fields_set else getattr(session,key)) for key in lifecycle};ensure_ordered(values['put_down_at'],values['fell_asleep_at'],values['woke_at'],values['got_up_at'])
+    checks=list(db.scalars(select(SleepCheck).where(SleepCheck.sleep_session_id==session.id)))
+    upper=values['woke_at'] or values['got_up_at']
+    if any(not values['fell_asleep_at'] or utc(check.checked_at)<utc(values['fell_asleep_at']) or upper and utc(check.checked_at)>utc(upper) for check in checks):raise HTTPException(422,'Sleep times must contain existing sleep checks')
+    for key in ['put_down_at','fell_asleep_at','woke_at','got_up_at','opened_by_staff_id','closed_by_staff_id','note','quality','wake_state']:
+        if key in body.model_fields_set:setattr(session,key,getattr(body,key))
+    session.updated_at=now();after={key:time_value(getattr(session,key)) if key.endswith('_at') else getattr(session,key) for key in before};audit(db,a.centre_id,'sleep_session',session.id,'ordinary_corrected',before,after,a.id,body.reason);db.commit();return {'ok':True,'id':session.id}
+
+@app.patch('/api/admin/activity/sleep-checks/{check_id}')
+def correct_sleep_check(check_id:str,body:SleepCheckCorrectionIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    check=db.scalar(select(SleepCheck).where(SleepCheck.id==check_id,SleepCheck.centre_id==a.centre_id))
+    if not check:raise HTTPException(404,'Sleep check not found')
+    if any(key in body.model_fields_set and getattr(body,key) is None for key in ['checked_at','staff_id','warmth','breathing','wellbeing']):raise HTTPException(422,'Required sleep check fields cannot be null')
+    valid_centre_staff(db,a.centre_id,body.staff_id,'teacher');session=db.scalar(select(SleepSession).where(SleepSession.id==check.sleep_session_id,SleepSession.centre_id==a.centre_id))
+    if not session:raise HTTPException(409,'Sleep check has no valid sleep session')
+    when=body.checked_at or check.checked_at
+    if not session.fell_asleep_at or utc(when)<utc(session.fell_asleep_at):raise HTTPException(422,'Sleep check cannot be before fell asleep')
+    upper=session.woke_at or session.got_up_at
+    if upper and utc(when)>utc(upper):raise HTTPException(422,'Sleep check cannot be after waking')
+    before={'checked_at':time_value(check.checked_at),'staff_id':check.staff_id,'warmth':check.warmth,'breathing':check.breathing,'wellbeing':check.wellbeing,'note':check.note}
+    for key in ['checked_at','staff_id','warmth','breathing','wellbeing','note']:
+        if key in body.model_fields_set:setattr(check,key,getattr(body,key))
+    after={'checked_at':time_value(check.checked_at),'staff_id':check.staff_id,'warmth':check.warmth,'breathing':check.breathing,'wellbeing':check.wellbeing,'note':check.note};audit(db,a.centre_id,'sleep_check',check.id,'ordinary_corrected',before,after,a.id,body.reason);db.commit();return {'ok':True,'id':check.id}
+
+@app.get('/api/admin/activity/{source}/{record_id}/corrections')
+def correction_history(source:Literal['event','attendance','room_visit','sleep_session','sleep_check'],record_id:str,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    return [{'reason':row.reason,'before':row.before,'after':row.after,'created_at':row.created_at,'actor_id':row.actor_id} for row in db.scalars(select(Audit).where(Audit.centre_id==a.centre_id,Audit.entity==source,Audit.entity_id==record_id,Audit.action=='ordinary_corrected').order_by(Audit.created_at.desc()).limit(10))]
+
 @app.get('/api/admin/events')
 def events(day:str|None=None,room_id:str|None=None,staff_id:str|None=None,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
     q=select(Event).where(Event.centre_id==a.centre_id)
@@ -1177,7 +1512,12 @@ def pair(body:PairComplete,response:Response,db:Session=Depends(get_db)):
 @app.get('/api/classroom/bootstrap')
 def classroom_bootstrap(d:Device=Depends(device),db:Session=Depends(get_db)):
     centre=db.get(Centre,d.centre_id);children=list(db.scalars(select(Child).where(Child.centre_id==d.centre_id,Child.active.is_(True)))); active_att={x.child_id:x for x in db.scalars(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None)))}
-    return {'device_id':d.id,'default_room_id':d.default_room_id,'centre':{'id':centre.id,'name':centre.name,'display_name':centre.display_name,'secondary_text':centre.secondary_text,'logo_url':f'/api/branding/{centre.id}/logo' if centre.logo_path else None,'timezone':centre.timezone},'last_confirmed_at':now(),'rooms':[{'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon} for r in scoped(db,Room,d.centre_id)],'staff':[{'id':s.id,'name':(s.preferred_name or s.first_name)+' '+s.last_name[:1]+'.'} for s in scoped(db,Staff,d.centre_id) if s.active],'children':[public_child(c)|{'present':c.id in active_att,'arrived_at':active_att[c.id].arrived_at if c.id in active_att else None,'visiting_room_id':active_att[c.id].visit_room_id if c.id in active_att and active_att[c.id].visit_ended_at is None else None} for c in children],'unread_notes':db.scalar(select(func.count()).select_from(ParentNote).where(ParentNote.centre_id==d.centre_id,ParentNote.read_at.is_(None))),'incident_drafts':db.scalar(select(func.count()).select_from(Incident).where(Incident.centre_id==d.centre_id,Incident.status=='draft'))}
+    recent={}
+    for room in scoped(db,Room,d.centre_id):
+        latest=select(RoomVisit.child_id.label('child_id'),func.max(RoomVisit.started_at).label('latest')).where(RoomVisit.centre_id==d.centre_id,RoomVisit.room_id==room.id).group_by(RoomVisit.child_id).subquery()
+        active_visitors=select(Attendance.child_id).where(Attendance.centre_id==d.centre_id,Attendance.visit_room_id==room.id,Attendance.visit_ended_at.is_(None),Attendance.departed_at.is_(None))
+        recent[room.id]=list(db.scalars(select(latest.c.child_id).where(~latest.c.child_id.in_(active_visitors)).order_by(latest.c.latest.desc()).limit(5)))
+    return {'device_id':d.id,'default_room_id':d.default_room_id,'centre':{'id':centre.id,'name':centre.name,'display_name':centre.display_name,'secondary_text':centre.secondary_text,'logo_url':f'/api/branding/{centre.id}/logo' if centre.logo_path else None,'timezone':centre.timezone},'last_confirmed_at':now(),'rooms':[{'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon} for r in scoped(db,Room,d.centre_id)],'staff':[{'id':s.id,'name':(s.preferred_name or s.first_name)+' '+s.last_name[:1]+'.'} for s in scoped(db,Staff,d.centre_id) if s.active],'children':[public_child(c)|{'present':c.id in active_att,'arrived_at':active_att[c.id].arrived_at if c.id in active_att else None,'visiting_room_id':active_att[c.id].visit_room_id if c.id in active_att and active_att[c.id].visit_ended_at is None else None} for c in children],'recent_visitors':recent,'unread_notes':db.scalar(select(func.count()).select_from(ParentNote).where(ParentNote.centre_id==d.centre_id,ParentNote.read_at.is_(None))),'incident_drafts':db.scalar(select(func.count()).select_from(Incident).where(Incident.centre_id==d.centre_id,Incident.status=='draft'))}
 @app.get('/api/classroom/parent-notes')
 def classroom_parent_notes(d:Device=Depends(device),db:Session=Depends(get_db)):
     rows=db.scalars(select(ParentNote).where(ParentNote.centre_id==d.centre_id).order_by(ParentNote.pinned.desc(),ParentNote.created_at.desc()).limit(100))
@@ -1312,6 +1652,10 @@ def sleep(body:SleepIn,d:Device=Depends(device),db:Session=Depends(get_db)):
             if session: raise HTTPException(409,f'{child.first_name} already has an active sleep session')
             centre=db.get(Centre,d.centre_id); session=SleepSession(centre_id=d.centre_id,child_id=child.id,room_id=body.room_id,put_down_at=when,check_interval_minutes=centre.sleep_check_minutes,opened_by_staff_id=staff.id,note=body.note);db.add(session);results.append({'child_id':child.id,'session_id':session.id,'status':'green'})
         else:
+            if not session and body.action=='fell_asleep':
+                centre=db.get(Centre,d.centre_id)
+                if not 5<=centre.sleep_check_minutes<=10:raise HTTPException(409,'Centre sleep-check interval must be between 5 and 10 minutes')
+                session=SleepSession(centre_id=d.centre_id,child_id=child.id,room_id=body.room_id,put_down_at=when,check_interval_minutes=centre.sleep_check_minutes,opened_by_staff_id=staff.id,note=body.note);db.add(session);db.flush()
             if not session: raise HTTPException(409,f'{child.first_name} has no active sleep session')
             if session.room_id!=body.room_id: raise HTTPException(409,f'{child.first_name} sleep session belongs to a different room')
             if body.action=='fell_asleep':

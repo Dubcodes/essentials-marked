@@ -75,6 +75,8 @@
   gap:12px;
 }
 
+.person-card-grid,.person-list{display:grid;grid-template-columns:1fr;gap:7px}.person-row{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;min-height:58px;padding:10px 12px;text-align:left;background:#fff;color:#17312d;border:1px solid #dfe6e0;border-radius:11px}.person-row b,.person-row small{display:block}.person-row small{opacity:.72}.activity-filters{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 14px}.activity-filters input,.activity-filters select{min-height:38px;padding:7px 9px;border:1px solid #b6c7bd;border-radius:8px}.icon-presets{display:flex;flex-wrap:wrap;gap:5px;align-items:end}.icon-presets button{min-height:34px;padding:5px 7px}
+
 .room-card{
   display:grid;
   grid-template-columns:52px minmax(0,1fr) 30px;
@@ -139,6 +141,9 @@
   border-radius:15px;
   background:#fff;
 }
+
+.family-editor{padding:14px;box-shadow:0 2px 8px rgba(20,38,31,.04)}
+.family-editor .family-children{margin:8px 0 12px;padding:8px 10px;border:0;border-top:1px solid #e2e9e4;border-bottom:1px solid #e2e9e4}.family-editor .family-children legend{font-size:.86rem;font-weight:750;padding:0 4px}.family-editor .family-children .check{display:inline-flex;margin:4px 14px 4px 0;font-size:.9rem}.family-sensitive{margin-left:auto}.family-sensitive summary{cursor:pointer;color:#7e4a22;font-weight:700}.family-sensitive label{margin:8px 0;font-size:.86rem}.family-sensitive input{width:100%;min-width:220px}
 
 .editor-grid{
   display:grid;
@@ -453,3 +458,5 @@ body{
     right:-8px;
   }
 }
+
+.activity-categories{display:flex;flex-wrap:wrap;gap:7px;margin:0 0 8px}.activity-categories button{min-height:38px;padding:8px 11px}.account-password-embedded{margin:0}.account-password-embedded .account-password-panel{position:static;width:auto;padding:0;border:0;box-shadow:none}.account-password-embedded .account-password-panel button{width:auto}
