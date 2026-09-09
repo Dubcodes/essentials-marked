@@ -1,6 +1,7 @@
 import React,{useEffect,useState}from'react';
 import{api}from'../api';
 import{loadSnapshot,saveSnapshot,sync}from'../offline';
+import{useLiveReconciliation}from'../live';
 import{currentRoomPresentIds}from'../presence';
 import{Food,Sunscreen,Toileting}from'./OrdinaryWorkflows';
 import{
@@ -34,6 +35,7 @@ type SleepAction=
   'put_down'|
   'fell_asleep'|
   'wake'|
+  'wake_and_got_up'|
   'got_up';
 
 export const restoreContext=(data:Bootstrap)=>({
@@ -122,6 +124,8 @@ export default function Classroom(){
 
     return boot;
   };
+
+  const liveState=useLiveReconciliation(refresh);
 
   useEffect(()=>{
     void refresh()
@@ -272,7 +276,7 @@ export default function Classroom(){
   };
 
   return(
-    <main className="classroom">
+    <main className="classroom" style={{'--room-accent':data.rooms.find(r=>r.id===roomId)?.accent||'#176b5b'} as any}>
       <header>
         <div>
           {data.centre?.logo_url&&<img className="brand-logo" src={data.centre.logo_url} alt=""/>}<strong>{data.centre?.display_name||<>Essentials <i>Marked</i></>}</strong>{data.centre?.secondary_text&&<small>{data.centre.secondary_text}</small>}
@@ -311,12 +315,12 @@ export default function Classroom(){
 
           <em
             className={
-              syncState==='Synced'
+              liveState==='Live'
                 ?'ok'
                 :'warn'
             }
           >
-            {syncState}
+            {liveState}
           </em>
 
           <button
@@ -388,6 +392,8 @@ export default function Classroom(){
             }
           />
 
+          <Metric value={data.child_alerts?.length||0} label="open child alerts"/>
+
           <Metric
             value={syncState}
             label="sync"
@@ -395,6 +401,8 @@ export default function Classroom(){
           />
 
         </section>
+
+        {!!data.child_alerts?.length&&<section className="classroom-alerts" aria-label="Open child alerts"><h2>Open child alerts</h2>{data.child_alerts.map(alert=><p key={alert.id}><b>{alert.child_name}</b> — {alert.label}<button className="minor" onClick={()=>void api(`/classroom/alerts/${alert.id}/resolve`,{method:'POST',body:JSON.stringify({staff_id:staffId})}).then(refresh).catch((e:any)=>showNotice(e.message))}>Resolve</button></p>)}</section>}
 
         {notice&&
           <p
@@ -405,7 +413,7 @@ export default function Classroom(){
           </p>
         }
 
-        <h1>
+        <h1 style={{borderLeft:`6px solid ${data.rooms.find(r=>r.id===roomId)?.accent||'#176b5b'}`,paddingLeft:'10px'}}>
           {data.rooms.find(
             r=>r.id===roomId
           )?.name} classroom
@@ -501,7 +509,13 @@ export default function Classroom(){
   );
 }
 
-function EmergencyRoll({data,offline,close}:{data:Bootstrap;offline:boolean;close:()=>void}){const confirmed=new Date(data.last_confirmed_at||Date.now());const stale=Date.now()-confirmed.getTime()>12*60*60*1000;const present=data.children.filter(c=>c.present);const groups=data.rooms.map(room=>({room,children:present.filter(c=>(c.visiting_room_id||c.room_id)===room.id)})).filter(group=>group.children.length);return <div className="emergency-overlay" role="dialog" aria-modal="true" aria-label="Emergency roll"><section className="emergency-roll"><div className="no-print"><button className="close" onClick={close}>×</button></div><h1>{data.centre?.display_name||'Essentials Marked'} — Emergency roll</h1>{offline&&<p className="offline-banner">OFFLINE — LAST KNOWN ROSTER</p>}{stale&&<p className="offline-banner">STALE — confirm against another source</p>}<p>Generated {new Date().toLocaleString()} · last confirmed {confirmed.toLocaleString()}</p>{groups.map(({room,children})=><section key={room.id}><h2>{room.name}</h2>{children.map(child=><p key={child.id}>☐ {child.first_name} {child.last_name}</p>)}</section>)}{!present.length&&<p>No children were marked present at the last confirmation.</p>}<button className="no-print" onClick={()=>print()}>Print emergency roll</button></section></div>}
+function EmergencyRoll({data,offline,close}:{data:Bootstrap;offline:boolean;close:()=>void}){
+  const confirmed=new Date(data.last_confirmed_at||Date.now()),stale=Date.now()-confirmed.getTime()>12*60*60*1000,settings=data.centre?.emergency_print||{columns:3,sort:'room_then_name',show_room:true};
+  const active=data.children.filter(c=>c.active!==false),present=active.filter(c=>c.present),absent=active.filter(c=>!c.present);
+  const roomName=(id?:string|null)=>data.rooms.find(room=>room.id===id)?.name||'No room';
+  const section=(title:string,items:any[],location:(child:any)=>string)=>{const ordered=[...items].sort((a,b)=>{const left=settings.sort==='alphabetical'?`${a.first_name} ${a.last_name}`:`${location(a)} ${a.first_name} ${a.last_name}`,right=settings.sort==='alphabetical'?`${b.first_name} ${b.last_name}`:`${location(b)} ${b.first_name} ${b.last_name}`;return left.localeCompare(right)});return <section className="emergency-section" style={{columnCount:settings.columns}}><h2>{title} ({items.length})</h2>{ordered.length?ordered.map(child=><p key={child.id}>☐ <b>{child.first_name} {child.last_name}</b> {settings.show_room&&<small>{location(child)}</small>}</p>):<p>None</p>}</section>};
+  return <div className="emergency-overlay" role="dialog" aria-modal="true" aria-label="Emergency roll"><section className="emergency-roll"><div className="no-print"><button className="close" onClick={close}>×</button></div><h1>{data.centre?.display_name||'Essentials Marked'} — Emergency roll</h1>{offline&&<p className="offline-banner">OFFLINE — LAST KNOWN ROSTER</p>}{stale&&<p className="offline-banner">STALE — confirm against another source</p>}<p>Generated {new Date().toLocaleString()} · last confirmed {confirmed.toLocaleString()}</p>{section('PRESENT / LAST-KNOWN PRESENT',present,child=>roomName(child.visiting_room_id||child.room_id))}{section('NOT MARKED PRESENT',absent,child=>roomName(child.room_id))}<button className="no-print" onClick={()=>print()}>Print emergency roll</button></section></div>
+}
 
 function Metric({
   value,

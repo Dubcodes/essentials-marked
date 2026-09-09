@@ -17,6 +17,9 @@ class Centre(Base):
     display_name: Mapped[str | None] = mapped_column(String(200))
     secondary_text: Mapped[str | None] = mapped_column(String(240))
     logo_path: Mapped[str | None] = mapped_column(String(300))
+    emergency_columns: Mapped[int] = mapped_column(Integer, default=3)
+    emergency_sort: Mapped[str] = mapped_column(String(30), default='room_then_name')
+    emergency_show_room: Mapped[bool] = mapped_column(Boolean, default=True)
 class Room(Base):
     __tablename__ = 'rooms'
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
@@ -38,7 +41,7 @@ class Child(Base):
     __tablename__ = 'children'
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id'), index=True); room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id'))
-    first_name: Mapped[str] = mapped_column(String(100)); last_name: Mapped[str] = mapped_column(String(100), default=''); preferred_name: Mapped[str | None] = mapped_column(String(100)); dob: Mapped[str | None] = mapped_column(String(10)); active: Mapped[bool] = mapped_column(Boolean, default=True)
+    first_name: Mapped[str] = mapped_column(String(100)); middle_name: Mapped[str | None] = mapped_column(String(100)); last_name: Mapped[str] = mapped_column(String(100), default=''); preferred_name: Mapped[str | None] = mapped_column(String(100)); dob: Mapped[str | None] = mapped_column(String(10)); active: Mapped[bool] = mapped_column(Boolean, default=True)
 class Parent(Base):
     __tablename__ = 'parents'
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
@@ -48,7 +51,7 @@ class ParentChild(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); parent_id: Mapped[str] = mapped_column(ForeignKey('parents.id'), index=True); child_id: Mapped[str] = mapped_column(ForeignKey('children.id'), index=True)
 class Attendance(Base):
     __tablename__ = 'attendance'
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id'), index=True); child_id: Mapped[str] = mapped_column(ForeignKey('children.id')); room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); arrived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); departed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); visit_room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); last_visit_room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); visit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); visit_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); recorded_by_staff_id: Mapped[str | None] = mapped_column(ForeignKey('staff.id')); device_id: Mapped[str | None] = mapped_column(ForeignKey('devices.id'))
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid); centre_id: Mapped[str] = mapped_column(ForeignKey('centres.id'), index=True); child_id: Mapped[str] = mapped_column(ForeignKey('children.id')); room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); arrived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); departed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); visit_room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); last_visit_room_id: Mapped[str | None] = mapped_column(ForeignKey('rooms.id')); visit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); visit_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); recorded_by_staff_id: Mapped[str | None] = mapped_column(ForeignKey('staff.id')); device_id: Mapped[str | None] = mapped_column(ForeignKey('devices.id')); source: Mapped[str] = mapped_column(String(30),default='classroom'); late_sign_in: Mapped[bool] = mapped_column(Boolean,default=False); circumstance: Mapped[str|None] = mapped_column(String(240)); signer_name: Mapped[str|None] = mapped_column(String(200)); signer_relationship: Mapped[str|None] = mapped_column(String(100))
 class RoomVisit(Base):
     __tablename__='room_visits'
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); centre_id: Mapped[str]=mapped_column(ForeignKey('centres.id'),index=True); attendance_id: Mapped[str]=mapped_column(ForeignKey('attendance.id'),index=True); child_id: Mapped[str]=mapped_column(ForeignKey('children.id'),index=True); room_id: Mapped[str]=mapped_column(ForeignKey('rooms.id')); started_at: Mapped[datetime]=mapped_column(DateTime(timezone=True)); ended_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); started_by_staff_id: Mapped[str|None]=mapped_column(ForeignKey('staff.id')); ended_by_staff_id: Mapped[str|None]=mapped_column(ForeignKey('staff.id')); device_id: Mapped[str|None]=mapped_column(ForeignKey('devices.id'))
@@ -71,6 +74,9 @@ class ParentNote(Base):
 class ParentDataRequest(Base):
     __tablename__='parent_data_requests'
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); centre_id: Mapped[str]=mapped_column(ForeignKey('centres.id'),index=True); parent_id: Mapped[str]=mapped_column(ForeignKey('parents.id'),index=True); child_id: Mapped[str]=mapped_column(ForeignKey('children.id'),index=True); start_date: Mapped[date]=mapped_column(Date); end_date: Mapped[date]=mapped_column(Date); note: Mapped[str|None]=mapped_column(Text); status: Mapped[str]=mapped_column(String(20),default='new'); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); handled_by_id: Mapped[str|None]=mapped_column(ForeignKey('accounts.id'))
+class ChildAlert(Base):
+    __tablename__='child_alerts'; __table_args__=(Index('ix_open_child_alert','centre_id','child_id','type','resolved_at'),)
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); centre_id: Mapped[str]=mapped_column(ForeignKey('centres.id'),index=True); child_id: Mapped[str]=mapped_column(ForeignKey('children.id'),index=True); type: Mapped[str]=mapped_column(String(50)); event_id: Mapped[str|None]=mapped_column(ForeignKey('events.id')); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); created_by_staff_id: Mapped[str|None]=mapped_column(ForeignKey('staff.id')); touched_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); resolved_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); resolved_by_staff_id: Mapped[str|None]=mapped_column(ForeignKey('staff.id'))
 
 class AppSession(Base):
     __tablename__ = 'app_sessions'

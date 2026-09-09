@@ -39,13 +39,15 @@ export const sleepingChildIds=(sessions:SleepSession[],roomId:string)=>
     .filter(s=>s.room_id===roomId&&s.state==='sleeping'&&!s.stale)
     .map(s=>s.child_id);
 
+const friendlyState=(state:SleepSession['state'])=>({settling:'Settling',sleeping:'Sleeping',awake_resting:'Awake after sleep'}[state]);
+
 export function SleepWorkflow({
   check=false,
   initialAction,
   ...props
 }:WorkflowProps&{
   check?:boolean;
-  initialAction?:'put_down'|'fell_asleep'|'wake'|'got_up'
+  initialAction?:'put_down'|'fell_asleep'|'wake'|'wake_and_got_up'|'got_up'
 }){
   const[sessions,setSessions]=useState<SleepSession[]>([]);
   const[selected,setSelected]=useState<string[]>([]);
@@ -57,6 +59,8 @@ export function SleepWorkflow({
   const[warmth,setWarmth]=useState('normal');
   const[breathing,setBreathing]=useState('normal');
   const[wellbeing,setWellbeing]=useState('well');
+  const[quality,setQuality]=useState('');
+  const[wakeState,setWakeState]=useState('');
   const[saving,setSaving]=useState(false);
 
   const op=useRef(operationId(check?'sleep-check':'sleep'));
@@ -99,6 +103,8 @@ export function SleepWorkflow({
         s.state==='sleeping';
     }
 
+    if(!child.present&&(action==='put_down'||action==='fell_asleep'))return true;
+
     if(action==='put_down'){
       return isPhysicallyInRoom(child,props.roomId)&&!s;
     }
@@ -118,7 +124,7 @@ export function SleepWorkflow({
       return s.state==='settling';
     }
 
-    if(action==='wake'){
+    if(action==='wake'||action==='wake_and_got_up'){
       return s.state==='sleeping';
     }
 
@@ -159,7 +165,7 @@ export function SleepWorkflow({
         :'No active sleep session';
     }
 
-    return `Currently ${s.state.replace('_',' ')}`;
+    return `Currently ${friendlyState(s.state)}`;
   };
 
   const state=(child:Child)=>{
@@ -180,7 +186,7 @@ export function SleepWorkflow({
         ?''
         :` · ${roomNames[s.room_id]||'other room'}`;
 
-    return `${s.state.replace('_',' ')}${room}${s.stale?' · needs closing':''}`;
+    return `${friendlyState(s.state)}${room}${s.stale?' · needs closing':''}`;
   };
 
   const save=async()=>{
@@ -201,6 +207,8 @@ export function SleepWorkflow({
           warmth,
           breathing,
           wellbeing,
+          quality:quality||undefined,
+          wake_state:wakeState||undefined,
           note:note||undefined
         })
       });
@@ -244,6 +252,7 @@ export function SleepWorkflow({
           roomId={props.roomId}
           selected={selected}
           setSelected={setSelected}
+          onAbsentConfirm={async child=>{await api('/classroom/late-sign-in',{method:'POST',body:JSON.stringify({client_id:operationId('late-sign-in'),child_id:child.id,room_id:props.roomId,staff_id:props.staffId})});props.notice(`${child.first_name} marked present — continue recording sleep`);await props.refresh()}}
           filter={eligible}
           eligibilityLabel={reason}
           stateLabel={state}
@@ -299,6 +308,7 @@ export function SleepWorkflow({
               'put_down',
               'fell_asleep',
               'wake',
+              'wake_and_got_up',
               'got_up'
             ]}
             value={action}
@@ -362,6 +372,8 @@ export function SleepWorkflow({
             </p>
           )
       }
+
+      {!check&&['wake','wake_and_got_up'].includes(action)&&<div className="editor-grid"><label>Sleep quality (optional)<input value={quality} onChange={event=>setQuality(event.target.value)} placeholder="e.g. settled"/></label><label>Wake state (optional)<input value={wakeState} onChange={event=>setWakeState(event.target.value)} placeholder="e.g. happy"/></label></div>}
 
       <label>
         Optional note

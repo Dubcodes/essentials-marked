@@ -6,6 +6,7 @@ export type Child={
   present?:boolean;
   visiting_room_id?:string|null;
   arrived_at?:string|null;
+  active?:boolean;
 };
 
 export type Staff={
@@ -28,9 +29,10 @@ export type Bootstrap={
   children:Child[];
   unread_notes:number;
   incident_drafts?:number;
+  child_alerts?:{id:string;child_id:string;child_name:string;type:string;label:string}[];
   recent_visitors?:Record<string,string[]>;
   last_confirmed_at?:string;
-  centre?:{display_name?:string;secondary_text?:string;logo_url?:string|null;timezone?:string};
+  centre?:{display_name?:string;secondary_text?:string;logo_url?:string|null;timezone?:string;emergency_print?:{columns:2|3;sort:'alphabetical'|'room_then_name';show_room:boolean}};
 };
 
 export type WorkflowProps={

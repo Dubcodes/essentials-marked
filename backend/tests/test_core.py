@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 import app.main as main_module
 from app.main import app, pwd, enforce_failure_limit, record_auth_failure, verify_staff_pin
 from app.db import Base, engine, SessionLocal
-from app.models import Centre, Account, Room, Staff, Child, Parent, ParentChild, Attendance, RoomVisit, Audit, Event, MedicationAuthority, MedicationAdministration, MedicationReceipt, Signature, SleepSession, SleepCheck, Incident, IncidentAction, IncidentBodyArea, LoginAttempt, AppSession, now
+from app.models import Centre, Account, Room, Staff, Child, Parent, ParentChild, Attendance, RoomVisit, Audit, Event, ChildAlert, MedicationAuthority, MedicationAdministration, MedicationReceipt, Signature, SleepSession, SleepCheck, Incident, IncidentAction, IncidentBodyArea, LoginAttempt, AppSession, now
 
 def setup():
     Base.metadata.drop_all(engine);Base.metadata.create_all(engine);db=SessionLocal()
@@ -597,7 +597,7 @@ def test_admin_management_rooms_children_and_staff():
 
         assert client.patch(
             f'/api/admin/children/{child_id}',
-            json={'active':False}
+            json={'active':False,'account_password':'secret'}
         ).status_code==200
 
         staff_response=client.post(
@@ -690,6 +690,52 @@ def test_admin_management_rooms_children_and_staff():
     finally:
         db.close()
 
+def test_child_update_requires_initiator_password_and_never_audits_it():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room);child=children[0]
+        assert client.patch(f'/api/admin/children/{child.id}',json={'first_name':'Changed'}).status_code==403
+        assert client.patch(f'/api/admin/children/{child.id}',json={'first_name':'Changed','account_password':'wrong'}).status_code==403
+        assert client.patch(f'/api/admin/children/{child.id}',json={'first_name':'Changed','account_password':'secret'}).status_code==200
+        db.expire_all();assert db.get(Child,child.id).first_name=='Changed'
+        audit_rows=db.scalars(select(Audit).where(Audit.entity_id==child.id)).all()
+        assert 'secret' not in str([(row.before,row.after,row.reason) for row in audit_rows])
+    finally: db.close()
+
+def test_safe_child_delete_and_history_block():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room)
+        unused=client.post('/api/admin/children',json={'first_name':'Unused','last_name':'Child','room_id':room.id}).json()
+        deleted=client.post(f"/api/admin/children/{unused['id']}/delete",json={'admin_password':'secret','confirm':'Unused Child'})
+        assert deleted.status_code==200
+        blocked=client.post(f'/api/admin/children/{children[0].id}/delete',json={'admin_password':'secret','confirm':'Child'})
+        assert blocked.status_code==409 and blocked.json()['detail']['code']=='has_history'
+    finally: db.close()
+
+def test_wake_and_got_up_is_one_idempotent_sleep_operation():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room);base={'child_ids':[children[0].id],'room_id':room.id,'staff_id':staff.id}
+        assert client.post('/api/classroom/sleep',json={**base,'client_id':'wake-composite-put','action':'put_down'}).status_code==200
+        assert client.post('/api/classroom/sleep',json={**base,'client_id':'wake-composite-sleep','action':'fell_asleep'}).status_code==200
+        payload={**base,'client_id':'wake-composite-close','action':'wake_and_got_up','quality':'good','wake_state':'happy'}
+        assert client.post('/api/classroom/sleep',json=payload).status_code==200
+        assert client.post('/api/classroom/sleep',json=payload).json()['idempotent']
+        session=db.scalar(select(SleepSession).where(SleepSession.child_id==children[0].id));assert session.woke_at==session.got_up_at and session.closed_by_staff_id==staff.id
+    finally: db.close()
+
+def test_device_attendance_kiosk_records_signer_and_signature_without_care_access():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room)
+        payload={'child_id':children[0].id,'room_id':room.id,'signer_name':'Demo Parent','relationship':'parent','signature_data':'data:image/png;base64,signature-evidence-014'}
+        assert client.post('/api/attendance/kiosk',json={**payload,'action':'sign_in'}).status_code==200
+        attendance=db.scalar(select(Attendance).where(Attendance.child_id==children[0].id));assert attendance.source=='parent_kiosk' and attendance.signer_name=='Demo Parent'
+        assert client.post('/api/attendance/kiosk',json={**payload,'action':'sign_out'}).status_code==200
+        assert db.scalar(select(Signature).where(Signature.domain_type=='attendance')) is not None
+    finally: db.close()
+
 def test_admin_archive_visibility_and_inactive_staff_guard():
     db,centre,account,room,other_room,staff,children,parent=setup()
 
@@ -716,7 +762,7 @@ def test_admin_archive_visibility_and_inactive_staff_guard():
 
         blocked=client.patch(
             f'/api/admin/children/{child.id}',
-            json={'active':False}
+            json={'active':False,'account_password':'secret'}
         )
 
         assert blocked.status_code==409
@@ -736,7 +782,7 @@ def test_admin_archive_visibility_and_inactive_staff_guard():
 
         archived=client.patch(
             f'/api/admin/children/{child.id}',
-            json={'active':False}
+            json={'active':False,'account_password':'secret'}
         )
 
         assert archived.status_code==200
@@ -793,3 +839,29 @@ def test_admin_archive_visibility_and_inactive_staff_guard():
 
     finally:
         db.close()
+
+def test_toileting_alerts_deduplicate_resolve_and_are_parent_visible():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room);child=children[0]
+        payload={'client_id':'toileting-alert-001','child_ids':[child.id],'type':'nappy','room_id':room.id,'performed_by_id':staff.id,'data':{'outcome':'Wet','nappies_low':True,'soiled_clothes':True}}
+        assert client.post('/api/classroom/events',json=payload).status_code==200
+        second={**payload,'client_id':'toileting-alert-002'}
+        assert client.post('/api/classroom/events',json=second).status_code==200
+        open_alerts=client.get('/api/classroom/alerts').json()
+        assert {x['type'] for x in open_alerts}=={'nappies_low','soiled_clothes'} and db.query(ChildAlert).count()==2
+        assert client.post(f"/api/classroom/alerts/{open_alerts[0]['id']}/resolve",json={'staff_id':staff.id}).status_code==200
+        client.post('/api/auth/logout');assert client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
+        day=client.get(f'/api/parent/children/{child.id}/day').json()
+        assert len(day['alerts'])==1 and day['alerts'][0]['type'] in {'nappies_low','soiled_clothes'}
+    finally: db.close()
+
+def test_late_sign_in_is_explicit_and_idempotent():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        client=TestClient(app);paired(client,room);payload={'client_id':'late-sign-in-001','child_id':children[0].id,'room_id':room.id,'staff_id':staff.id}
+        first=client.post('/api/classroom/late-sign-in',json=payload);again=client.post('/api/classroom/late-sign-in',json=payload)
+        assert first.status_code==200 and again.status_code==200
+        attendance=db.query(Attendance).one();assert attendance.late_sign_in and attendance.source=='staff_late_sign_in' and attendance.circumstance=='Entered by staff after care workflow'
+        assert db.query(Attendance).count()==1 and db.query(Audit).filter(Audit.action=='late_sign_in').count()==1
+    finally: db.close()

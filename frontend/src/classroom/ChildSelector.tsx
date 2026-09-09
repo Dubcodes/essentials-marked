@@ -5,6 +5,7 @@ import{
   physicalRoomStatus
 }from'../presence';
 import type{Child,Room}from'./types';
+import{ConfirmDialog}from'../admin/ConfirmDialog';
 
 export const selectAllPhysical=(
   children:Child[],
@@ -39,7 +40,8 @@ export function ChildSelector({
   eligibilityLabel,
   stateLabel,
   recentVisitorIds=[],
-  bulkLabel='Select all present in this room'
+  bulkLabel='Select all present in this room',
+  onAbsentConfirm
 }:{
   children:Child[];
   rooms:Room[];
@@ -51,9 +53,11 @@ export function ChildSelector({
   stateLabel?:(child:Child)=>string;
   recentVisitorIds?:string[];
   bulkLabel?:string;
+  onAbsentConfirm?:(child:Child)=>Promise<void>;
 }){
   const[q,setQ]=useState('');
   const[presentOnly,setPresentOnly]=useState(false);
+  const[pendingAbsent,setPendingAbsent]=useState<Child>();
   const searchRef=useRef<HTMLInputElement>(null);
   useEffect(()=>{const focus=()=>searchRef.current?.focus();window.addEventListener('classroom-focus-search',focus);return()=>window.removeEventListener('classroom-focus-search',focus)},[]);
 
@@ -62,6 +66,7 @@ export function ChildSelector({
 
   const toggle=(child:Child)=>{
     if(filter&&!filter(child))return;
+    if(!child.present&&!selected.includes(child.id)&&onAbsentConfirm){setPendingAbsent(child);return;}
     setSelected(
       selected.includes(child.id)
         ? selected.filter(x=>x!==child.id)
@@ -123,7 +128,7 @@ export function ChildSelector({
                   </b>
 
                   <span>
-                    {c.first_name}
+                    {c.first_name} {c.last_name}
                     <small>
                       {stateLabel?.(c)||physicalRoomStatus(c,roomId,names)}
                     </small>
@@ -135,6 +140,7 @@ export function ChildSelector({
           </div>
         ) : null
       )}
+      <ConfirmDialog open={Boolean(pendingAbsent)} title="Child is not marked present" message={`${pendingAbsent?.first_name||''} ${pendingAbsent?.last_name||''} is not marked present. Are they physically at the centre?`} confirmLabel="Mark present and continue" onCancel={()=>setPendingAbsent(undefined)} onConfirm={()=>{const child=pendingAbsent;setPendingAbsent(undefined);if(child)void onAbsentConfirm?.(child).then(()=>setSelected([...selected,child.id]));}}/>
     </section>
   );
 }

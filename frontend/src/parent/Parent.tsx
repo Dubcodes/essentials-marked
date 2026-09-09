@@ -1,5 +1,6 @@
 import React,{useEffect,useMemo,useState}from'react';
 import{api}from'../api';
+import{useLiveReconciliation}from'../live';
 
 type Child={
   id:string;
@@ -34,12 +35,14 @@ type CareEvent={
   data:any;
   room?:string|null;
 };
+type ChildAlert={id:string;label:string;type:string};
 
 type DayData={
   date:string;
   attendance:Attendance[];
   sleep_sessions:Sleep[];
   events:CareEvent[];
+  alerts?:ChildAlert[];
 };
 
 const icons:Record<string,string>={
@@ -378,6 +381,19 @@ export default function ParentView(){
   const[errorStatus,setErrorStatus]=useState<number>();
   const[requestState,setRequestState]=useState<'idle'|'sending'|'sent'>('idle');
 
+  const reconcile=async()=>{
+    const me=await api('/parent/me');
+    setData(me);
+    const available=me.children.some((item:Child)=>item.id===child);
+    const selected=available?child:me.children[0]?.id;
+    if(selected&&selected!==child){setChild(selected);return;}
+    if(selected){
+      const next=await api(`/parent/children/${selected}/day?day=${day}`);
+      setRecord(next);
+    }
+  };
+  const liveState=useLiveReconciliation(reconcile);
+
   useEffect(()=>{
     void api('/parent/me')
       .then(me=>{
@@ -530,6 +546,7 @@ export default function ParentView(){
         {data.logo_url&&<img className="brand-logo" src={data.logo_url} alt=""/>}
         <strong>{data.display_name||<>Essentials <i>Marked</i></>}</strong>
         <span>{data.secondary_text||data.centre}</span>
+        <small className={liveState==='Live'?'live-indicator':'live-indicator offline'}>{liveState}</small>
         <button className="minor" onClick={()=>void api('/auth/logout',{method:'POST'}).finally(()=>location.reload())}>Sign out</button>
       </header>
 
@@ -602,7 +619,7 @@ export default function ParentView(){
       }
 
       {record&&
-        <section className="parent-story">
+        <><section className="parent-alerts" aria-label="Current child alerts">{record.alerts?.map(alert=><p key={alert.id}><b>{alert.label}</b> — please speak with your teachers if you need more detail.</p>)}</section><section className="parent-story">
           <AttendanceRow
             type="Drop off"
             value={dropOff}
@@ -646,7 +663,7 @@ export default function ParentView(){
                 <span>Not yet picked up</span>
               </div>
           }
-        </section>
+        </section></>
       }
 
       <div className="parent-actions">

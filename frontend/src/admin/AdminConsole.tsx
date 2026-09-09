@@ -1,9 +1,11 @@
 import React,{useEffect,useMemo,useState}from'react';
 import{api}from'../api';
+import{useLiveReconciliation}from'../live';
 import AccountPassword from'../account/AccountPassword';
 import AccountsSettings from'../account/AccountsSettings';
 import FamiliesManager from'./FamiliesManager';
 import ActivityLog from'./ActivityLog';
+import{ConfirmDialog}from'./ConfirmDialog';
 import{managementPagesForRole,settingsSections,type AdminPage}from'../account/role-ui';
 
 type Page=AdminPage;
@@ -15,6 +17,7 @@ export default function AdminConsole(){
   const[page,setPage]=useState<Page>('Dashboard');
   const[activityChild,setActivityChild]=useState('');
   const[activityRecord,setActivityRecord]=useState<any>();
+  const[printing,setPrinting]=useState(false);
 
   const[pair,setPair]=useState<any>();
   const[pairState,setPairState]=useState('');
@@ -30,6 +33,8 @@ export default function AdminConsole(){
       value||boot.rooms[0]?.id||''
     );
   };
+
+  const liveState=useLiveReconciliation(load);
 
   useEffect(()=>{
     void load();
@@ -139,6 +144,10 @@ export default function AdminConsole(){
           {data.centre.secondary_text||
            data.centre.name} administration
         </span>
+
+        <small className={liveState==='Live'?'live-indicator':'live-indicator offline'}>
+          {liveState}
+        </small>
 
         <button
           className="minor"
@@ -251,7 +260,7 @@ export default function AdminConsole(){
                 />
               </div></section>
 
-              <section className="dashboard-section"><h2>Quick actions</h2><div className="inline-actions"><button onClick={()=>openClassroom(data.rooms[0]?.id)}>Open Classroom</button><button onClick={()=>setPage('Children')}>Children</button><button onClick={()=>setPage('Activity log')}>Activity log</button>{isAdmin&&<button onClick={()=>setPage('Devices')}>Pair new tablet</button>}</div></section>
+              <section className="dashboard-section"><h2>Quick actions</h2><div className="inline-actions"><button onClick={()=>openClassroom(data.rooms[0]?.id)}>Open Classroom</button><button onClick={()=>setPage('Children')}>Children</button><button onClick={()=>setPage('Activity log')}>Activity log</button>{isAdmin&&<button onClick={()=>setPrinting(true)}>Print emergency roll</button>}{isAdmin&&<button onClick={()=>setPage('Devices')}>Pair new tablet</button>}</div></section>
               <DashboardActivity notice={notice} openAll={()=>setPage('Activity log')} openRecord={item=>{setActivityRecord(item);setPage('Activity log')}}/>
             </>
           }
@@ -435,6 +444,7 @@ export default function AdminConsole(){
 
           {page==='Data requests'&&
             <>
+              {!(data.data_requests||[]).length&&<div className="empty-state"><h2>No data requests are waiting.</h2><p>Parent requests for older records will appear here.</p></div>}
               {(data.data_requests||[]).map(
                 (request:any)=>
                   <div
@@ -499,6 +509,7 @@ export default function AdminConsole(){
           }
         </section>
       </div>
+      {printing&&<AdminEmergencyRoll data={data} close={()=>setPrinting(false)}/>}
     </main>
   );
 }
@@ -546,8 +557,17 @@ function Card({
 
 function DashboardActivity({notice,openAll,openRecord}:{notice:Notice;openAll:()=>void;openRecord:(item:any)=>void}){
   const[items,setItems]=useState<any[]>([]);
-  useEffect(()=>{void api('/admin/activity?limit=10').then((result:any)=>setItems(result.items)).catch((error:any)=>notice(error.message))},[]);
+  const load=()=>api('/admin/activity?limit=10').then((result:any)=>setItems(result.items)).catch((error:any)=>notice(error.message));
+  useEffect(()=>{void load()},[]);useLiveReconciliation(load);
   return <section className="dashboard-section"><div className="manager-toolbar"><h2>Recent activity</h2><button className="minor" onClick={openAll}>View all activity</button></div><div className="person-list">{items.map(item=><button className="person-row" key={`${item.source}-${item.id}`} onClick={()=>openRecord(item)}><span><b>{item.activity||item.type}</b><small>{item.child_name||'Centre'} · {item.teacher||'No teacher'} · {item.room||'No room'}{item.corrected?' · corrected':''}</small></span><small>{new Date(item.effective_at).toLocaleString()}</small></button>)}</div></section>;
+}
+
+function AdminEmergencyRoll({data,close}:{data:any;close:()=>void}){
+  const active=data.children.filter((child:any)=>child.active!==false),present=active.filter((child:any)=>child.present),notPresent=active.filter((child:any)=>!child.present);
+  const settings=data.centre.emergency_print||{columns:3,sort:'room_then_name',show_room:true};
+  const room=(id:string)=>data.rooms.find((item:any)=>item.id===id)?.name||'No room';
+  const list=(title:string,children:any[],current:boolean)=><section className="emergency-section" style={{columnCount:settings.columns}}><h2>{title} ({children.length})</h2>{children.length?children.sort((a:any,b:any)=>{const left=settings.sort==='alphabetical'?`${a.first_name} ${a.last_name}`:`${room(current?(a.physical_room_id||a.room_id):a.room_id)} ${a.first_name} ${a.last_name}`,right=settings.sort==='alphabetical'?`${b.first_name} ${b.last_name}`:`${room(current?(b.physical_room_id||b.room_id):b.room_id)} ${b.first_name} ${b.last_name}`;return left.localeCompare(right)}).map((child:any)=><p key={child.id}>☐ <b>{child.preferred_name||child.first_name} {child.last_name}</b> {settings.show_room&&<small>{room(current?(child.physical_room_id||child.room_id):child.room_id)}</small>}</p>):<p>None</p>}</section>;
+  return <div className="emergency-overlay" role="dialog" aria-modal="true" aria-label="Print emergency roll"><section className="emergency-roll"><div className="no-print"><button className="close" onClick={close}>×</button></div><h1>{data.centre.display_name||data.centre.name} — Emergency roll</h1><p>Generated {new Date().toLocaleString()}</p>{list('PRESENT',present,true)}{list('NOT MARKED PRESENT',notPresent,false)}<button className="no-print" onClick={()=>print()}>Print emergency roll</button></section></div>;
 }
 
 
@@ -560,7 +580,7 @@ function RoomsManager({
   reload:()=>Promise<void>;
   notice:Notice;
 }){
-  const[editing,setEditing]=useState(false);
+  const[selected,setSelected]=useState<any>();
   const[adding,setAdding]=useState(false);
 
   return(
@@ -575,22 +595,10 @@ function RoomsManager({
         </div>
 
         <div className="inline-actions">
-          {editing&&
-            <button
-              onClick={()=>setAdding(true)}
+          <button
+              onClick={()=>{setAdding(true);setSelected(undefined)}}
             >
               + Add room
-            </button>
-          }
-
-          <button
-            className="minor"
-            onClick={()=>{
-              setEditing(value=>!value);
-              setAdding(false);
-            }}
-          >
-            {editing?'Done':'Edit'}
           </button>
         </div>
       </div>
@@ -608,24 +616,11 @@ function RoomsManager({
       }
 
       <div className="room-card-grid">
-        {data.rooms.map((room:any)=>
-          editing
-            ?(
-              <RoomEditor
-                key={room.id}
-                room={room}
-                reload={reload}
-                notice={notice}
-              />
-            )
-            :(
-              <button
+        {data.rooms.map((room:any)=><React.Fragment key={room.id}><button
                 type="button"
                 className="room-card"
-                key={room.id}
-                onClick={()=>
-                  openClassroom(room.id)
-                }
+                style={{borderColor:room.accent,backgroundColor:`${room.accent}12`}}
+                onClick={()=>{setSelected(selected?.id===room.id?undefined:room);setAdding(false)}}
               >
                 <span className="room-icon">
                   {room.icon}
@@ -651,9 +646,7 @@ function RoomsManager({
                     `Accent ${room.accent}`
                   }
                 />
-              </button>
-            )
-        )}
+              </button>{selected?.id===room.id&&<RoomEditor room={room} reload={reload} notice={notice}/>}</React.Fragment>)}
       </div>
     </section>
   );
@@ -973,7 +966,7 @@ function ChildrenManager({
           <button className="close" onClick={()=>setSelectedChildId('')}>×</button>
           <h3>{selected.preferred_name||selected.first_name} {selected.last_name}</h3>
           <p>{selected.present?'Present':'Absent'} · Enrolled: {selected.enrolled_room||'No room'} · Physical: {selected.physical_room||'Not at centre'}</p>
-          <ChildEditor child={selected} rooms={data.rooms} reload={reload} notice={notice}/>
+          <ChildEditor child={selected} rooms={data.rooms} reload={reload} notice={notice} canDelete={data.account?.role==='admin'}/>
           <h4>Linked families</h4>
           <div className="person-list">{selected.families?.length?selected.families.map((family:any)=><div className="person-row" key={family.id}><span><b>{family.name}</b><small>{family.login}</small></span><small>{family.active?'Active':'Inactive'}</small></div>):<p>No family login linked.</p>}</div>
           <ChildHistory child={selected} notice={notice} openHistory={openHistory} openRecord={openRecord}/>
@@ -1046,13 +1039,15 @@ function ChildEditor({
   rooms,
   reload,
   notice,
-  cancel
+  cancel,
+  canDelete=false
 }:{
   child:any|null;
   rooms:any[];
   reload:()=>Promise<void>;
   notice:Notice;
   cancel?:()=>void;
+  canDelete?:boolean;
 }){
   const[firstName,setFirstName]=useState(
     child?.first_name||''
@@ -1060,6 +1055,7 @@ function ChildEditor({
   const[lastName,setLastName]=useState(
     child?.last_name||''
   );
+  const[middleName,setMiddleName]=useState(child?.middle_name||'');
   const[preferredName,setPreferredName]=
     useState(child?.preferred_name||'');
   const[dob,setDob]=useState(
@@ -1074,17 +1070,22 @@ function ChildEditor({
     child?.active??true
   );
   const[busy,setBusy]=useState(false);
+  const[confirming,setConfirming]=useState(false);
+  const[accountPassword,setAccountPassword]=useState('');
+  const[deleting,setDeleting]=useState(false);
 
   useEffect(()=>{
     setFirstName(child?.first_name||'');
     setLastName(child?.last_name||'');
+    setMiddleName(child?.middle_name||'');
     setPreferredName(child?.preferred_name||'');
     setDob(child?.dob||'');
     setRoomId(child?.room_id||rooms[0]?.id||'');
     setActive(child?.active??true);
-  },[child,rooms]);
+  },[child?.id,rooms[0]?.id]);
 
   const save=async()=>{
+    if(child&&!confirming){setConfirming(true);return;}
     try{
       setBusy(true);
 
@@ -1096,12 +1097,14 @@ function ChildEditor({
           method:child?'PATCH':'POST',
           body:JSON.stringify({
             first_name:firstName.trim(),
+            middle_name:middleName.trim()||null,
             last_name:lastName.trim(),
             preferred_name:
               preferredName.trim()||null,
             dob:dob||null,
             room_id:roomId||null,
-            active
+            active,
+            ...(child?{account_password:accountPassword}: {})
           })
         }
       );
@@ -1113,12 +1116,15 @@ function ChildEditor({
           ?'Child updated'
           :'Child added'
       );
+      setAccountPassword('');
+      setConfirming(false);
     }catch(e:any){
       notice(e.message);
     }finally{
       setBusy(false);
     }
   };
+  const destroy=async()=>{try{await api(`/admin/children/${child.id}/delete`,{method:'POST',body:JSON.stringify({admin_password:accountPassword,confirm:`${preferredName||firstName} ${lastName}`.trim()})});setDeleting(false);setAccountPassword('');await reload();notice('Child permanently deleted')}catch(error:any){notice(error.message)}};
 
   return(
     <article className="manager-editor">
@@ -1141,6 +1147,11 @@ function ChildEditor({
               setLastName(e.target.value)
             }
           />
+        </label>
+
+        <label>
+          Middle name
+          <input value={middleName} onChange={e=>setMiddleName(e.target.value)}/>
         </label>
 
         <label>
@@ -1224,6 +1235,7 @@ function ChildEditor({
             Open classroom
           </button>
         }
+        {child&&canDelete&&<button className="danger minor" onClick={()=>setDeleting(true)}>Delete child</button>}
       </div>
 
       {!active&&
@@ -1233,6 +1245,9 @@ function ChildEditor({
           inactive.
         </p>
       }
+
+      {confirming&&<dialog open className="confirmation-dialog"><h3>Confirm child change</h3><p>{!active?'Archiving this Child removes them from normal active rosters but keeps historical records. ':' '}Enter your current account password to save this child’s details.</p><label>Current account password<input autoFocus type="password" autoComplete="current-password" value={accountPassword} onChange={event=>setAccountPassword(event.target.value)}/></label><div className="inline-actions"><button className="minor" onClick={()=>{setConfirming(false);setAccountPassword('')}}>Cancel</button><button disabled={!accountPassword||busy} onClick={()=>void save()}>{busy?'Saving…':'Confirm and save'}</button></div></dialog>}
+      <ConfirmDialog open={deleting} title="Permanently delete child?" message="Historical records will not be cascaded. This is only available if the child has never been used; otherwise archive the child instead." confirmLabel="Delete child" disabled={!accountPassword} onCancel={()=>{setDeleting(false);setAccountPassword('')}} onConfirm={()=>void destroy()}><label>Current Admin password<input autoFocus type="password" autoComplete="current-password" value={accountPassword} onChange={event=>setAccountPassword(event.target.value)}/></label><p>Type the child name exactly as shown by editing the fields before deleting.</p></ConfirmDialog>
     </article>
   );
 }
@@ -1247,7 +1262,7 @@ function StaffManager({
   reload:()=>Promise<void>;
   notice:Notice;
 }){
-  const[editing,setEditing]=useState(false);
+  const[selected,setSelected]=useState<any>();
   const[adding,setAdding]=useState(false);
   const[search,setSearch]=useState('');
 
@@ -1297,22 +1312,10 @@ function StaffManager({
             }
           />
 
-          {editing&&
-            <button
-              onClick={()=>setAdding(true)}
+          <button
+              onClick={()=>{setAdding(true);setSelected(undefined)}}
             >
               + Add teacher
-            </button>
-          }
-
-          <button
-            className="minor"
-            onClick={()=>{
-              setEditing(value=>!value);
-              setAdding(false);
-            }}
-          >
-            {editing?'Done':'Edit'}
           </button>
         </div>
       </div>
@@ -1329,46 +1332,8 @@ function StaffManager({
         />
       }
 
-      <div className="person-card-grid">
-        {filtered.map((staff:any)=>
-          editing
-            ?(
-              <StaffEditor
-                key={staff.id}
-                staff={staff}
-                reload={reload}
-                notice={notice}
-              />
-            )
-            :(
-              <article
-                className={
-                  `person-card ${
-                    staff.active
-                      ?''
-                      :'inactive'
-                  }`
-                }
-                key={staff.id}
-              >
-                <div>
-                  <b>
-                    {staff.preferred_name||
-                     staff.first_name}{' '}
-                    {staff.last_name}
-                  </b>
-
-                  <small>
-                    {staff.employment_type}
-                    {' · '}
-                    {staff.active
-                      ?'Active'
-                      :'Inactive'}
-                  </small>
-                </div>
-              </article>
-            )
-        )}
+      <div className="person-list">
+        {filtered.map((staff:any)=><React.Fragment key={staff.id}><button className={`person-row ${staff.active?'':'inactive'}`} onClick={()=>{setSelected(selected?.id===staff.id?undefined:staff);setAdding(false)}}><span><b>{staff.preferred_name||staff.first_name} {staff.last_name}</b><small>{staff.employment_type}</small></span><small>{staff.active?'Active':'Inactive'} ›</small></button>{selected?.id===staff.id&&<StaffEditor staff={staff} reload={reload} notice={notice}/>}</React.Fragment>)}
       </div>
     </section>
   );
@@ -1766,6 +1731,7 @@ function Branding({
     data.centre.logo_url
   );
   const[busy,setBusy]=useState(false);
+  const[printSettings,setPrintSettings]=useState<{columns:number;sort:string;show_room:boolean}>(data.centre.emergency_print||{columns:3,sort:'room_then_name',show_room:true});
 
   const upload=async(file:File)=>{
     setBusy(true);
@@ -1854,6 +1820,14 @@ function Branding({
         <button>Save branding</button>
       </form>
 
+      <form onSubmit={event=>{event.preventDefault();void api('/admin/emergency-print-settings',{method:'PATCH',body:JSON.stringify(printSettings)}).then(saved);}}>
+        <h2>Emergency print</h2>
+        <label>Columns<select value={printSettings.columns} onChange={event=>setPrintSettings({...printSettings,columns:Number(event.target.value)})}><option value={2}>2</option><option value={3}>3</option></select></label>
+        <label>Sort<select value={printSettings.sort} onChange={event=>setPrintSettings({...printSettings,sort:event.target.value})}><option value="alphabetical">Alphabetical</option><option value="room_then_name">Room then name</option></select></label>
+        <label className="active-switch">Show room<input type="checkbox" role="switch" checked={printSettings.show_room} onChange={event=>setPrintSettings({...printSettings,show_room:event.target.checked})}/><span>{printSettings.show_room?'On':'Off'}</span></label>
+        <button>Save emergency print settings</button>
+      </form>
+
       <h2>Logo</h2>
 
       {logo&&
@@ -1906,6 +1880,10 @@ function Help({demo}:{demo:boolean}){
       'Pairing',
       'Create a labeled 90-second QR pairing under Devices, confirm its room, then enter the separate three-digit challenge on the tablet.'
     ],
+    ['Parent access and QR','Parents sign in separately with a Family login and PIN. The Parent QR only opens the sign-in page; a Family QR may safely prefill only its login identifier.'],
+    ['Management','Children, Families and Teachers use one selected editor at a time. Search families to link children by first, last, preferred name or room. Archive records with history; permanent Delete is only for unused items.'],
+    ['Attendance kiosk and late sign-in','The kiosk is device-only and requires signer name and signature. If care is selected for an absent child, confirm Mark present and continue; it records a late staff sign-in rather than inventing an arrival time.'],
+    ['Alerts','Toileting can record nappy and clothing alerts. Open alerts remain visible to the Classroom and Parent until a Teacher resolves them.'],
     [
       'Attendance and visits',
       'Arrive and depart from Attendance / Presence. Start and end visits from the destination room. Resolve any open sleep first.'
@@ -1949,7 +1927,9 @@ function Help({demo}:{demo:boolean}){
     [
       'Emergency Roll',
       'Uses only the last-confirmed attendance snapshot, grouped by physical room. Offline and stale states are prominent.'
-    ]
+    ],
+    ['Activity, Audit and Data Requests','Activity expands below the selected row. Corrections keep the original, reason and Audit trail. Parent requests for older records appear in Data Requests.'],
+    ['Example only — no record is saved','Sleep: Awake → Fell asleep → Woke & got up. Family: Search Mila → Add → Remove. Activity: Original → Correction → Audit history. These are local instructional examples and make no API request; this section can later host local looping media.']
   ];
 
   return(
