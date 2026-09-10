@@ -876,7 +876,12 @@ function RoomEditor({
 }
 
 
-function ChildrenManager({
+export const filterAdminChildren=(children:any[],search:string,roomFilter:string,statusFilter:string,presenceFilter:string)=>{
+  const query=search.trim().toLowerCase();
+  return children.filter((child:any)=>(!query||[child.first_name,child.last_name,child.preferred_name,child.enrolled_room,child.physical_room,child.dob].filter(Boolean).join(' ').toLowerCase().includes(query))&&(!roomFilter||child.room_id===roomFilter)&&(!statusFilter||(statusFilter==='active'?child.active!==false:child.active===false))&&(!presenceFilter||(presenceFilter==='present'?child.present===true:child.present!==true)));
+};
+
+export function ChildrenManager({
   data,
   reload,
   notice,
@@ -893,30 +898,13 @@ function ChildrenManager({
   const[search,setSearch]=useState('');
   const[roomFilter,setRoomFilter]=useState('');
   const[statusFilter,setStatusFilter]=useState('');
+  const[presenceFilter,setPresenceFilter]=useState('');
   const[selectedChildId,setSelectedChildId]=useState('');
   const selected=data.children.find((child:any)=>child.id===selectedChildId);
 
   const filtered=useMemo(()=>{
-    const query=search
-      .trim()
-      .toLowerCase();
-
-    return data.children.filter(
-      (child:any)=>
-        (!query||[
-          child.first_name,
-          child.last_name,
-          child.preferred_name,
-          child.enrolled_room,
-          child.physical_room,
-          child.dob
-        ]
-          .filter(Boolean)
-          .join(' ')
-          .toLowerCase()
-          .includes(query))&&(!roomFilter||child.room_id===roomFilter)&&(!statusFilter||(statusFilter==='active'?child.active!==false:child.active===false))
-    );
-  },[data.children,search,roomFilter,statusFilter]);
+    return filterAdminChildren(data.children,search,roomFilter,statusFilter,presenceFilter);
+  },[data.children,search,roomFilter,statusFilter,presenceFilter]);
 
   return(
     <section>
@@ -942,6 +930,7 @@ function ChildrenManager({
           />
           <select aria-label="Filter children by room" value={roomFilter} onChange={event=>setRoomFilter(event.target.value)}><option value="">All rooms</option>{data.rooms.map((room:any)=><option key={room.id} value={room.id}>{room.name}</option>)}</select>
           <select aria-label="Filter children by status" value={statusFilter} onChange={event=>setStatusFilter(event.target.value)}><option value="">All status</option><option value="active">Active</option><option value="archived">Archived</option></select>
+          <select aria-label="Filter children by presence" value={presenceFilter} onChange={event=>setPresenceFilter(event.target.value)}><option value="">All presence</option><option value="present">Present</option><option value="absent">Absent</option></select>
 
           <button
             onClick={()=>setAdding(true)}

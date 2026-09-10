@@ -6,6 +6,7 @@ import{
 }from'../presence';
 import type{Child,Room}from'./types';
 import{ConfirmDialog}from'../admin/ConfirmDialog';
+import{ChildRosterIdentity}from'./ChildRosterIdentity';
 
 export const selectAllPhysical=(
   children:Child[],
@@ -128,18 +129,7 @@ export function ChildSelector({
                   aria-disabled={filter&&!filter(c)}
                   onClick={()=>toggle(c)}
                 >
-                  <b>
-                    {c.first_name[0]}
-                    {c.last_name?.[0]||''}
-                  </b>
-
-                  <span>
-                    {c.first_name} {c.last_name}
-                    <small>
-                      {stateLabel?.(c)||physicalRoomStatus(c,roomId,names)}
-                    </small>
-                    {filter&&!filter(c)&&<small className="eligibility-reason">{eligibilityLabel?.(c)||'Unavailable for this action'}</small>}
-                  </span>
+                  <ChildRosterIdentity child={c} state={stateLabel?.(c)||physicalRoomStatus(c,roomId,names)} detail={filter&&!filter(c)?eligibilityLabel?.(c)||'Unavailable for this action':undefined}/>
                 </button>
               ))}
             </div>

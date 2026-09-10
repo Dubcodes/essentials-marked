@@ -133,7 +133,7 @@ describe('0.1.5 completion UI',()=>{
     vi.stubGlobal('fetch',vi.fn(async()=>new Response(JSON.stringify([]),{status:200,headers:{'Content-Type':'application/json'}})));
     const props:any={data:{},roomId:'a',staffId:'s',close:()=>{},refresh:async()=>{},notice:()=>{}};
     await act(async()=>{root.render(<ParentNotes {...props}/>);await Promise.resolve()});
-    await act(async()=>{([...(host.querySelectorAll('button'))].find(button=>button.textContent==='Help')as HTMLButtonElement).click()});
+    await act(async()=>{(host.querySelector('[aria-label="Help"]')as HTMLButtonElement).click()});
     expect(host.querySelector('[aria-label="Parent notes help"]')).not.toBeNull();expect(host.textContent).toContain('mark them read');
   });
 });
