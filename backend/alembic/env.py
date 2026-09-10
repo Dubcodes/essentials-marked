@@ -3,7 +3,7 @@ from sqlalchemy import engine_from_config, pool
 from app.db import Base, database_url
 from app import models  # noqa
 config = context.config
-config.set_main_option('sqlalchemy.url', database_url())
+config.set_main_option('sqlalchemy.url', database_url().replace('%', '%%'))
 target_metadata = Base.metadata
 def run_migrations_offline():
     context.configure(url=database_url(), target_metadata=target_metadata, literal_binds=True)

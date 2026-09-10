@@ -23,6 +23,7 @@ export default function AdminConsole(){
   const[pairState,setPairState]=useState('');
   const[seconds,setSeconds]=useState(0);
   const[label,setLabel]=useState('Classroom tablet');
+  const[deviceMode,setDeviceMode]=useState<'classroom'|'attendance'>('classroom');
   const[room,setRoom]=useState('');
   const[message,setMessage]=useState('');
 
@@ -203,7 +204,7 @@ export default function AdminConsole(){
           }
 
           {page==='Dashboard'&&
-            <>
+            <div className="dashboard-grid">
               <section className="dashboard-section"><h2>Overview</h2><div className="cards">
                 <Card
                   value={present.length}
@@ -261,8 +262,9 @@ export default function AdminConsole(){
               </div></section>
 
               <section className="dashboard-section"><h2>Quick actions</h2><div className="inline-actions"><button onClick={()=>openClassroom(data.rooms[0]?.id)}>Open Classroom</button><button onClick={()=>setPage('Children')}>Children</button><button onClick={()=>setPage('Activity log')}>Activity log</button>{isAdmin&&<button onClick={()=>setPrinting(true)}>Print emergency roll</button>}{isAdmin&&<button onClick={()=>setPage('Devices')}>Pair new tablet</button>}</div></section>
-              <DashboardActivity notice={notice} openAll={()=>setPage('Activity log')} openRecord={item=>{setActivityRecord(item);setPage('Activity log')}}/>
-            </>
+              <section className="dashboard-section dashboard-status"><h2>Operational status</h2><p><b>{liveState}</b> live reconciliation</p><p>{data.devices.filter((x:any)=>!x.revoked).length} active devices</p></section>
+              <div className="dashboard-activity"><DashboardActivity notice={notice} openAll={()=>setPage('Activity log')} openRecord={item=>{setActivityRecord(item);setPage('Activity log')}}/></div>
+            </div>
           }
 
           {page==='Rooms'&&
@@ -296,6 +298,11 @@ export default function AdminConsole(){
           {page==='Devices'&&
             <>
               <div className="pair">
+                <label>
+                  Device use
+                  <select value={deviceMode} onChange={event=>{const mode=event.target.value as 'classroom'|'attendance';setDeviceMode(mode);setLabel(mode==='attendance'?'Sign-in tablet':'Classroom tablet')}}><option value="classroom">Classroom tablet</option><option value="attendance">Sign-in tablet</option></select>
+                </label>
+
                 <label>
                   Device label
                   <input
@@ -334,7 +341,8 @@ export default function AdminConsole(){
                         method:'POST',
                         body:JSON.stringify({
                           room_id:room,
-                          label:label.trim()
+                          label:label.trim(),
+                          mode:deviceMode
                         })
                       }
                     )
@@ -419,7 +427,7 @@ export default function AdminConsole(){
                   <span>
                     <b>{device.label}</b>
                     <small>
-                        {device.default_room||'No default room'} · active · {device.last_active_at?new Date(device.last_active_at).toLocaleString():'Never active'}
+                        {device.mode==='attendance'?'Sign-in tablet':'Classroom tablet'} · {device.default_room||'No default room'}{device.mode==='attendance'?' · Sign-in only':''} · active · {device.last_active_at?new Date(device.last_active_at).toLocaleString():'Never active'}
                     </small>
                   </span>
 
@@ -883,6 +891,8 @@ function ChildrenManager({
 }){
   const[adding,setAdding]=useState(false);
   const[search,setSearch]=useState('');
+  const[roomFilter,setRoomFilter]=useState('');
+  const[statusFilter,setStatusFilter]=useState('');
   const[selectedChildId,setSelectedChildId]=useState('');
   const selected=data.children.find((child:any)=>child.id===selectedChildId);
 
@@ -891,11 +901,9 @@ function ChildrenManager({
       .trim()
       .toLowerCase();
 
-    if(!query)return data.children;
-
     return data.children.filter(
       (child:any)=>
-        [
+        (!query||[
           child.first_name,
           child.last_name,
           child.preferred_name,
@@ -906,9 +914,9 @@ function ChildrenManager({
           .filter(Boolean)
           .join(' ')
           .toLowerCase()
-          .includes(query)
+          .includes(query))&&(!roomFilter||child.room_id===roomFilter)&&(!statusFilter||(statusFilter==='active'?child.active!==false:child.active===false))
     );
-  },[data.children,search]);
+  },[data.children,search,roomFilter,statusFilter]);
 
   return(
     <section>
@@ -932,6 +940,8 @@ function ChildrenManager({
               setSearch(e.target.value)
             }
           />
+          <select aria-label="Filter children by room" value={roomFilter} onChange={event=>setRoomFilter(event.target.value)}><option value="">All rooms</option>{data.rooms.map((room:any)=><option key={room.id} value={room.id}>{room.name}</option>)}</select>
+          <select aria-label="Filter children by status" value={statusFilter} onChange={event=>setStatusFilter(event.target.value)}><option value="">All status</option><option value="active">Active</option><option value="archived">Archived</option></select>
 
           <button
             onClick={()=>setAdding(true)}
@@ -1731,6 +1741,7 @@ function Branding({
     data.centre.logo_url
   );
   const[busy,setBusy]=useState(false);
+  const[confirmBranding,setConfirmBranding]=useState(false);
   const[printSettings,setPrintSettings]=useState<{columns:number;sort:string;show_room:boolean}>(data.centre.emergency_print||{columns:3,sort:'room_then_name',show_room:true});
 
   const upload=async(file:File)=>{
@@ -1774,17 +1785,7 @@ function Branding({
         onSubmit={e=>{
           e.preventDefault();
 
-          void api(
-            '/admin/branding',
-            {
-              method:'PATCH',
-              body:JSON.stringify({
-                display_name,
-                secondary_text,
-                timezone
-              })
-            }
-          ).then(saved);
+          setConfirmBranding(true);
         }}
       >
         <label>
@@ -1819,6 +1820,7 @@ function Branding({
 
         <button>Save branding</button>
       </form>
+      <ConfirmDialog open={confirmBranding} title="Apply branding changes?" message="Apply these branding changes to the centre?" confirmLabel="Apply branding" onCancel={()=>setConfirmBranding(false)} onConfirm={()=>{setConfirmBranding(false);void api('/admin/branding',{method:'PATCH',body:JSON.stringify({display_name,secondary_text,timezone})}).then(saved);}}/>
 
       <form onSubmit={event=>{event.preventDefault();void api('/admin/emergency-print-settings',{method:'PATCH',body:JSON.stringify(printSettings)}).then(saved);}}>
         <h2>Emergency print</h2>

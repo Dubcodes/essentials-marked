@@ -10,16 +10,20 @@ from fastapi.testclient import TestClient
 import app.main as main_module
 from app.main import app, pwd, enforce_failure_limit, record_auth_failure, verify_staff_pin
 from app.db import Base, engine, SessionLocal
-from app.models import Centre, Account, Room, Staff, Child, Parent, ParentChild, Attendance, RoomVisit, Audit, Event, ChildAlert, MedicationAuthority, MedicationAdministration, MedicationReceipt, Signature, SleepSession, SleepCheck, Incident, IncidentAction, IncidentBodyArea, LoginAttempt, AppSession, now
+from app.models import Centre, Account, Room, Staff, Child, Parent, ParentChild, Attendance, RoomVisit, Audit, Event, ChildAlert, MedicationAuthority, MedicationAdministration, MedicationReceipt, Signature, SleepSession, SleepCheck, Incident, IncidentAction, IncidentBodyArea, LoginAttempt, AppSession, Device, ParentRelationshipOption, now
 
 def setup():
     Base.metadata.drop_all(engine);Base.metadata.create_all(engine);db=SessionLocal()
     centre=Centre(name='A');other=Centre(name='B');db.add_all([centre,other]);db.flush()
-    account=Account(centre_id=centre.id,email='a@test',password_hash=pwd.hash('secret'));room=Room(centre_id=centre.id,name='R');other_room=Room(centre_id=other.id,name='Other');staff=Staff(centre_id=centre.id,first_name='S',last_name='T',pin_hash=pwd.hash('1234'));children=[Child(centre_id=centre.id,room_id=room.id,first_name='Child'),Child(centre_id=centre.id,room_id=room.id,first_name='Two')];parent=Parent(centre_id=centre.id,name='P',login='p',pin_hash=pwd.hash('123456'))
+    account=Account(centre_id=centre.id,login_id='a@test',email='a@test',password_hash=pwd.hash('secret'));room=Room(centre_id=centre.id,name='R');other_room=Room(centre_id=other.id,name='Other');staff=Staff(centre_id=centre.id,first_name='S',last_name='T',pin_hash=pwd.hash('1234'));children=[Child(centre_id=centre.id,room_id=room.id,first_name='Child'),Child(centre_id=centre.id,room_id=room.id,first_name='Two')];parent=Parent(centre_id=centre.id,name='P',login='p',pin_hash=pwd.hash('123456'))
     db.add_all([account,room,other_room,staff,*children,parent]);db.flush();db.add(ParentChild(parent_id=parent.id,child_id=children[0].id));db.commit();return db,centre,account,room,other_room,staff,children,parent
 def paired(client,room):
     assert client.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
     pair=client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Tablet'}).json()
+    assert client.post('/api/device/pair',json={'token':pair['token'],'challenge':pair['challenge']}).status_code==200
+def paired_attendance(client,room):
+    assert client.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+    pair=client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Attendance tablet','mode':'attendance'}).json()
     assert client.post('/api/device/pair',json={'token':pair['token'],'challenge':pair['challenge']}).status_code==200
 def test_parent_isolation_and_staff_notes_hidden():
     db,centre,account,room,other_room,staff,children,parent=setup()
@@ -346,7 +350,7 @@ def test_account_password_sessions_cross_centre_and_restricted_audit_scope():
         office=admin_client.post('/api/admin/accounts',json={'email':'office@test','password':'office-pass','role':'administration','active':True}).json()
         teacher=admin_client.post('/api/admin/accounts',json={'email':'teacher@test','password':'teacher-pass','role':'teacher','active':True}).json()
 
-        other_account=Account(centre_id=other_room.centre_id,email='other@test',password_hash=pwd.hash('other-pass'),role='admin')
+        other_account=Account(centre_id=other_room.centre_id,login_id='other@test',email='other@test',password_hash=pwd.hash('other-pass'),role='admin')
         db.add(other_account);db.commit()
 
         assert admin_client.post('/api/admin/accounts',json={'email':'too-long@test','password':'x'*73,'role':'teacher'}).status_code==422
@@ -374,10 +378,39 @@ def test_account_password_sessions_cross_centre_and_restricted_audit_scope():
         assert all((item['entity'],item['action']) in {('attendance','arrive'),('attendance','depart'),('attendance','visit'),('attendance','end_visit'),('incident','draft_discarded')} for item in office_audit)
     finally:db.close()
 
+def test_unused_non_email_account_delete_confirms_login_id_and_audits_identity():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        admin=TestClient(app)
+        assert admin.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+        office=admin.post('/api/admin/accounts',json={'email':'office','password':'office-pass','role':'administration','active':True}).json()
+        assert office['login_id']=='office' and office['email'] is None
+
+        office_client=TestClient(app)
+        assert office_client.post('/api/auth/admin/login',json={'email':'office','password':'office-pass'}).status_code==200
+        assert db.scalar(select(AppSession).where(AppSession.subject_id==office['id'])) is not None
+
+        wrong=admin.post(f"/api/admin/accounts/{office['id']}/delete",json={'admin_password':'secret','confirm':'office@example.test'})
+        assert wrong.status_code==422
+        assert db.get(Account,office['id']) is not None
+
+        deleted=admin.post(f"/api/admin/accounts/{office['id']}/delete",json={'admin_password':'secret','confirm':'office'})
+        assert deleted.status_code==200 and deleted.json()['sessions_revoked']>=1
+        db.expire_all()
+        assert db.get(Account,office['id']) is None
+        assert db.scalar(select(AppSession).where(AppSession.subject_id==office['id'])) is None
+        deletion=db.scalar(select(Audit).where(Audit.entity=='account',Audit.entity_id==office['id'],Audit.action=='deleted'))
+        assert deletion is not None
+        assert deletion.before=={'login_id':'office','email':None,'sessions_revoked':deleted.json()['sessions_revoked']}
+
+        self_delete=admin.post(f'/api/admin/accounts/{account.id}/delete',json={'admin_password':'secret','confirm':'a@test'})
+        assert self_delete.status_code==409
+    finally:db.close()
+
 def test_account_logout_preserves_paired_device_and_login_fails_closed():
     db,centre,account,room,other_room,staff,children,parent=setup()
     try:
-        legacy=Account(centre_id=centre.id,email='legacy@test',password_hash=pwd.hash('legacy-pass'),role='legacy')
+        legacy=Account(centre_id=centre.id,login_id='legacy@test',email='legacy@test',password_hash=pwd.hash('legacy-pass'),role='legacy')
         db.add(legacy);db.commit()
         client=TestClient(app)
         assert client.post('/api/auth/admin/login',json={'email':'a@test','password':'x'*73}).status_code==401
@@ -728,7 +761,7 @@ def test_wake_and_got_up_is_one_idempotent_sleep_operation():
 def test_device_attendance_kiosk_records_signer_and_signature_without_care_access():
     db,centre,account,room,other_room,staff,children,parent=setup()
     try:
-        client=TestClient(app);paired(client,room)
+        client=TestClient(app);paired_attendance(client,room)
         payload={'child_id':children[0].id,'room_id':room.id,'signer_name':'Demo Parent','relationship':'parent','signature_data':'data:image/png;base64,signature-evidence-014'}
         assert client.post('/api/attendance/kiosk',json={**payload,'action':'sign_in'}).status_code==200
         attendance=db.scalar(select(Attendance).where(Attendance.child_id==children[0].id));assert attendance.source=='parent_kiosk' and attendance.signer_name=='Demo Parent'
@@ -865,3 +898,98 @@ def test_late_sign_in_is_explicit_and_idempotent():
         attendance=db.query(Attendance).one();assert attendance.late_sign_in and attendance.source=='staff_late_sign_in' and attendance.circumstance=='Entered by staff after care workflow'
         assert db.query(Attendance).count()==1 and db.query(Audit).filter(Audit.action=='late_sign_in').count()==1
     finally: db.close()
+
+def test_attendance_device_capability_minimal_bootstrap_and_cross_room_sign_in():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        enrolled_elsewhere=Room(centre_id=centre.id,name='Elsewhere');db.add(enrolled_elsewhere);db.flush();children[0].room_id=enrolled_elsewhere.id;db.commit()
+        classroom_client=TestClient(app);paired(classroom_client,room)
+        kiosk_payload={'child_id':children[0].id,'room_id':room.id,'action':'sign_in','relationship':'Mother','signature_data':'data:image/png;base64,attendance-signature'}
+        assert classroom_client.get(f'/api/attendance/relationships/{children[0].id}').status_code==403
+        assert classroom_client.post('/api/attendance/kiosk',json=kiosk_payload).status_code==403
+        client=TestClient(app);assert client.post('/api/auth/admin/login',json={'email':'a@test','password':'secret'}).status_code==200
+        pairing=client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Sign-in tablet','mode':'attendance'}).json();paired_result=client.post('/api/device/pair',json={'token':pairing['token'],'challenge':pairing['challenge']})
+        assert paired_result.status_code==200 and paired_result.json()['mode']=='attendance'
+        boot=client.get('/api/attendance/bootstrap');assert boot.status_code==200
+        wire=boot.json();assert set(wire)=={'device_id','default_room_id','centre','assigned_room','children'}
+        assert not ({'staff','notes','medications','incidents','alerts','accounts'}&set(wire))
+        assert {item['id'] for item in wire['children']}=={c.id for c in children};expected_room=next(item['room_id'] for item in wire['children'] if item['id']==children[0].id);assert expected_room==enrolled_elsewhere.id
+        assert client.get('/api/classroom/bootstrap').status_code==403
+        assert client.post('/api/classroom/events',json={}).status_code==403
+        assert client.post('/api/classroom/sleep',json={}).status_code==403
+        assert client.get('/api/classroom/medications').status_code==403
+        assert client.post('/api/classroom/incidents',json={}).status_code==403
+        payload=kiosk_payload
+        signed=client.post('/api/attendance/kiosk',json=payload);assert signed.status_code==200
+        db.expire_all();attendance=db.scalar(select(Attendance).where(Attendance.child_id==children[0].id));assert attendance.room_id==expected_room and attendance.signer_name is None
+        assert client.post('/api/attendance/kiosk',json={**payload,'child_id':'cross-centre-child'}).status_code==404
+        db.expire_all();assert db.scalar(select(Device).where(Device.mode=='attendance')) is not None
+    finally:db.close()
+
+def test_family_relationship_soft_deactivation_and_signature_authorization():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        parent_client=TestClient(app);assert parent_client.post('/api/auth/parent/login',json={'login':'p','pin':'123456'}).status_code==200
+        defaults=parent_client.get('/api/parent/relationships').json();mother=next(x for x in defaults if x['label']=='Mother');assert {x['label'] for x in defaults}=={'Mother','Father','Caregiver','Other'}
+        assert parent_client.patch(f"/api/parent/relationships/{mother['id']}",json={'active':False}).status_code==200
+        device_client=TestClient(app);paired_attendance(device_client,room)
+        assert 'Mother' not in device_client.get(f'/api/attendance/relationships/{children[0].id}').json()
+        assert parent_client.patch(f"/api/parent/relationships/{mother['id']}",json={'active':True}).status_code==200
+        assert 'Mother' in device_client.get(f'/api/attendance/relationships/{children[0].id}').json()
+        common={'child_id':children[0].id,'room_id':room.id}
+        signed_in=device_client.post('/api/attendance/kiosk',json={**common,'action':'sign_in','signer_name':'Drop Off Adult','relationship':'Mother','signature_data':'data:image/png;base64,sign-in-evidence'});assert signed_in.status_code==200
+        signed_out=device_client.post('/api/attendance/kiosk',json={**common,'action':'sign_out','signer_name':'Pick Up Adult','relationship':'Father','signature_data':'data:image/png;base64,sign-out-evidence'});assert signed_out.status_code==200
+        db.expire_all();attendance=db.scalar(select(Attendance).where(Attendance.child_id==children[0].id));assert attendance.source=='parent_kiosk' and attendance.signer_name=='Drop Off Adult' and attendance.signer_relationship=='Mother'
+        db.add(Signature(centre_id=other_room.centre_id,signer_name='Wrong centre',relationship='Other',domain_type='attendance',domain_id=attendance.id,revision=1,purpose='kiosk_sign_in',signature_data='wrong-centre',signed_at=now()+timedelta(minutes=1)));db.commit()
+        sign_in=parent_client.get(f'/api/parent/attendance/{attendance.id}/signature?purpose=kiosk_sign_in');sign_out=parent_client.get(f'/api/parent/attendance/{attendance.id}/signature?purpose=kiosk_sign_out')
+        assert sign_in.status_code==200 and sign_in.json()['signature_data'].endswith('sign-in-evidence') and sign_in.json()['relationship']=='Mother'
+        assert sign_out.status_code==200 and sign_out.json()['signature_data'].endswith('sign-out-evidence') and sign_out.json()['relationship']=='Father'
+        day=parent_client.get(f'/api/parent/children/{children[0].id}/day').json()['attendance'][0]
+        assert day['sign_in_relationship']=='Mother' and day['sign_out_relationship']=='Father' and day['sign_in_signature_available'] and day['sign_out_signature_available']
+        assert parent_client.patch(f"/api/parent/relationships/{mother['id']}",json={'active':False}).status_code==200
+        db.refresh(attendance);assert attendance.signer_relationship=='Mother'
+        stranger=Parent(centre_id=centre.id,name='Other family',login='other-family',pin_hash=pwd.hash('654321'));db.add(stranger);db.commit();other_client=TestClient(app);assert other_client.post('/api/auth/parent/login',json={'login':'other-family','pin':'654321'}).status_code==200
+        assert other_client.get(f'/api/parent/attendance/{attendance.id}/signature?purpose=kiosk_sign_in').status_code==404
+    finally:db.close()
+
+def test_sleep_prepare_and_active_room_move_preserve_lifecycle():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        destination=Room(centre_id=centre.id,name='Sleep room');db.add(destination);db.commit();client=TestClient(app);paired(client,room);child=children[0]
+        assert client.post('/api/classroom/presence',json={'child_id':child.id,'room_id':room.id,'action':'arrive','staff_id':staff.id}).status_code==200
+        attendance=db.scalar(select(Attendance).where(Attendance.child_id==child.id));attendance_id=attendance.id
+        prepare={'client_id':'sleep-prepare-test-001','child_id':child.id,'room_id':destination.id,'staff_id':staff.id}
+        assert client.post('/api/classroom/sleep/prepare',json=prepare).status_code==200
+        assert client.post('/api/classroom/sleep/prepare',json=prepare).json()['idempotent']
+        db.refresh(attendance);assert attendance.id==attendance_id and attendance.visit_room_id==destination.id
+        base={'child_ids':[child.id],'room_id':destination.id,'staff_id':staff.id}
+        assert client.post('/api/classroom/sleep',json={**base,'client_id':'sleep-put-test-001','action':'put_down'}).status_code==200
+        assert client.post('/api/classroom/sleep',json={**base,'client_id':'sleep-asleep-test-01','action':'fell_asleep'}).status_code==200
+        session=db.scalar(select(SleepSession).where(SleepSession.child_id==child.id));snapshot=(session.id,session.put_down_at,session.fell_asleep_at,session.woke_at,session.got_up_at)
+        move={'client_id':'sleep-move-test-0001','child_id':child.id,'room_id':room.id,'staff_id':staff.id}
+        assert client.post('/api/classroom/sleep/move',json=move).status_code==200
+        assert client.post('/api/classroom/sleep/move',json=move).json()['idempotent']
+        db.refresh(session);assert (session.id,session.put_down_at,session.fell_asleep_at,session.woke_at,session.got_up_at)==snapshot and session.room_id==room.id
+        assert db.query(SleepSession).filter_by(child_id=child.id).count()==1 and db.query(Audit).filter_by(entity='sleep_session',action='moved_room').count()==1
+    finally:db.close()
+
+def test_sleep_placement_uses_physical_room_without_self_visits_or_retry_duplicates():
+    db,centre,account,room,other_room,staff,children,parent=setup()
+    try:
+        sleep_room=Room(centre_id=centre.id,name='Sleep room');elsewhere_child=Child(centre_id=centre.id,room_id=room.id,first_name='Elsewhere');db.add_all([sleep_room,elsewhere_child]);db.commit()
+        client=TestClient(app);paired(client,room)
+        assert client.post('/api/classroom/presence',json={'child_id':children[0].id,'room_id':room.id,'action':'arrive','staff_id':staff.id}).status_code==200
+        own={'client_id':'sleep-own-room-001','child_ids':[children[0].id],'room_id':room.id,'staff_id':staff.id,'action':'put_down'}
+        assert client.post('/api/classroom/sleep',json=own).status_code==200
+        assert db.query(RoomVisit).filter_by(child_id=children[0].id).count()==0
+        absent={'client_id':'sleep-absent-room-001','child_ids':[children[1].id],'room_id':room.id,'staff_id':staff.id,'action':'put_down'}
+        assert client.post('/api/classroom/sleep',json=absent).status_code==200
+        absent_attendance=db.scalar(select(Attendance).where(Attendance.child_id==children[1].id));assert absent_attendance.room_id==room.id and absent_attendance.late_sign_in
+        assert db.query(RoomVisit).filter_by(child_id=children[1].id).count()==0
+        assert client.post('/api/classroom/presence',json={'child_id':elsewhere_child.id,'room_id':room.id,'action':'arrive','staff_id':staff.id}).status_code==200
+        moved={'client_id':'sleep-real-visit-001','child_ids':[elsewhere_child.id],'room_id':sleep_room.id,'staff_id':staff.id,'action':'put_down'}
+        assert client.post('/api/classroom/sleep',json=moved).status_code==200
+        assert client.post('/api/classroom/sleep',json=moved).json()['idempotent']
+        visits=db.query(RoomVisit).filter_by(child_id=elsewhere_child.id).all();assert len(visits)==1 and visits[0].room_id==sleep_room.id
+        moved_attendance=db.scalar(select(Attendance).where(Attendance.child_id==elsewhere_child.id));assert moved_attendance.visit_room_id==sleep_room.id and moved_attendance.visit_ended_at is None
+    finally:db.close()

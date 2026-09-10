@@ -13,6 +13,7 @@ type Attendance={
   arrived_at?:string|null;
   departed_at?:string|null;
   room?:string|null;
+  source?:string|null;late_sign_in?:boolean;staff?:string|null;relationship?:string|null;signature_available?:boolean;sign_in_relationship?:string|null;sign_out_relationship?:string|null;sign_in_signature_available?:boolean;sign_out_signature_available?:boolean;
 };
 
 type Sleep={
@@ -349,19 +350,33 @@ function CareRow({event}:{event:CareEvent}){
   );
 }
 
+export const attendancePresentation=(type:'Drop off'|'Pick up',value:Attendance)=>{
+  const signIn=type==='Drop off';
+  return{
+    source:signIn
+      ?value.late_sign_in?'Teacher late sign-in':value.source==='parent_kiosk'?'Parent sign-in':value.source==='classroom'?'Teacher sign-in':value.source?.replaceAll('_',' ')||''
+      :value.sign_out_signature_available?'Parent sign-out':'',
+    relationship:signIn?(value.sign_in_relationship??value.relationship):value.sign_out_relationship,
+    staff:signIn?value.staff:null,
+    signatureAvailable:signIn?(value.sign_in_signature_available??value.signature_available):value.sign_out_signature_available,
+    purpose:signIn?'kiosk_sign_in' as const:'kiosk_sign_out' as const
+  };
+};
+
 function AttendanceRow({
   type,
-  value
+  value,onSignature
 }:{
   type:'Drop off'|'Pick up';
-  value?:string|null;
+  value?:Attendance|null;onSignature:(id:string,purpose:'kiosk_sign_in'|'kiosk_sign_out')=>void;
 }){
-  if(!value)return null;
+  const at=type==='Drop off'?value?.arrived_at:value?.departed_at;if(!value||!at)return null;
+  const{source,relationship,staff,signatureAvailable,purpose}=attendancePresentation(type,value);
 
   return(
     <div className="attendance-row">
       <b>{type}</b>
-      <time>{time(value)}</time>
+      <time>{time(at)}</time><small>{[value.room,relationship,staff?`Entered by ${staff}`:null,source].filter(Boolean).join(' · ')}</small>{signatureAvailable&&<button className="minor" onClick={()=>onSignature(value.id,purpose)}>View signature</button>}
     </div>
   );
 }
@@ -380,6 +395,10 @@ export default function ParentView(){
   const[error,setError]=useState('');
   const[errorStatus,setErrorStatus]=useState<number>();
   const[requestState,setRequestState]=useState<'idle'|'sending'|'sent'>('idle');
+  const[signature,setSignature]=useState<string>();
+  const[relationships,setRelationships]=useState<any[]>([]);
+  const[newRelationship,setNewRelationship]=useState('');
+  const loadRelationships=()=>api('/parent/relationships').then(setRelationships).catch(()=>undefined);
 
   const reconcile=async()=>{
     const me=await api('/parent/me');
@@ -422,6 +441,7 @@ export default function ParentView(){
       })
       .catch(()=>setLogin(true));
   },[]);
+  useEffect(()=>{void loadRelationships()},[]);
 
   useEffect(()=>{
     if(!child)return;
@@ -460,17 +480,10 @@ export default function ParentView(){
     [record]
   );
 
-  const dropOff=
-    record?.attendance
-      ?.map(x=>x.arrived_at)
-      .filter(Boolean)
-      .sort()[0];
+  const dropOff=record?.attendance?.filter(x=>x.arrived_at).sort((a,b)=>String(a.arrived_at).localeCompare(String(b.arrived_at)))[0];
 
   const pickupValues=
-    record?.attendance
-      ?.map(x=>x.departed_at)
-      .filter(Boolean)
-      .sort()||[];
+    record?.attendance?.filter(x=>x.departed_at).sort((a,b)=>String(a.departed_at).localeCompare(String(b.departed_at)))||[];
 
   const pickUp=
     pickupValues.length
@@ -619,10 +632,11 @@ export default function ParentView(){
       }
 
       {record&&
-        <><section className="parent-alerts" aria-label="Current child alerts">{record.alerts?.map(alert=><p key={alert.id}><b>{alert.label}</b> — please speak with your teachers if you need more detail.</p>)}</section><section className="parent-story">
+        <>{record.alerts&&record.alerts.length>0&&<section className="parent-alerts" aria-label="Current child alerts">{record.alerts.map(alert=><p key={alert.id}><b>{alert.label}</b> — please speak with your teachers if you need more detail.</p>)}</section>}<section className="parent-story">
           <AttendanceRow
             type="Drop off"
             value={dropOff}
+            onSignature={(id,purpose)=>void api(`/parent/attendance/${id}/signature?purpose=${purpose}`).then((x:any)=>setSignature(x.signature_data))}
           />
 
           <div className="story-divider"/>
@@ -655,6 +669,7 @@ export default function ParentView(){
             <AttendanceRow
               type="Pick up"
               value={pickUp}
+              onSignature={(id,purpose)=>void api(`/parent/attendance/${id}/signature?purpose=${purpose}`).then((x:any)=>setSignature(x.signature_data))}
             />
             :
             dropOff&&
@@ -665,6 +680,14 @@ export default function ParentView(){
           }
         </section></>
       }
+
+      <section className="parent-relationships">
+        <h2>Sign-in relationships</h2>
+        <p>These are available for future kiosk sign-ins. Removing one keeps past attendance unchanged.</p>
+        <div className="person-list">{relationships.map(option=><div className="person-row" key={option.id}><span><b>{option.label}</b><small>{option.active?'Active':'Inactive'}</small></span><button className="minor" onClick={()=>{if(window.confirm(`${option.active?'Remove':'Restore'} ${option.label} ${option.active?'from future sign-in choices?':'for future sign-in choices?'}`))void api(`/parent/relationships/${option.id}`,{method:'PATCH',body:JSON.stringify({active:!option.active})}).then(loadRelationships)}}>{option.active?'Remove':'Restore'}</button></div>)}</div>
+        <div className="inline"><input aria-label="Add sign-in relationship" value={newRelationship} onChange={event=>setNewRelationship(event.target.value)} placeholder="Add relationship"/><button disabled={!newRelationship.trim()} onClick={()=>void api('/parent/relationships',{method:'POST',body:JSON.stringify({label:newRelationship.trim()})}).then(()=>{setNewRelationship('');return loadRelationships()})}>+ Add relationship</button></div>
+      </section>
+      {signature&&<div className="workflow-workspace" role="dialog" aria-modal="true"><section className="workflow-panel workflow-single"><header className="workflow-header"><h2>Signature</h2><button className="close" onClick={()=>setSignature(undefined)}>×</button></header><div className="workflow-details"><img className="signature-view" src={signature} alt="Parent sign-in signature"/></div></section></div>}
 
       <div className="parent-actions">
         <a

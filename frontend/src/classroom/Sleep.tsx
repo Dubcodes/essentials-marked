@@ -106,14 +106,14 @@ export function SleepWorkflow({
     if(!child.present&&(action==='put_down'||action==='fell_asleep'))return true;
 
     if(action==='put_down'){
-      return isPhysicallyInRoom(child,props.roomId)&&!s;
+      return !s;
     }
 
     if(!s||!sameRoom){
       // A tired, physically present child can fall asleep without an
       // intermediate settling action. The server creates that session
       // atomically, so this remains safe for an offline/retry-prone tablet.
-      return action==='fell_asleep' && !s && isPhysicallyInRoom(child,props.roomId);
+      return action==='fell_asleep' && !s;
     }
 
     if(s.stale){
@@ -154,15 +154,11 @@ export function SleepWorkflow({
     if(action==='put_down'){
       if(s)return `Already ${s.state.replace('_',' ')}`;
 
-      return isPhysicallyInRoom(child,props.roomId)
-        ?'Available'
-        :'Not physically in this room';
+      return child.present?'Present elsewhere — select to move here':'Absent — select to mark present';
     }
 
     if(!s){
-      return action==='fell_asleep'&&isPhysicallyInRoom(child,props.roomId)
-        ?'Available to record asleep immediately'
-        :'No active sleep session';
+      return action==='fell_asleep'?'Available to record asleep immediately':'No active sleep session';
     }
 
     return `Currently ${friendlyState(s.state)}`;
@@ -177,7 +173,7 @@ export function SleepWorkflow({
       }
 
       return child.present
-        ?'Present elsewhere'
+        ?'Present elsewhere · confirm move before saving'
         :'Absent';
     }
 
@@ -252,7 +248,13 @@ export function SleepWorkflow({
           roomId={props.roomId}
           selected={selected}
           setSelected={setSelected}
-          onAbsentConfirm={async child=>{await api('/classroom/late-sign-in',{method:'POST',body:JSON.stringify({client_id:operationId('late-sign-in'),child_id:child.id,room_id:props.roomId,staff_id:props.staffId})});props.notice(`${child.first_name} marked present — continue recording sleep`);await props.refresh()}}
+          onSelectionRequest={child=>{
+            if(check||!['put_down','fell_asleep'].includes(action))return;
+            const session:SleepSession|undefined=byChild[child.id],currentRoom=roomNames[props.roomId]||'this room';
+            if(session&&session.room_id!==props.roomId)return{title:'Move active sleep?',message:`${child.first_name} ${child.last_name} already has an active sleep in ${roomNames[session.room_id]||'another room'}.`,confirmLabel:`Move sleep to ${currentRoom}`,selectAfterConfirm:false,confirm:async()=>{await api('/classroom/sleep/move',{method:'POST',body:JSON.stringify({client_id:operationId('sleep-move'),child_id:child.id,room_id:props.roomId,staff_id:props.staffId})});await load();await props.refresh()}};
+            if(!child.present)return{title:'Child is not marked present',message:`${child.first_name} ${child.last_name} is not marked present. Mark ${child.first_name} present in ${currentRoom} and continue?`,confirmLabel:'Mark present and continue',confirm:async()=>{await api('/classroom/sleep/prepare',{method:'POST',body:JSON.stringify({client_id:operationId('sleep-prepare'),child_id:child.id,room_id:props.roomId,staff_id:props.staffId,effective_at:stableEffective(implicit,time)})});await props.refresh()}};
+            if(!isPhysicallyInRoom(child,props.roomId))return{title:'Move child for sleep?',message:`${child.first_name} ${child.last_name} is currently in ${roomNames[child.visiting_room_id||child.room_id]||'another room'}. Move ${child.first_name} to ${currentRoom} for sleep?`,confirmLabel:`Move to ${currentRoom} and continue`,confirm:async()=>{await api('/classroom/sleep/prepare',{method:'POST',body:JSON.stringify({client_id:operationId('sleep-prepare'),child_id:child.id,room_id:props.roomId,staff_id:props.staffId,effective_at:stableEffective(implicit,time)})});await props.refresh()}};
+          }}
           filter={eligible}
           eligibilityLabel={reason}
           stateLabel={state}
@@ -280,27 +282,7 @@ export function SleepWorkflow({
       }
     >
       {check
-        ?(
-          <div
-            className={`sleep-banner ${
-              sleeping.some(s=>s.status==='red')
-                ?'red'
-                :sleeping.some(s=>s.status==='amber')
-                  ?'amber'
-                  :'green'
-            }`}
-          >
-            <b>{sleeping.length} sleeping</b>
-            {' · '}
-            worst status {
-              sleeping.some(s=>s.status==='red')
-                ?'red'
-                :sleeping.some(s=>s.status==='amber')
-                  ?'amber'
-                  :'green'
-            }
-          </div>
-        )
+        ?(sleeping.length?<div className="sleep-banner"><b>{sleeping.length} sleeping</b></div>:<p>No children are currently marked asleep.</p>)
         :(
           <Choice
             label="Action"

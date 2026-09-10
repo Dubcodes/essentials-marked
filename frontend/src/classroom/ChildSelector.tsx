@@ -41,7 +41,9 @@ export function ChildSelector({
   stateLabel,
   recentVisitorIds=[],
   bulkLabel='Select all present in this room',
-  onAbsentConfirm
+  showBulkAction=true,
+  onAbsentConfirm,
+  onSelectionRequest
 }:{
   children:Child[];
   rooms:Room[];
@@ -53,11 +55,14 @@ export function ChildSelector({
   stateLabel?:(child:Child)=>string;
   recentVisitorIds?:string[];
   bulkLabel?:string;
+  showBulkAction?:boolean;
   onAbsentConfirm?:(child:Child)=>Promise<void>;
+  onSelectionRequest?:(child:Child)=>undefined|{title:string;message:string;confirmLabel:string;confirm:()=>Promise<void>;selectAfterConfirm?:boolean};
 }){
   const[q,setQ]=useState('');
   const[presentOnly,setPresentOnly]=useState(false);
   const[pendingAbsent,setPendingAbsent]=useState<Child>();
+  const[pendingSelection,setPendingSelection]=useState<{child:Child;title:string;message:string;confirmLabel:string;confirm:()=>Promise<void>;selectAfterConfirm?:boolean}>();
   const searchRef=useRef<HTMLInputElement>(null);
   useEffect(()=>{const focus=()=>searchRef.current?.focus();window.addEventListener('classroom-focus-search',focus);return()=>window.removeEventListener('classroom-focus-search',focus)},[]);
 
@@ -65,6 +70,7 @@ export function ChildSelector({
   const groups=useMemo(()=>groupedChildren(children,rooms,roomId,recentVisitorIds,q,presentOnly),[children,rooms,roomId,recentVisitorIds,q,presentOnly]);
 
   const toggle=(child:Child)=>{
+    if(!selected.includes(child.id)&&onSelectionRequest){const request=onSelectionRequest(child);if(request){setPendingSelection({child,...request});return;}}
     if(filter&&!filter(child))return;
     if(!child.present&&!selected.includes(child.id)&&onAbsentConfirm){setPendingAbsent(child);return;}
     setSelected(
@@ -87,7 +93,7 @@ export function ChildSelector({
 
         <button type="button" className={presentOnly?'active':'minor'} onClick={()=>setPresentOnly(value=>!value)}>Present</button>
 
-        <button
+        {showBulkAction&&<button
           type="button"
           className="minor"
           onClick={()=>
@@ -97,7 +103,7 @@ export function ChildSelector({
           }
         >
           {bulkLabel}
-        </button>
+        </button>}
 
         <button
           type="button"
@@ -141,6 +147,7 @@ export function ChildSelector({
         ) : null
       )}
       <ConfirmDialog open={Boolean(pendingAbsent)} title="Child is not marked present" message={`${pendingAbsent?.first_name||''} ${pendingAbsent?.last_name||''} is not marked present. Are they physically at the centre?`} confirmLabel="Mark present and continue" onCancel={()=>setPendingAbsent(undefined)} onConfirm={()=>{const child=pendingAbsent;setPendingAbsent(undefined);if(child)void onAbsentConfirm?.(child).then(()=>setSelected([...selected,child.id]));}}/>
+      <ConfirmDialog open={Boolean(pendingSelection)} title={pendingSelection?.title||''} message={pendingSelection?.message||''} confirmLabel={pendingSelection?.confirmLabel||'Continue'} onCancel={()=>setPendingSelection(undefined)} onConfirm={()=>{const pending=pendingSelection;setPendingSelection(undefined);if(pending)void pending.confirm().then(()=>{if(pending.selectAfterConfirm!==false)setSelected(selected.includes(pending.child.id)?selected:[...selected,pending.child.id])});}}/>
     </section>
   );
 }
