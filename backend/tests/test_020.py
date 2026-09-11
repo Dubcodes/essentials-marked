@@ -33,6 +33,9 @@ def login(client,identifier='admin'):
 def attendance_client(room):
     client=TestClient(app);login(client);pair=client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Harakeke Sign-in','mode':'attendance'}).json();assert client.post('/api/device/pair',json={'token':pair['token'],'challenge':pair['challenge']}).status_code==200;return client
 
+def require_attendance_evidence(db,attendance):
+    db.add(attendance);db.flush();db.add(Audit(centre_id=attendance.centre_id,entity='attendance',entity_id=attendance.id,action='arrive',after={'signature_evidence_required':True}));db.commit();return attendance
+
 def test_operational_settings_relationship_enforcement_and_minimal_bootstrap():
     db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
     try:
@@ -209,7 +212,7 @@ def test_missing_pickup_local_time_rejects_dst_gaps_and_requires_ambiguous_choic
 def test_teacher_arrival_requires_parent_sign_in_recovery_before_pickup_and_keeps_attribution():
     db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
     try:
-        arrived=now()-timedelta(hours=2);attendance=Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=arrived,recorded_by_staff_id=staff.id,source='classroom');db.add(attendance);db.commit()
+        arrived=now()-timedelta(hours=2);attendance=require_attendance_evidence(db,Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=arrived,recorded_by_staff_id=staff.id,source='classroom'))
         kiosk=attendance_client(room);boot=next(item for item in kiosk.get('/api/attendance/bootstrap').json()['children'] if item['id']==child.id);pending=boot['pending_attendance_confirmation']
         assert pending['phase']=='sign_in' and pending['recorded_by']=='Sarah T.' and pending['needs_departure_time'] is False
         normal={'child_id':child.id,'room_id':room.id,'action':'sign_out','relationship':'Caregiver','signature_data':'data:image/png;base64,normal-pickup'}
@@ -235,7 +238,7 @@ def test_normal_parent_sign_in_is_complete_without_recovery():
 def test_closed_teacher_attendance_recovers_both_phases_in_order_with_fresh_signatures():
     db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
     try:
-        arrived=now()-timedelta(hours=3);departed=now()-timedelta(hours=1);attendance=Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=arrived,departed_at=departed,recorded_by_staff_id=staff.id,source='classroom');db.add(attendance);db.commit();kiosk=attendance_client(room)
+        arrived=now()-timedelta(hours=3);departed=now()-timedelta(hours=1);attendance=require_attendance_evidence(db,Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=arrived,departed_at=departed,recorded_by_staff_id=staff.id,source='classroom'));kiosk=attendance_client(room)
         first=next(item for item in kiosk.get('/api/attendance/bootstrap').json()['children'] if item['id']==child.id)['pending_attendance_confirmation'];assert first['phase']=='sign_in'
         shared={'child_id':child.id,'attendance_id':attendance.id,'relationship':'Mother','signature_data':'data:image/png;base64,first-phase'}
         arrival=kiosk.post('/api/attendance/missing-signature',json={**shared,'phase':'sign_in'});assert arrival.status_code==200 and arrival.json()['next_confirmation']['phase']=='sign_out' and arrival.json()['next_confirmation']['needs_departure_time'] is False
@@ -269,4 +272,52 @@ def test_ancient_unsigned_completed_attendance_does_not_block_current_kiosk_use(
         db.add(Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=now()-timedelta(days=20,hours=2),departed_at=now()-timedelta(days=20,hours=1),recorded_by_staff_id=staff.id,source='classroom'));db.commit();kiosk=attendance_client(room)
         row=next(item for item in kiosk.get('/api/attendance/bootstrap').json()['children'] if item['id']==child.id);assert row['pending_attendance_confirmation'] is None
         assert kiosk.post('/api/attendance/kiosk',json={'child_id':child.id,'room_id':room.id,'action':'sign_in','relationship':'Mother','signature_data':'data:image/png;base64,today-arrival'}).status_code==200
+    finally:db.close()
+
+def test_governed_attendance_evidence_never_expires_and_is_oldest_first():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        old=require_attendance_evidence(db,Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=now()-timedelta(days=4,hours=2),departed_at=now()-timedelta(days=4,hours=1),recorded_by_staff_id=staff.id,source='classroom'))
+        newer=require_attendance_evidence(db,Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=now()-timedelta(days=2,hours=2),departed_at=now()-timedelta(days=2,hours=1),recorded_by_staff_id=staff.id,source='classroom'))
+        complete=Attendance(centre_id=centre.id,child_id=absent.id,room_id=room.id,arrived_at=now()-timedelta(days=3,hours=2),departed_at=now()-timedelta(days=3,hours=1),source='parent_kiosk');db.add(complete);db.flush();db.add_all([Signature(centre_id=centre.id,parent_id=None,signer_name='Parent',relationship='Mother',domain_type='attendance',domain_id=complete.id,revision=1,purpose='kiosk_sign_in',signature_data='data:image/png;base64,complete-in'),Signature(centre_id=centre.id,parent_id=None,signer_name='Parent',relationship='Mother',domain_type='attendance',domain_id=complete.id,revision=1,purpose='kiosk_sign_out',signature_data='data:image/png;base64,complete-out')]);db.commit()
+        admin_client=TestClient(app);login(admin_client);issues=admin_client.get('/api/admin/bootstrap').json()['attendance_signature_issues']
+        assert [item['attendance_id'] for item in issues if item['child_id']==child.id]==[old.id,newer.id]
+        assert not any(item['attendance_id']==complete.id for item in issues)
+        kiosk=attendance_client(room);pending=next(item for item in kiosk.get('/api/attendance/bootstrap').json()['children'] if item['id']==child.id)['pending_attendance_confirmation']
+        assert pending['attendance_id']==old.id and pending['phase']=='sign_in'
+        saved_times=(utc(old.arrived_at),utc(old.departed_at),old.recorded_by_staff_id)
+        for attendance,prefix in ((old,'old'),(newer,'new')):
+            first=kiosk.post('/api/attendance/missing-signature',json={'child_id':child.id,'attendance_id':attendance.id,'phase':'sign_in','relationship':'Mother','signature_data':f'data:image/png;base64,{prefix}-in'});assert first.status_code==200 and first.json()['next_confirmation']['attendance_id']==attendance.id and first.json()['next_confirmation']['phase']=='sign_out'
+            second=kiosk.post('/api/attendance/missing-signature',json={'child_id':child.id,'attendance_id':attendance.id,'phase':'sign_out','relationship':'Mother','signature_data':f'data:image/png;base64,{prefix}-out'});assert second.status_code==200
+            if attendance.id==old.id:
+                assert second.json()['next_confirmation']['attendance_id']==newer.id and second.json()['next_confirmation']['phase']=='sign_in'
+                remaining=admin_client.get('/api/admin/bootstrap').json()['attendance_signature_issues'];assert not any(item['attendance_id']==old.id for item in remaining) and any(item['attendance_id']==newer.id for item in remaining)
+        db.expire_all();old_saved=db.get(Attendance,old.id);assert (utc(old_saved.arrived_at),utc(old_saved.departed_at),old_saved.recorded_by_staff_id)==saved_times
+        assert TestClient(app).get('/api/admin/bootstrap').status_code==401
+        admin_client=TestClient(app);login(admin_client);assert admin_client.get('/api/admin/bootstrap').json()['attendance_signature_issues']==[]
+    finally:db.close()
+
+def test_direct_sleep_creation_marks_attendance_for_parent_signature_recovery_once():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        classroom=TestClient(app);login(classroom)
+        pairing=classroom.post('/api/admin/pairings',json={'room_id':room.id,'label':'Classroom','mode':'classroom'}).json()
+        assert classroom.post('/api/device/pair',json={'token':pairing['token'],'challenge':pairing['challenge']}).status_code==200
+        direct=classroom.post('/api/classroom/sleep',json={'client_id':'direct-sleep-create-001','child_ids':[child.id],'room_id':room.id,'action':'put_down','staff_id':staff.id})
+        assert direct.status_code==200
+        db.expire_all();attendance=db.scalar(select(Attendance).where(Attendance.child_id==child.id,Attendance.departed_at.is_(None)))
+        assert attendance and attendance.source=='staff_late_sign_in' and attendance.recorded_by_staff_id==staff.id
+        markers=list(db.scalars(select(Audit).where(Audit.entity=='attendance',Audit.entity_id==attendance.id,Audit.action=='prepared_for_sleep')))
+        assert len(markers)==1
+        marker=markers[0];assert marker.actor_id==staff.id and marker.after['signature_evidence_required'] is True
+        assert marker.after['child_id']==child.id and marker.after['room_id']==room.id and marker.after['effective_at']
+        assert 'signature_data' not in str(marker.after).lower()
+        kiosk=attendance_client(room);pending=next(item for item in kiosk.get('/api/attendance/bootstrap').json()['children'] if item['id']==child.id)['pending_attendance_confirmation']
+        assert pending['attendance_id']==attendance.id and pending['phase']=='sign_in'
+        admin_client=TestClient(app);login(admin_client);issues=admin_client.get('/api/admin/bootstrap').json()['attendance_signature_issues']
+        assert any(item['attendance_id']==attendance.id and item['phase']=='sign_in' for item in issues)
+        prepared=classroom.post('/api/classroom/sleep/prepare',json={'client_id':'prepare-sleep-create-001','child_id':absent.id,'room_id':room.id,'staff_id':staff.id})
+        assert prepared.status_code==200 and prepared.json()['late_sign_in'] is True
+        prepared_audits=list(db.scalars(select(Audit).where(Audit.entity=='attendance',Audit.entity_id==prepared.json()['attendance_id'],Audit.action=='prepared_for_sleep')))
+        assert len(prepared_audits)==1 and prepared_audits[0].after['signature_evidence_required'] is True
     finally:db.close()

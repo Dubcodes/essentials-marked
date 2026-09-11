@@ -226,14 +226,13 @@ def attendance_signature_state(db:Session,attendance:Attendance):
 def require_fresh_attendance_signature(db:Session,centre_id:str,attendance_id:str,signature_data:str):
     reused=db.scalar(select(Signature.id).where(Signature.centre_id==centre_id,Signature.domain_type=='attendance',Signature.domain_id==attendance_id,Signature.signature_data==signature_data))
     if reused:raise HTTPException(409,'Draw a new signature for this attendance phase')
-def relevant_attendance_for_child(db:Session,centre:Centre,child_id:str):
-    latest=db.scalar(select(Attendance).where(Attendance.centre_id==centre.id,Attendance.child_id==child_id).order_by(Attendance.arrived_at.desc()).limit(1))
-    if not latest:return None
-    if latest.departed_at is None:return latest
-    # Completed legacy records only drive recovery when they remain recent;
-    # older unsigned history must never block today's kiosk operation.
-    local_day=utc(latest.departed_at or latest.arrived_at).astimezone(ZoneInfo(centre.timezone)).date()
-    return latest if local_day>=now().astimezone(ZoneInfo(centre.timezone)).date()-timedelta(days=1) else None
+ATTENDANCE_SIGNATURE_REQUIRED_MARKER='signature_evidence_required'
+def attendance_requires_signature_evidence(db:Session,attendance:Attendance):
+    if attendance.source=='parent_kiosk':return True
+    evidence=db.scalar(select(Signature.id).where(Signature.centre_id==attendance.centre_id,Signature.domain_type=='attendance',Signature.domain_id==attendance.id,Signature.purpose.in_(sum(ATTENDANCE_SIGNATURE_PURPOSES.values(),()))).limit(1))
+    if evidence:return True
+    boundaries=db.scalars(select(Audit).where(Audit.centre_id==attendance.centre_id,Audit.entity=='attendance',Audit.entity_id==attendance.id))
+    return any(isinstance(boundary.after,dict) and boundary.after.get(ATTENDANCE_SIGNATURE_REQUIRED_MARKER) is True for boundary in boundaries)
 def attendance_pending_phase(db:Session,centre:Centre,attendance:Attendance|None):
     if not attendance or not attendance.arrived_at:return None
     state=attendance_signature_state(db,attendance)
@@ -248,11 +247,19 @@ def attendance_staff_for_phase(db:Session,attendance:Attendance,phase:Literal['s
         staff_id=departure.actor_id if departure else staff_id
     staff=db.scalar(select(Staff).where(Staff.id==staff_id,Staff.centre_id==attendance.centre_id)) if staff_id else None
     return ((staff.preferred_name or staff.first_name)+' '+staff.last_name[:1]+'.') if staff else None
-def attendance_pending_confirmation(db:Session,centre:Centre,child_id:str):
-    attendance=relevant_attendance_for_child(db,centre,child_id);phase=attendance_pending_phase(db,centre,attendance)
-    if not attendance or not phase:return None
+def attendance_confirmation_details(db:Session,centre:Centre,attendance:Attendance,phase:Literal['sign_in','sign_out']):
     room=db.scalar(select(Room).where(Room.id==attendance.room_id,Room.centre_id==centre.id)) if attendance.room_id else None
     return {'attendance_id':attendance.id,'phase':phase,'arrived_at':attendance.arrived_at,'departed_at':attendance.departed_at,'recorded_by':attendance_staff_for_phase(db,attendance,phase),'room_name':room.name if room else None,'needs_departure_time':phase=='sign_out' and attendance.departed_at is None}
+def unresolved_attendance_confirmations(db:Session,centre:Centre,child_id:str):
+    rows=db.scalars(select(Attendance).where(Attendance.centre_id==centre.id,Attendance.child_id==child_id).order_by(Attendance.arrived_at.asc())).all();pending=[]
+    for attendance in rows:
+        if not attendance_requires_signature_evidence(db,attendance):continue
+        phase=attendance_pending_phase(db,centre,attendance)
+        if phase:pending.append(attendance_confirmation_details(db,centre,attendance,phase))
+    return pending
+def attendance_pending_confirmation(db:Session,centre:Centre,child_id:str):
+    pending=unresolved_attendance_confirmations(db,centre,child_id)
+    return pending[0] if pending else None
 def centre_local_datetime(value:str,timezone_name:str,fold:int|None=None):
     try:
         local=datetime.fromisoformat(value)
@@ -758,12 +765,11 @@ def bootstrap(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
 
     attendance_signature_issues=[];missing_sign_outs=[]
     for child in child_models:
-        pending=attendance_pending_confirmation(db,c,child.id)
-        if not pending:continue
-        label={'sign_in':'Missing sign-in signature','sign_out':'Missing sign-out time/signature' if pending['needs_departure_time'] else 'Missing sign-out signature'}[pending['phase']]
-        issue={**pending,'child_id':child.id,'child_name':' '.join(part for part in [child.preferred_name or child.first_name,child.last_name] if part),'room':pending['room_name'],'status':label}
-        attendance_signature_issues.append(issue)
-        if pending['phase']=='sign_out' and pending['needs_departure_time']:missing_sign_outs.append(issue)
+        for pending in unresolved_attendance_confirmations(db,c,child.id):
+            label={'sign_in':'Missing sign-in signature','sign_out':'Missing sign-out time/signature' if pending['needs_departure_time'] else 'Missing sign-out signature'}[pending['phase']]
+            issue={**pending,'child_id':child.id,'child_name':' '.join(part for part in [child.preferred_name or child.first_name,child.last_name] if part),'room':pending['room_name'],'status':label}
+            attendance_signature_issues.append(issue)
+            if pending['phase']=='sign_out' and pending['needs_departure_time']:missing_sign_outs.append(issue)
 
     return {
         'account':account_out(a),
@@ -2042,9 +2048,9 @@ def presence(body:PresenceIn,d:Device=Depends(classroom_device),db:Session=Depen
     c=db.scalar(select(Child).where(Child.id==body.child_id,Child.centre_id==d.centre_id));
     if not c:raise HTTPException(404,'Child not found')
     staff=staff_for_device(db,d,body.staff_id) if body.staff_id else None;when=body.effective_at or now()
-    a=db.scalar(select(Attendance).where(Attendance.child_id==c.id,Attendance.departed_at.is_(None)).order_by(Attendance.arrived_at.desc()))
+    a=db.scalar(select(Attendance).where(Attendance.child_id==c.id,Attendance.departed_at.is_(None)).order_by(Attendance.arrived_at.desc()));created=False
     if body.action=='arrive':
-        if not a:a=Attendance(centre_id=d.centre_id,child_id=c.id,room_id=body.room_id,arrived_at=when,recorded_by_staff_id=staff.id if staff else None,device_id=d.id);db.add(a)
+        if not a:a=Attendance(centre_id=d.centre_id,child_id=c.id,room_id=body.room_id,arrived_at=when,recorded_by_staff_id=staff.id if staff else None,device_id=d.id);db.add(a);created=True
     elif not a: raise HTTPException(409,'Child is not present')
     elif body.action=='depart':
         sleeping=active_sleep(db,d.centre_id,c.id)
@@ -2063,7 +2069,7 @@ def presence(body:PresenceIn,d:Device=Depends(classroom_device),db:Session=Depen
         if visit:visit.ended_at=when;visit.ended_by_staff_id=staff.id if staff else None
         a.last_visit_room_id=a.visit_room_id;a.visit_room_id=None;a.visit_ended_at=when
     db.flush()
-    audit(db,d.centre_id,'attendance',a.id,body.action,after={'child_id':c.id,'room_id':body.room_id,'effective_at':when.isoformat()},actor=staff.id if staff else None)
+    audit(db,d.centre_id,'attendance',a.id,body.action,after={'child_id':c.id,'room_id':body.room_id,'effective_at':when.isoformat(),**({ATTENDANCE_SIGNATURE_REQUIRED_MARKER:True} if created else {})},actor=staff.id if staff else None)
     db.commit();return {'ok':True,'visiting_room_id':a.visit_room_id}
 @app.post('/api/classroom/late-sign-in')
 def late_sign_in(body:LateSignInIn,d:Device=Depends(classroom_device),db:Session=Depends(get_db)):
@@ -2076,7 +2082,7 @@ def late_sign_in(body:LateSignInIn,d:Device=Depends(classroom_device),db:Session
     if active:return {'attendance_id':active.id,'idempotent':True,'already_present':True}
     attendance=Attendance(centre_id=d.centre_id,child_id=child.id,room_id=body.room_id,arrived_at=body.effective_at or now(),recorded_by_staff_id=staff.id,device_id=d.id,source='staff_late_sign_in',late_sign_in=True,circumstance='Entered by staff after care workflow')
     db.add(attendance);db.flush();result={'attendance_id':attendance.id,'idempotent':False}
-    db.add(DomainOperation(centre_id=d.centre_id,domain='late_sign_in',client_operation_id=body.client_id,result=result));audit(db,d.centre_id,'attendance',attendance.id,'late_sign_in',after={'child_id':child.id,'room_id':body.room_id,'late_sign_in':True,'source':'staff_late_sign_in','circumstance':attendance.circumstance},actor=staff.id);db.commit();return result
+    db.add(DomainOperation(centre_id=d.centre_id,domain='late_sign_in',client_operation_id=body.client_id,result=result));audit(db,d.centre_id,'attendance',attendance.id,'late_sign_in',after={'child_id':child.id,'room_id':body.room_id,'late_sign_in':True,'source':'staff_late_sign_in','circumstance':attendance.circumstance,ATTENDANCE_SIGNATURE_REQUIRED_MARKER:True},actor=staff.id);db.commit();return result
 @app.get('/api/classroom/alerts')
 def classroom_alerts(d:Device=Depends(classroom_device),db:Session=Depends(get_db)):
     return [alert_out(row,db) for row in db.scalars(select(ChildAlert).where(ChildAlert.centre_id==d.centre_id,ChildAlert.resolved_at.is_(None)).order_by(ChildAlert.created_at.desc()))]
@@ -2117,7 +2123,7 @@ def confirm_missing_attendance_signature(body:MissingAttendanceSignatureIn,d:Dev
     centre=db.get(Centre,d.centre_id);child=db.scalar(select(Child).where(Child.id==body.child_id,Child.centre_id==d.centre_id,Child.active.is_(True)))
     attendance=db.scalar(select(Attendance).where(Attendance.id==body.attendance_id,Attendance.child_id==body.child_id,Attendance.centre_id==d.centre_id))
     if not child or not attendance:raise HTTPException(404,'Attendance confirmation not found')
-    relevant=relevant_attendance_for_child(db,centre,child.id);pending=attendance_pending_phase(db,centre,attendance) if relevant and relevant.id==attendance.id else None
+    next_pending=attendance_pending_confirmation(db,centre,child.id);pending=attendance_pending_phase(db,centre,attendance) if next_pending and next_pending['attendance_id']==attendance.id else None
     if pending!=body.phase:raise HTTPException(409,'This attendance no longer needs that Parent signature confirmation')
     relationship=(body.relationship or '').strip() or None
     if centre.attendance_relationship_required and not relationship:raise HTTPException(422,'Choose a relationship')
@@ -2246,16 +2252,17 @@ def place_for_sleep(db,d,child,room_id,staff,when):
     attendance=db.scalar(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.child_id==child.id,Attendance.departed_at.is_(None)).order_by(Attendance.arrived_at.desc()))
     if not attendance:
         attendance=Attendance(centre_id=d.centre_id,child_id=child.id,room_id=room_id,arrived_at=when,recorded_by_staff_id=staff.id,device_id=d.id,source='staff_late_sign_in',late_sign_in=True,circumstance='Entered by staff for sleep');db.add(attendance);db.flush()
-        return attendance
+        audit(db,d.centre_id,'attendance',attendance.id,'prepared_for_sleep',after={'child_id':child.id,'room_id':room_id,'late_sign_in':True,'effective_at':when.isoformat(),ATTENDANCE_SIGNATURE_REQUIRED_MARKER:True},actor=staff.id)
+        return attendance,True
     current_room_id=attendance.visit_room_id if attendance.visit_room_id and attendance.visit_ended_at is None else attendance.room_id
-    if current_room_id==room_id:return attendance
+    if current_room_id==room_id:return attendance,False
     if attendance.visit_room_id and attendance.visit_ended_at is None:
         old=db.scalar(select(RoomVisit).where(RoomVisit.attendance_id==attendance.id,RoomVisit.ended_at.is_(None)).order_by(RoomVisit.started_at.desc()))
         if old:old.ended_at=when;old.ended_by_staff_id=staff.id
         attendance.last_visit_room_id=attendance.visit_room_id;attendance.visit_ended_at=when
     attendance.visit_room_id=room_id;attendance.visit_started_at=when;attendance.visit_ended_at=None
     db.add(RoomVisit(centre_id=d.centre_id,attendance_id=attendance.id,child_id=child.id,room_id=room_id,started_at=when,started_by_staff_id=staff.id,device_id=d.id))
-    return attendance
+    return attendance,False
 
 @app.post('/api/classroom/sleep/prepare')
 def prepare_sleep_presence(body:SleepPrepareIn,d:Device=Depends(classroom_device),db:Session=Depends(get_db)):
@@ -2264,10 +2271,11 @@ def prepare_sleep_presence(body:SleepPrepareIn,d:Device=Depends(classroom_device
     if not child:raise HTTPException(404,'Child not found')
     prior=db.scalar(select(DomainOperation).where(DomainOperation.centre_id==d.centre_id,DomainOperation.domain=='sleep_prepare',DomainOperation.client_operation_id==body.client_id))
     if prior:return prior.result|{'idempotent':True}
-    when=body.effective_at or now();before=db.scalar(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.child_id==child.id,Attendance.departed_at.is_(None)).order_by(Attendance.arrived_at.desc()));was_absent=before is None
-    attendance=place_for_sleep(db,d,child,body.room_id,staff,when)
-    result={'attendance_id':attendance.id,'room_id':body.room_id,'late_sign_in':was_absent}
-    db.add(DomainOperation(centre_id=d.centre_id,domain='sleep_prepare',client_operation_id=body.client_id,result=result));audit(db,d.centre_id,'attendance',attendance.id,'prepared_for_sleep',after={'child_id':child.id,'room_id':body.room_id,'late_sign_in':was_absent,'effective_at':when.isoformat()},actor=staff.id);db.commit();return result|{'idempotent':False}
+    when=body.effective_at or now();attendance,created=place_for_sleep(db,d,child,body.room_id,staff,when)
+    result={'attendance_id':attendance.id,'room_id':body.room_id,'late_sign_in':created}
+    db.add(DomainOperation(centre_id=d.centre_id,domain='sleep_prepare',client_operation_id=body.client_id,result=result))
+    if not created:audit(db,d.centre_id,'attendance',attendance.id,'prepared_for_sleep',after={'child_id':child.id,'room_id':body.room_id,'late_sign_in':False,'effective_at':when.isoformat()},actor=staff.id)
+    db.commit();return result|{'idempotent':False}
 
 @app.post('/api/classroom/sleep')
 def sleep(body:SleepIn,d:Device=Depends(classroom_device),db:Session=Depends(get_db)):
