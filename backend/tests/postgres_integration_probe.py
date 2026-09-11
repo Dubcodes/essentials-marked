@@ -31,6 +31,8 @@ try:
     command.upgrade(config,'head')
     with admin_engine.connect() as connection:
         assert connection.execute(text(f'SELECT attendance_relationship_required FROM "{schema}".centres WHERE id=\'upgrade-centre\'')).scalar_one() is True
+        print_settings=connection.execute(text(f'SELECT emergency_orientation,emergency_name_size FROM "{schema}".centres WHERE id=\'upgrade-centre\'')).one()
+        assert tuple(print_settings)==('portrait','standard')
         assert connection.execute(text(f'SELECT count(*) FROM "{schema}".parent_relationship_options WHERE id=\'upgrade-relationship\'')).scalar_one()==1
     inspector=inspect(admin_engine)
     check_tables={'centre_safety_checks','centre_safety_check_rooms'}

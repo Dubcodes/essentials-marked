@@ -20,6 +20,8 @@ class Centre(Base):
     emergency_columns: Mapped[int] = mapped_column(Integer, default=3)
     emergency_sort: Mapped[str] = mapped_column(String(30), default='room_then_name')
     emergency_show_room: Mapped[bool] = mapped_column(Boolean, default=True)
+    emergency_orientation: Mapped[str] = mapped_column(String(20), default='portrait')
+    emergency_name_size: Mapped[str] = mapped_column(String(20), default='standard')
     attendance_relationship_required: Mapped[bool] = mapped_column(Boolean, default=True)
 class Room(Base):
     __tablename__ = 'rooms'

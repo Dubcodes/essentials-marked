@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .db import get_db
 from .models import Centre, Room, Staff, Account, Child, Parent, ParentChild, Event, Attendance, RoomVisit, Device, Pairing, Audit, ParentNote, ParentDataRequest, ChildAlert, AppSession, LoginAttempt, SleepSession, SleepCheck, DomainOperation, MedicationAuthority, MedicationReceipt, MedicationAdministration, Incident, IncidentBodyArea, IncidentAction, Signature, ParentRelationshipOption, CentreSafetyCheck, CentreSafetyCheckRoom, now
+from .pairing_words import PAIRING_WORDS
 
 app = FastAPI(title='Essentials Marked', version='0.1.0')
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv('CORS_ORIGINS','http://localhost:5173').split(','), allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
@@ -23,6 +24,18 @@ SECRET = os.getenv('SECRET_KEY','development-only-change-me')
 secure_cookie = os.getenv('COOKIE_SECURE','false').lower() == 'true'
 APP_ENV = os.getenv('APP_ENV','development')
 MEDIA_DIR = os.getenv('MEDIA_DIR','./media')
+
+def bounded_env_int(name:str,default:int,minimum:int=30,maximum:int=900):
+    try:value=int(os.getenv(name,str(default)))
+    except (TypeError,ValueError):return default
+    return value if minimum<=value<=maximum else default
+
+def normalize_pairing_token(value:str):
+    canonical='-'.join(value.strip().lower().replace('-',' ').split())
+    if not re.fullmatch(r'[a-z]+-[a-z]+-[a-z]+',canonical):raise HTTPException(422,'Enter a valid three-word pairing code')
+    return canonical
+
+def pairing_token_hash(value:str):return hashlib.sha256(normalize_pairing_token(value).encode()).hexdigest()
 
 # Live events are deliberately advisory.  They carry no care records or entity
 # identifiers: every recipient re-reads its normal, authorised REST resource.
@@ -355,6 +368,8 @@ class EmergencyPrintSettingsIn(BaseModel):
     columns:Literal[2,3]=3
     sort:Literal['alphabetical','room_then_name']='room_then_name'
     show_room:bool=True
+    orientation:Literal['portrait','landscape']='portrait'
+    name_size:Literal['standard','large']='standard'
 class AttendanceKioskIn(BaseModel):
     child_id:str
     room_id:str
@@ -788,7 +803,7 @@ def bootstrap(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
                 if c.logo_path
                 else None
             ),
-            'emergency_print':{'columns':c.emergency_columns or 3,'sort':c.emergency_sort or 'room_then_name','show_room':c.emergency_show_room is not False}
+            'emergency_print':{'columns':c.emergency_columns or 3,'sort':c.emergency_sort or 'room_then_name','show_room':c.emergency_show_room is not False,'orientation':c.emergency_orientation or 'portrait','name_size':c.emergency_name_size or 'standard'}
         },
         'rooms':room_data,
         'staff':staff,
@@ -1532,17 +1547,30 @@ def delete_family(parent_id:str,body:AdminDeleteIn,a:Account=Depends(admin_only)
 @app.post('/api/admin/pairings')
 def create_pairing(body:PairIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     if body.room_id and not db.scalar(select(Room).where(Room.id==body.room_id,Room.centre_id==a.centre_id)): raise HTTPException(404,'Room not found')
-    raw=secrets.token_urlsafe(32); challenge=str(secrets.randbelow(900)+100); p=Pairing(centre_id=a.centre_id,room_id=body.room_id,label=body.label,mode=body.mode,token_hash=hashlib.sha256(raw.encode()).hexdigest(),challenge=challenge,expires_at=now()+timedelta(seconds=90));db.add(p);db.flush();audit(db,a.centre_id,'pairing',p.id,'created',after={'room_id':p.room_id,'label':p.label,'mode':p.mode,'expires_at':p.expires_at.isoformat()},actor=a.id);db.commit();origin=os.getenv('PUBLIC_ORIGIN','http://localhost:5173').rstrip('/');url=f'{origin}/classroom/pair?token={raw}'
+    raw='-'.join(secrets.SystemRandom().sample(PAIRING_WORDS,3)); canonical=normalize_pairing_token(raw); challenge=str(secrets.randbelow(900)+100); p=Pairing(centre_id=a.centre_id,room_id=body.room_id,label=body.label,mode=body.mode,token_hash=pairing_token_hash(canonical),challenge=challenge,expires_at=now()+timedelta(seconds=bounded_env_int('PAIRING_QR_TTL_SECONDS',90)));db.add(p);db.flush();audit(db,a.centre_id,'pairing',p.id,'created',after={'room_id':p.room_id,'label':p.label,'mode':p.mode,'expires_at':p.expires_at.isoformat()},actor=a.id);db.commit();origin=os.getenv('PUBLIC_ORIGIN','http://localhost:5173').rstrip('/');url=f'{origin}/classroom/pair?token={canonical}'
     try:
         import qrcode
         image=qrcode.make(url);buffer=io.BytesIO();image.save(buffer,format='PNG');qr='data:image/png;base64,'+base64.b64encode(buffer.getvalue()).decode()
     except ImportError:qr=None
-    return {'id':p.id,'token':raw,'challenge':challenge,'expires_at':p.expires_at,'label':p.label,'pairing_url':url,'qr_data_url':qr}
+    return {'id':p.id,'token':canonical,'challenge':challenge,'expires_at':p.expires_at,'label':p.label,'pairing_url':url,'qr_data_url':qr}
 @app.get('/api/admin/pairings/{pairing_id}')
 def pairing_status(pairing_id:str,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     p=db.scalar(select(Pairing).where(Pairing.id==pairing_id,Pairing.centre_id==a.centre_id))
     if not p:raise HTTPException(404,'Pairing not found')
     return {'id':p.id,'label':p.label,'expires_at':p.expires_at,'consumed_at':p.consumed_at,'device_id':p.device_id}
+
+@app.post('/api/admin/pairings/{pairing_id}/manual-token')
+def reveal_manual_pairing_token(pairing_id:str,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
+    p=db.scalar(select(Pairing).where(Pairing.id==pairing_id,Pairing.centre_id==a.centre_id))
+    if not p:raise HTTPException(404,'Pairing not found')
+    expiry=utc(p.expires_at)
+    if p.consumed_at:raise HTTPException(409,'Pairing has already been used')
+    if expiry<now():raise HTTPException(409,'Pairing has expired')
+    revealed=db.scalar(select(Audit.id).where(Audit.centre_id==a.centre_id,Audit.entity=='pairing',Audit.entity_id==p.id,Audit.action=='manual_token_revealed'))
+    if not revealed:
+        before={'expires_at':expiry.isoformat()};p.expires_at=max(expiry,now()+timedelta(seconds=bounded_env_int('PAIRING_WORD_TTL_SECONDS',180)))
+        audit(db,a.centre_id,'pairing',p.id,'manual_token_revealed',before=before,after={'expires_at':p.expires_at.isoformat()},actor=a.id);db.commit()
+    return {'id':p.id,'expires_at':p.expires_at,'manual_revealed':True}
 
 def safety_expected_children(db:Session,centre_id:str,room_id:str):
     attendances=list(db.scalars(select(Attendance).where(Attendance.centre_id==centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None))))
@@ -1977,9 +2005,9 @@ def update_branding(body:BrandingIn,a:Account=Depends(admin_only),db:Session=Dep
     audit(db,a.centre_id,'centre',centre.id,'branding_updated',actor=a.id);db.commit();return {'display_name':centre.display_name,'secondary_text':centre.secondary_text,'timezone':centre.timezone}
 @app.patch('/api/admin/emergency-print-settings')
 def emergency_print_settings(body:EmergencyPrintSettingsIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
-    centre=db.get(Centre,a.centre_id);before={'columns':centre.emergency_columns,'sort':centre.emergency_sort,'show_room':centre.emergency_show_room}
-    centre.emergency_columns=body.columns;centre.emergency_sort=body.sort;centre.emergency_show_room=body.show_room
-    after={'columns':centre.emergency_columns,'sort':centre.emergency_sort,'show_room':centre.emergency_show_room};audit(db,a.centre_id,'centre',centre.id,'emergency_print_updated',before,after,a.id);db.commit();return after
+    centre=db.get(Centre,a.centre_id);before={'columns':centre.emergency_columns,'sort':centre.emergency_sort,'show_room':centre.emergency_show_room,'orientation':centre.emergency_orientation,'name_size':centre.emergency_name_size}
+    centre.emergency_columns=body.columns;centre.emergency_sort=body.sort;centre.emergency_show_room=body.show_room;centre.emergency_orientation=body.orientation;centre.emergency_name_size=body.name_size
+    after={'columns':centre.emergency_columns,'sort':centre.emergency_sort,'show_room':centre.emergency_show_room,'orientation':centre.emergency_orientation,'name_size':centre.emergency_name_size};audit(db,a.centre_id,'centre',centre.id,'emergency_print_updated',before,after,a.id);db.commit();return after
 @app.post('/api/admin/branding/logo')
 async def upload_branding_logo(file:UploadFile=File(...),a:Account=Depends(admin_only),db:Session=Depends(get_db)):
     if file.content_type not in {'image/png','image/jpeg','image/webp'}:raise HTTPException(422,'Logo must be PNG, JPEG, or WebP')
@@ -2008,7 +2036,7 @@ def branding_logo(centre_id:str,db:Session=Depends(get_db)):
 
 @app.post('/api/device/pair')
 def pair(body:PairComplete,response:Response,db:Session=Depends(get_db)):
-    key=hashlib.sha256(body.token.encode()).hexdigest();enforce_failure_limit(db,'pairing',key)
+    key=pairing_token_hash(body.token);enforce_failure_limit(db,'pairing',key)
     p=db.scalar(select(Pairing).where(Pairing.token_hash==key))
     expiry = p.expires_at.replace(tzinfo=timezone.utc) if p and p.expires_at.tzinfo is None else (p.expires_at if p else now())
     if not p or p.consumed_at or expiry<now() or not secrets.compare_digest(p.challenge,body.challenge):record_auth_failure(db,'pairing',key);raise HTTPException(400,'Pairing code invalid or expired')
@@ -2022,14 +2050,14 @@ def classroom_bootstrap(d:Device=Depends(classroom_device),db:Session=Depends(ge
         latest=select(RoomVisit.child_id.label('child_id'),func.max(RoomVisit.started_at).label('latest')).where(RoomVisit.centre_id==d.centre_id,RoomVisit.room_id==room.id).group_by(RoomVisit.child_id).subquery()
         active_visitors=select(Attendance.child_id).where(Attendance.centre_id==d.centre_id,Attendance.visit_room_id==room.id,Attendance.visit_ended_at.is_(None),Attendance.departed_at.is_(None))
         recent[room.id]=list(db.scalars(select(latest.c.child_id).where(~latest.c.child_id.in_(active_visitors)).order_by(latest.c.latest.desc()).limit(5)))
-    return {'device_id':d.id,'default_room_id':d.default_room_id,'centre':{'id':centre.id,'name':centre.name,'display_name':centre.display_name,'secondary_text':centre.secondary_text,'logo_url':f'/api/branding/{centre.id}/logo' if centre.logo_path else None,'timezone':centre.timezone,'emergency_print':{'columns':centre.emergency_columns or 3,'sort':centre.emergency_sort or 'room_then_name','show_room':centre.emergency_show_room is not False}},'last_confirmed_at':now(),'rooms':[{'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon} for r in scoped(db,Room,d.centre_id)],'staff':[{'id':s.id,'name':(s.preferred_name or s.first_name)+' '+s.last_name[:1]+'.'} for s in scoped(db,Staff,d.centre_id) if s.active],'children':[public_child(c)|{'present':c.id in active_att,'arrived_at':active_att[c.id].arrived_at if c.id in active_att else None,'visiting_room_id':active_att[c.id].visit_room_id if c.id in active_att and active_att[c.id].visit_ended_at is None else None} for c in children],'recent_visitors':recent,'unread_notes':db.scalar(select(func.count()).select_from(ParentNote).where(ParentNote.centre_id==d.centre_id,ParentNote.read_at.is_(None))),'incident_drafts':db.scalar(select(func.count()).select_from(Incident).where(Incident.centre_id==d.centre_id,Incident.status=='draft')),'child_alerts':[alert_out(x,db) for x in db.scalars(select(ChildAlert).where(ChildAlert.centre_id==d.centre_id,ChildAlert.resolved_at.is_(None)).order_by(ChildAlert.created_at.desc()))]}
+    return {'device_id':d.id,'default_room_id':d.default_room_id,'centre':{'id':centre.id,'name':centre.name,'display_name':centre.display_name,'secondary_text':centre.secondary_text,'logo_url':f'/api/branding/{centre.id}/logo' if centre.logo_path else None,'timezone':centre.timezone,'emergency_print':{'columns':centre.emergency_columns or 3,'sort':centre.emergency_sort or 'room_then_name','show_room':centre.emergency_show_room is not False,'orientation':centre.emergency_orientation or 'portrait','name_size':centre.emergency_name_size or 'standard'}},'last_confirmed_at':now(),'rooms':[{'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon} for r in scoped(db,Room,d.centre_id)],'staff':[{'id':s.id,'name':(s.preferred_name or s.first_name)+' '+s.last_name[:1]+'.'} for s in scoped(db,Staff,d.centre_id) if s.active],'children':[public_child(c)|{'present':c.id in active_att,'arrived_at':active_att[c.id].arrived_at if c.id in active_att else None,'visiting_room_id':active_att[c.id].visit_room_id if c.id in active_att and active_att[c.id].visit_ended_at is None else None} for c in children],'recent_visitors':recent,'unread_notes':db.scalar(select(func.count()).select_from(ParentNote).where(ParentNote.centre_id==d.centre_id,ParentNote.read_at.is_(None))),'incident_drafts':db.scalar(select(func.count()).select_from(Incident).where(Incident.centre_id==d.centre_id,Incident.status=='draft')),'child_alerts':[alert_out(x,db) for x in db.scalars(select(ChildAlert).where(ChildAlert.centre_id==d.centre_id,ChildAlert.resolved_at.is_(None)).order_by(ChildAlert.created_at.desc()))]}
 @app.get('/api/attendance/bootstrap')
 def attendance_bootstrap(d:Device=Depends(attendance_device),db:Session=Depends(get_db)):
     centre=db.get(Centre,d.centre_id);children=list(db.scalars(select(Child).where(Child.centre_id==d.centre_id,Child.active.is_(True))));active={x.child_id:x for x in db.scalars(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None)))};rooms={r.id:r for r in scoped(db,Room,d.centre_id)};assigned=rooms.get(d.default_room_id)
     child_rows=[]
     for child in children:
         pending=attendance_pending_confirmation(db,centre,child.id);active_row=active.get(child.id)
-        child_rows.append({'id':child.id,'first_name':child.preferred_name or child.first_name,'last_name':child.last_name,'room_id':child.room_id,'room_name':rooms[child.room_id].name if child.room_id in rooms else None,'present':bool(active_row),'attendance_id':pending['attendance_id'] if pending else (active_row.id if active_row else None),'arrived_at':pending['arrived_at'] if pending else (active_row.arrived_at if active_row else None),'stale_attendance':bool(pending and pending['phase']=='sign_out' and pending['needs_departure_time']),'pending_attendance_confirmation':pending})
+        child_rows.append({'id':child.id,'first_name':child.preferred_name or child.first_name,'last_name':child.last_name,'room_id':child.room_id,'room_name':rooms[child.room_id].name if child.room_id in rooms else None,'present':bool(active_row),'attendance_id':pending['attendance_id'] if pending else (active_row.id if active_row else None),'arrived_at':pending['arrived_at'] if pending else (active_row.arrived_at if active_row else None),'current_arrived_at':active_row.arrived_at if active_row else None,'stale_attendance':bool(pending and pending['phase']=='sign_out' and pending['needs_departure_time']),'pending_attendance_confirmation':pending})
     return {'device_id':d.id,'default_room_id':d.default_room_id,'centre':{'display_name':centre.display_name or centre.name,'secondary_text':centre.secondary_text,'timezone':centre.timezone},'assigned_room':{'id':assigned.id,'name':assigned.name,'accent':assigned.accent,'icon':assigned.icon} if assigned else None,'relationship_required':centre.attendance_relationship_required,'children':child_rows}
 @app.get('/api/classroom/parent-notes')
 def classroom_parent_notes(d:Device=Depends(classroom_device),db:Session=Depends(get_db)):

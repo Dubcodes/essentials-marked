@@ -16,6 +16,9 @@ import{ParentNotes}from'./ParentNotes';
 import{ClassroomHelp}from'./ClassroomHelp';
 import type{Bootstrap,WorkflowProps}from'./types';
 import{FullscreenToggle}from'../FullscreenToggle';
+import{DismissibleOverlay}from'../ui/DismissibleOverlay';
+import{EmergencyRoll}from'../ui/EmergencyRoll';
+export{sortEmergencyChildren}from'../ui/EmergencyRoll';
 
 type View=
   'toileting'|
@@ -58,7 +61,6 @@ export const restoreContext=(data:Bootstrap)=>({
         ''
 });
 
-export const escapeClosesView=(view:View)=>view!=='medicine'&&view!=='incident';
 export const ignoresClassroomShortcut=(target:HTMLElement|null)=>!!(target&&(['INPUT','TEXTAREA','SELECT'].includes(target.tagName)||target.isContentEditable));
 export const noticeFadeDelay=59500;
 
@@ -93,7 +95,6 @@ export default function Classroom(){
     const onKey=(event:KeyboardEvent)=>{
       const target=event.target as HTMLElement|null;
       if(ignoresClassroomShortcut(target))return;
-      if(event.key==='Escape'&&escapeClosesView(view)){setView('');return}
       if(event.key==='/'){window.dispatchEvent(new Event('classroom-focus-search'));event.preventDefault();return}
       if(event.key==='?'){setView('help');return}
       if(!event.altKey)return;
@@ -103,7 +104,7 @@ export default function Classroom(){
     };
     window.addEventListener('keydown',onKey);
     return()=>window.removeEventListener('keydown',onKey);
-  },[view]);
+  },[]);
 
   const refresh=async()=>{
     const[
@@ -483,22 +484,11 @@ export default function Classroom(){
       {view==='notes'&&
         <ParentNotes {...workflow}/>
       }
-      {view==='emergency'&&<EmergencyRoll data={data} roomId={roomId} offline={offlineSnapshot||syncState==='Offline'} close={()=>setView('')}/>}
-      {view==='sync'&&<div className="sheet" role="dialog" aria-modal="true"><section><button type="button" className="close" onClick={()=>setView('')}>×</button><h2>Sync details</h2><p>{syncState}</p><p>Ordinary care records queue automatically during retryable outages. Medication and incident finalisation require a live connection.</p></section></div>}
-      {view==='help'&&<div className="workflow-workspace" role="dialog" aria-modal="true" aria-label="Classroom help"><section className="workflow-panel workflow-single"><header className="workflow-header"><h2>Classroom Help</h2><button type="button" className="close" onClick={()=>setView('')}>×</button></header><div className="workflow-body"><div className="workflow-details"><ClassroomHelp/></div></div><footer className="workflow-footer"><button type="button" className="minor" onClick={()=>setView('')}>Close</button></footer></section></div>}
+      {view==='emergency'&&<EmergencyRoll data={data} currentRoomId={roomId} classroom offline={offlineSnapshot||syncState==='Offline'} onClose={()=>setView('')}/>}
+      {view==='sync'&&<DismissibleOverlay onClose={()=>setView('')} label="Sync details" backdropClass="sheet" panelClass="sheet-panel"><button type="button" className="close" aria-label="Close sync details" onClick={()=>setView('')}>×</button><h2>Sync details</h2><p>{syncState}</p><p>Ordinary care records queue automatically during retryable outages. Medication and incident finalisation require a live connection.</p></DismissibleOverlay>}
+      {view==='help'&&<DismissibleOverlay onClose={()=>setView('')} label="Classroom help" backdropClass="workflow-workspace" panelClass="workflow-panel workflow-single"><header className="workflow-header"><h2>Classroom Help</h2><button type="button" className="close" onClick={()=>setView('')}>×</button></header><div className="workflow-body"><div className="workflow-details"><ClassroomHelp/></div></div><footer className="workflow-footer"><button type="button" className="minor" onClick={()=>setView('')}>Close</button></footer></DismissibleOverlay>}
     </main>
   );
-}
-
-export const sortEmergencyChildren=(items:any[],sort:'alphabetical'|'room_then_name',location:(child:any)=>string)=>[...items].sort((a,b)=>{const name=(child:any)=>`${child.preferred_name||child.first_name} ${child.last_name}`;const left=sort==='room_then_name'?`${location(a)} ${name(a)}`:name(a),right=sort==='room_then_name'?`${location(b)} ${name(b)}`:name(b);return left.localeCompare(right)});
-
-function EmergencyRoll({data,roomId,offline,close}:{data:Bootstrap;roomId:string;offline:boolean;close:()=>void}){
-  const[wholeCentre,setWholeCentre]=useState(false);
-  const confirmed=new Date(data.last_confirmed_at||Date.now()),stale=Date.now()-confirmed.getTime()>12*60*60*1000,settings=data.centre?.emergency_print||{columns:3,sort:'room_then_name',show_room:true};
-  const active=data.children.filter(c=>c.active!==false),currentRoom=data.rooms.find(room=>room.id===roomId)||data.rooms[0],roster=wholeCentre?active:active.filter(c=>c.room_id===currentRoom?.id||(c.present&&c.visiting_room_id===currentRoom?.id)),present=roster.filter(c=>c.present),absent=roster.filter(c=>!c.present);
-  const roomName=(id?:string|null)=>data.rooms.find(room=>room.id===id)?.name||'No room';
-  const section=(title:string,items:any[],location:(child:any)=>string)=>{const ordered=sortEmergencyChildren(items,settings.sort,location);return <section className="emergency-section"><h2>{title} ({items.length})</h2><div className="emergency-names" style={{gridTemplateColumns:`repeat(${settings.columns},minmax(0,1fr))`}}>{ordered.length?ordered.map(child=><p key={child.id}>☐ <b>{child.preferred_name||child.first_name} {child.last_name}</b> {settings.show_room&&<small>{location(child)}</small>}</p>):<p>None</p>}</div></section>};
-  return <div className="emergency-overlay" role="dialog" aria-modal="true" aria-label="Emergency roll"><section className="emergency-roll"><div className="no-print"><button type="button" className="close" onClick={close}>×</button></div><h1>{data.centre?.display_name||'Essentials Marked'} — Emergency roll</h1><p className="no-print"><button type="button" className={!wholeCentre?'active':''} onClick={()=>setWholeCentre(false)}>This room</button> <button type="button" className={wholeCentre?'active':''} onClick={()=>setWholeCentre(true)}>Whole centre</button></p>{offline&&<p className="offline-banner">OFFLINE — LAST KNOWN ROSTER</p>}{stale&&<p className="offline-banner">STALE — confirm against another source</p>}<p>{wholeCentre?'Whole centre':currentRoom?.name} · Generated {new Date().toLocaleString()} · last confirmed {confirmed.toLocaleString()}</p>{section('PRESENT / LAST-KNOWN PRESENT',present,child=>roomName(child.visiting_room_id||child.room_id))}{section('NOT MARKED PRESENT',absent,child=>roomName(child.room_id))}<button type="button" className="no-print" onClick={()=>print()}>Print emergency roll</button></section></div>
 }
 
 function Metric({

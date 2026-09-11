@@ -42,8 +42,3 @@ export function quickNavForRole(role?:string,parentContext=false){
   ] as Array<[string,string]>;
   return [['Classroom','/classroom']] as Array<[string,string]>;
 }
-
-export const settingsSections=[
-  {title:'Accounts',open:false},
-  {title:'Branding',open:false}
-]as const;

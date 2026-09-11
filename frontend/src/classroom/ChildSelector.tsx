@@ -7,6 +7,7 @@ import{
 import type{Child,Room}from'./types';
 import{ConfirmDialog}from'../admin/ConfirmDialog';
 import{ChildRosterIdentity}from'./ChildRosterIdentity';
+import{ClearableSearch}from'../ui/ClearableSearch';
 
 export const selectAllPhysical=(
   children:Child[],
@@ -86,13 +87,7 @@ export function ChildSelector({
   return (
     <section className="picker">
       <div className="picker-tools">
-        <input
-          ref={searchRef}
-          aria-label="Search children"
-          value={q}
-          placeholder="Search children"
-          onChange={e=>setQ(e.target.value)}
-        />
+        <ClearableSearch inputRef={searchRef} label="Search children" value={q} onChange={setQ}/>
 
         <button type="button" className={presentOnly?'active':'minor'} onClick={()=>setPresentOnly(value=>!value)}>Present</button>
 

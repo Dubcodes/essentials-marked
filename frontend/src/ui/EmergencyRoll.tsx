@@ -1,0 +1,19 @@
+import React,{useEffect,useState}from'react';
+import{DismissibleOverlay}from'./DismissibleOverlay';
+
+export type EmergencyPrintSettings={columns:2|3;sort:'alphabetical'|'room_then_name';show_room:boolean;orientation:'portrait'|'landscape';name_size:'standard'|'large'};
+
+export const sortEmergencyChildren=(items:any[],sort:EmergencyPrintSettings['sort'],location:(child:any)=>string)=>[...items].sort((a,b)=>{const name=(child:any)=>`${child.preferred_name||child.first_name} ${child.last_name}`;const left=sort==='room_then_name'?`${location(a)} ${name(a)}`:name(a),right=sort==='room_then_name'?`${location(b)} ${name(b)}`:name(b);return left.localeCompare(right)});
+
+export function EmergencyRoll({data,onClose,currentRoomId,classroom=false,offline=false}:{data:any;onClose:()=>void;currentRoomId?:string;classroom?:boolean;offline?:boolean}){
+  const[wholeCentre,setWholeCentre]=useState(!classroom);
+  const settings:EmergencyPrintSettings={columns:3,sort:'room_then_name',show_room:true,orientation:'portrait',name_size:'standard',...(data.centre?.emergency_print||{})};
+  useEffect(()=>{const style=document.createElement('style');style.dataset.emergencyOrientation='true';style.textContent=`@media print{@page{size:${settings.orientation}}}`;document.head.append(style);return()=>style.remove()},[settings.orientation]);
+  const confirmed=new Date(data.last_confirmed_at||Date.now()),stale=classroom&&Date.now()-confirmed.getTime()>12*60*60*1000;
+  const active=data.children.filter((child:any)=>child.active!==false),currentRoom=data.rooms.find((room:any)=>room.id===currentRoomId)||data.rooms[0];
+  const roster=wholeCentre?active:active.filter((child:any)=>child.room_id===currentRoom?.id||(child.present&&(child.visiting_room_id||child.physical_room_id)===currentRoom?.id));
+  const present=roster.filter((child:any)=>child.present),absent=roster.filter((child:any)=>!child.present);
+  const roomName=(id?:string|null)=>data.rooms.find((room:any)=>room.id===id)?.name||'No room';
+  const section=(title:string,items:any[],current:boolean)=>{const location=(child:any)=>roomName(current?(child.visiting_room_id||child.physical_room_id||child.room_id):child.room_id);const ordered=sortEmergencyChildren(items,settings.sort,location);return <section className="emergency-section"><h2>{title} ({items.length})</h2><div className="emergency-names" style={{gridTemplateColumns:`repeat(${settings.columns},minmax(0,1fr))`}}>{ordered.length?ordered.map((child:any)=><p key={child.id}>☐ <b>{child.preferred_name||child.first_name} {child.last_name}</b> {settings.show_room&&<small>{location(child)}</small>}</p>):<p>None</p>}</div></section>};
+  return <DismissibleOverlay onClose={onClose} label="Emergency roll" backdropClass="emergency-overlay" panelClass={`emergency-roll emergency-${settings.orientation} names-${settings.name_size}`}><div className="no-print"><button type="button" className="close" aria-label="Close Emergency roll" onClick={onClose}>×</button></div><h1>{data.centre?.display_name||data.centre?.name||'Essentials Marked'} — Emergency roll</h1>{classroom&&<p className="no-print"><button type="button" className={!wholeCentre?'active':''} onClick={()=>setWholeCentre(false)}>This room</button> <button type="button" className={wholeCentre?'active':''} onClick={()=>setWholeCentre(true)}>Whole centre</button></p>}{offline&&<p className="offline-banner">OFFLINE — LAST KNOWN ROSTER</p>}{stale&&<p className="offline-banner">STALE — confirm against another source</p>}<p>{classroom&&(wholeCentre?'Whole centre':currentRoom?.name+' · ')}Generated {new Date().toLocaleString()}{classroom&&<> · last confirmed {confirmed.toLocaleString()}</>}</p>{section(classroom?'PRESENT / LAST-KNOWN PRESENT':'PRESENT',present,true)}{section('NOT MARKED PRESENT',absent,false)}<button type="button" className="no-print" onClick={()=>print()}>Print emergency roll</button></DismissibleOverlay>;
+}

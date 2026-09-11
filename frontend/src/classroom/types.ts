@@ -32,7 +32,7 @@ export type Bootstrap={
   child_alerts?:{id:string;child_id:string;child_name:string;type:string;label:string}[];
   recent_visitors?:Record<string,string[]>;
   last_confirmed_at?:string;
-  centre?:{display_name?:string;secondary_text?:string;logo_url?:string|null;timezone?:string;emergency_print?:{columns:2|3;sort:'alphabetical'|'room_then_name';show_room:boolean}};
+  centre?:{display_name?:string;secondary_text?:string;logo_url?:string|null;timezone?:string;emergency_print?:{columns:2|3;sort:'alphabetical'|'room_then_name';show_room:boolean;orientation:'portrait'|'landscape';name_size:'standard'|'large'}};
 };
 
 export type WorkflowProps={

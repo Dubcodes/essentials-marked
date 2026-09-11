@@ -1,13 +1,14 @@
 import React,{useEffect,useMemo,useState}from'react';
 import{api}from'../api';
 import{useLiveReconciliation}from'../live';
-import AccountPassword from'../account/AccountPassword';
-import AccountsSettings from'../account/AccountsSettings';
 import FamiliesManager from'./FamiliesManager';
 import ActivityLog,{activityContext}from'./ActivityLog';
 import{formatCentreDateTime}from'../centre-time';
 import{ConfirmDialog}from'./ConfirmDialog';
-import{managementPagesForRole,settingsSections,type AdminPage}from'../account/role-ui';
+import{managementPagesForRole,type AdminPage}from'../account/role-ui';
+import{SettingsPage}from'./SettingsPage';
+import{EmergencyRoll}from'../ui/EmergencyRoll';
+import{ClearableSearch}from'../ui/ClearableSearch';
 
 type Page=AdminPage;
 
@@ -24,6 +25,7 @@ export default function AdminConsole(){
   const[pair,setPair]=useState<any>();
   const[pairState,setPairState]=useState('');
   const[seconds,setSeconds]=useState(0);
+  const[pairView,setPairView]=useState<'qr'|'words'>('qr');
   const[label,setLabel]=useState('Classroom tablet');
   const[deviceMode,setDeviceMode]=useState<'classroom'|'attendance'>('classroom');
   const[room,setRoom]=useState('');
@@ -103,7 +105,7 @@ export default function AdminConsole(){
       stopped=true;
       clearInterval(timer);
     };
-  },[pair?.id]);
+  },[pair?.id,pair?.expires_at]);
 
   if(!data){
     return(
@@ -152,6 +154,8 @@ export default function AdminConsole(){
         <small className={liveState==='Live'?'live-indicator':'live-indicator offline'}>
           {liveState}
         </small>
+
+        {isAdmin&&<button type="button" className="minor" onClick={()=>setPrinting(true)}>Emergency roll</button>}
 
         <button
           className="minor"
@@ -208,7 +212,7 @@ export default function AdminConsole(){
 
           {page==='Dashboard'&&
             <div className="dashboard-grid">
-              <section className="dashboard-section"><h2>Overview</h2><div className="cards">
+              <section className="dashboard-section dashboard-overview"><h2>Overview</h2><div className="cards">
                 <Card
                   value={present.length}
                   label="present now"
@@ -239,7 +243,7 @@ export default function AdminConsole(){
 
               </div></section>
 
-              <section className="dashboard-section"><h2>Needs attention</h2><div className="cards">
+              <section className="dashboard-section dashboard-attention"><h2>Needs attention</h2><div className="cards">
                 <Card value={(data.attendance_signature_issues||data.missing_sign_outs||[]).length} label="attendance evidence issues" onClick={()=>setPage('Dashboard')}/>
                 <Card
                   value={data.incident_drafts||0}
@@ -265,7 +269,6 @@ export default function AdminConsole(){
                 />
               </div>{(data.attendance_signature_issues||data.missing_sign_outs||[]).length>0&&<details className="attention-list"><summary>Children awaiting Parent attendance evidence</summary>{(data.attendance_signature_issues||data.missing_sign_outs).map((item:any)=><div className="person-row" key={item.attendance_id+'-'+(item.phase||'sign_out')}><span><b>{item.child_name}</b><small>{item.phase==='sign_in'?'Marked present':item.departed_at?'Departure recorded':'Open since'}: {formatCentreDateTime(item.phase==='sign_out'&&item.departed_at?item.departed_at:item.arrived_at,data.centre.timezone)}{item.room?' · '+item.room:''}</small></span><small>{item.status}</small></div>)}</details>}</section>
 
-              <section className="dashboard-section"><h2>Quick actions</h2><div className="inline-actions"><button onClick={()=>openClassroom(data.rooms[0]?.id)}>Open Classroom</button><button onClick={()=>setPage('Children')}>Children</button><button onClick={()=>setPage('Activity log')}>Activity log</button><button onClick={()=>setPage('Safety check')}>Start safety check</button>{isAdmin&&<button onClick={()=>setPrinting(true)}>Print emergency roll</button>}{isAdmin&&<button onClick={()=>setPage('Devices')}>Pair new tablet</button>}</div></section>
               <section className="dashboard-section dashboard-status"><h2>Operational status</h2><p><b>{liveState}</b> live reconciliation</p><p>{data.devices.filter((x:any)=>!x.revoked).length} active devices</p></section>
               <div className="dashboard-activity"><DashboardActivity timezone={data.centre.timezone} notice={notice} openAll={()=>setPage('Activity log')} openRecord={item=>{setActivityRecord(item);setPage('Activity log')}}/></div>
             </div>
@@ -354,6 +357,7 @@ export default function AdminConsole(){
                     )
                       .then((result:any)=>{
                         setPair(result);
+                        setPairView('qr');
                         setPairState(
                           'Waiting for tablet'
                         );
@@ -366,7 +370,7 @@ export default function AdminConsole(){
                   Pair new tablet
                 </button>
 
-                {pair&&pair.consumed_at&&<div className="pair-success" role="status"><h2>✓ Paired successfully</h2><p>{deviceMode==='attendance'?'Sign-in tablet':'Classroom tablet'} · {data.rooms.find((item:any)=>item.id===room)?.name}</p><button className="minor" onClick={()=>{setPair(undefined);setPairState('');setSeconds(0)}}>Pair another tablet</button></div>}
+                {pair&&pair.consumed_at&&<div className="pair-success" role="status"><h2>✓ Paired successfully</h2><p>{deviceMode==='attendance'?'Sign-in tablet':'Classroom tablet'} · {data.rooms.find((item:any)=>item.id===room)?.name}</p><button type="button" className="minor" onClick={()=>{setPair(undefined);setPairState('');setSeconds(0);setPairView('qr')}}>Pair another tablet</button></div>}
                 {pairingShowsChallenge(pair)&&
                   <>
                     <p>
@@ -374,17 +378,21 @@ export default function AdminConsole(){
                       remaining
                     </p>
 
-                    {pair.qr_data_url&&
+                    {pairView==='qr'&&pair.qr_data_url&&
                       <img
                         alt="Pairing QR code"
                         src={pair.qr_data_url}
                       />
                     }
 
+                    {pairView==='words'&&<div className="pairing-words" aria-label="Three-word pairing code">{String(pair.token).split('-').join(' ')}</div>}
+
                     <h2>
                       Separate challenge{' '}
                       {pair.challenge}
                     </h2>
+
+                    <button type="button" className="minor" onClick={()=>{if(pairView==='words'){setPairView('qr');return}if(pair.manual_revealed){setPairView('words');return}void api(`/admin/pairings/${pair.id}/manual-token`,{method:'POST'}).then((result:any)=>{setPair((value:any)=>({...value,...result}));setPairView('words')}).catch((error:any)=>notice(error.message))}}>{pairView==='qr'?'Show pairing words':'Show QR code'}</button>
 
                     <div className="inline-actions">
                       {pair.pairing_url&&
@@ -517,14 +525,14 @@ export default function AdminConsole(){
             </>
           }
 
-          {page==='Settings'&&<section className="settings-panels"><details><summary>My sign-in</summary><AccountPassword embedded/></details>{isAdmin&&<><details open={settingsSections[0].open}><summary>Accounts</summary><AccountsSettings/></details><Branding data={data} saved={async()=>{await load();notice('Settings saved')}}/></>}</section>}
+          {page==='Settings'&&<SettingsPage data={data} isAdmin={isAdmin} saved={async()=>{await load();notice('Settings saved')}}/>}
 
           {page==='Help'&&
             <Help demo={data.demo_mode}/>
           }
         </section>
       </div>
-      {printing&&<AdminEmergencyRoll data={data} close={()=>setPrinting(false)}/>}
+      {printing&&<EmergencyRoll data={data} onClose={()=>setPrinting(false)}/>}
     </main>
   );
 }
@@ -597,15 +605,6 @@ export function SafetyChecks({data,notice}:{data:any;notice:Notice}){
 }
 
 function SafetySummary({value,timezone}:{value:any;timezone:string}){return <div className="safety-summary"><p>Started: {formatCentreDateTime(value.started_at,timezone)}{value.completed_at&&<> · Completed: {formatCentreDateTime(value.completed_at,timezone)}</>}</p><p>Checked by: {value.checker}</p>{value.rooms.filter((room:any)=>room.checked_at).map((room:any)=><div className="person-row" key={room.room_id}><span><b>{room.room_name}</b><small>Checked {formatCentreDateTime(room.checked_at,timezone)} · Expected {room.expected_count} · Observed {room.observed_count}{room.note?' · '+room.note:''}</small></span><b>{room.match?'✓':'⚠'}</b></div>)}</div>}
-
-function AdminEmergencyRoll({data,close}:{data:any;close:()=>void}){
-  const active=data.children.filter((child:any)=>child.active!==false),present=active.filter((child:any)=>child.present),notPresent=active.filter((child:any)=>!child.present);
-  const settings=data.centre.emergency_print||{columns:3,sort:'room_then_name',show_room:true};
-  const room=(id:string)=>data.rooms.find((item:any)=>item.id===id)?.name||'No room';
-  const list=(title:string,children:any[],current:boolean)=><section className="emergency-section" style={{columnCount:settings.columns}}><h2>{title} ({children.length})</h2>{children.length?children.sort((a:any,b:any)=>{const left=settings.sort==='alphabetical'?`${a.first_name} ${a.last_name}`:`${room(current?(a.physical_room_id||a.room_id):a.room_id)} ${a.first_name} ${a.last_name}`,right=settings.sort==='alphabetical'?`${b.first_name} ${b.last_name}`:`${room(current?(b.physical_room_id||b.room_id):b.room_id)} ${b.first_name} ${b.last_name}`;return left.localeCompare(right)}).map((child:any)=><p key={child.id}>☐ <b>{child.preferred_name||child.first_name} {child.last_name}</b> {settings.show_room&&<small>{room(current?(child.physical_room_id||child.room_id):child.room_id)}</small>}</p>):<p>None</p>}</section>;
-  return <div className="emergency-overlay" role="dialog" aria-modal="true" aria-label="Print emergency roll"><section className="emergency-roll"><div className="no-print"><button className="close" onClick={close}>×</button></div><h1>{data.centre.display_name||data.centre.name} — Emergency roll</h1><p>Generated {new Date().toLocaleString()}</p>{list('PRESENT',present,true)}{list('NOT MARKED PRESENT',notPresent,false)}<button className="no-print" onClick={()=>print()}>Print emergency roll</button></section></div>;
-}
-
 
 function RoomsManager({
   data,
@@ -947,15 +946,7 @@ export function ChildrenManager({
         </div>
 
         <div className="inline-actions">
-          <input
-            className="manager-search"
-            aria-label="Search children"
-            placeholder="Search children…"
-            value={search}
-            onChange={e=>
-              setSearch(e.target.value)
-            }
-          />
+          <ClearableSearch className="manager-search" label="Search children" placeholder="Search children…" value={search} onChange={setSearch}/>
           <select aria-label="Filter children by room" value={roomFilter} onChange={event=>setRoomFilter(event.target.value)}><option value="">All rooms</option>{data.rooms.map((room:any)=><option key={room.id} value={room.id}>{room.name}</option>)}</select>
           <select aria-label="Filter children by status" value={statusFilter} onChange={event=>setStatusFilter(event.target.value)}><option value="">All status</option><option value="active">Active</option><option value="archived">Archived</option></select>
           <select aria-label="Filter children by presence" value={presenceFilter} onChange={event=>setPresenceFilter(event.target.value)}><option value="">All presence</option><option value="present">Present</option><option value="absent">Absent</option></select>
@@ -1273,7 +1264,7 @@ function ChildEditor({
         </p>
       }
 
-      {confirming&&<dialog open className="confirmation-dialog"><h3>Confirm child change</h3><p>{!active?'Archiving this Child removes them from normal active rosters but keeps historical records. ':' '}Enter your current account password to save this child’s details.</p><label>Current account password<input autoFocus type="password" autoComplete="current-password" value={accountPassword} onChange={event=>setAccountPassword(event.target.value)}/></label><div className="inline-actions"><button className="minor" onClick={()=>{setConfirming(false);setAccountPassword('')}}>Cancel</button><button disabled={!accountPassword||busy} onClick={()=>void save()}>{busy?'Saving…':'Confirm and save'}</button></div></dialog>}
+      <ConfirmDialog open={confirming} title="Confirm child change" message={`${!active?'Archiving this Child removes them from normal active rosters but keeps historical records. ':''}Enter your current account password to save this child’s details.`} confirmLabel={busy?'Saving…':'Confirm and save'} disabled={!accountPassword||busy} onCancel={()=>{setConfirming(false);setAccountPassword('')}} onConfirm={()=>void save()}><label>Current account password<input autoFocus type="password" autoComplete="current-password" value={accountPassword} onChange={event=>setAccountPassword(event.target.value)}/></label></ConfirmDialog>
       <ConfirmDialog open={deleting} title="Permanently delete child?" message="Historical records will not be cascaded. This is only available if the child has never been used; otherwise archive the child instead." confirmLabel="Delete child" disabled={!accountPassword} onCancel={()=>{setDeleting(false);setAccountPassword('')}} onConfirm={()=>void destroy()}><label>Current Admin password<input autoFocus type="password" autoComplete="current-password" value={accountPassword} onChange={event=>setAccountPassword(event.target.value)}/></label><p>Type the child name exactly as shown by editing the fields before deleting.</p></ConfirmDialog>
     </article>
   );
@@ -1329,15 +1320,7 @@ function StaffManager({
         </div>
 
         <div className="inline-actions">
-          <input
-            className="manager-search"
-            aria-label="Search teachers"
-            placeholder="Search teachers…"
-            value={search}
-            onChange={e=>
-              setSearch(e.target.value)
-            }
-          />
+          <ClearableSearch className="manager-search" label="Search teachers" placeholder="Search teachers…" value={search} onChange={setSearch}/>
 
           <button
               onClick={()=>{setAdding(true);setSelected(undefined)}}
@@ -1736,50 +1719,7 @@ function Table({
 }
 
 
-const timezoneNames:Record<string,string>={'Pacific/Auckland':'Auckland, New Zealand','Pacific/Chatham':'Chatham Islands, New Zealand','Australia/Sydney':'Sydney, Australia'};
-export const timezoneOffset=(zone:string,at=new Date())=>{const raw=new Intl.DateTimeFormat('en-NZ',{timeZone:zone,timeZoneName:'longOffset'}).formatToParts(at).find(part=>part.type==='timeZoneName')?.value||'GMT';const match=/GMT([+-])(\d{1,2})(?::(\d{2}))?/.exec(raw);return match?`UTC${match[1]}${String(match[2]).padStart(2,'0')}:${match[3]||'00'}`:'UTC+00:00'};
-export const centreTimezoneOptions=(current='Pacific/Auckland')=>{const fallback=['Pacific/Auckland','Pacific/Chatham','Australia/Sydney','Australia/Melbourne','Pacific/Fiji','UTC'];const supported=typeof(Intl as any).supportedValuesOf==='function'?(Intl as any).supportedValuesOf('timeZone') as string[]:fallback;return [...new Set([current,'Pacific/Auckland',...supported])].map(value=>({value,label:`${timezoneNames[value]||value.split('/').reverse().join(', ').replaceAll('_',' ')} — ${timezoneOffset(value)}`}));};
-
-export function Branding({data,saved}:{
-  data:any;
-  saved:()=>void|Promise<void>;
-}){
-  const[display_name,setName]=useState(data.centre.display_name||'');
-  const[secondary_text,setSecondary]=useState(data.centre.secondary_text||'');
-  const[timezone,setTimezone]=useState(data.centre.timezone||'Pacific/Auckland');
-  const[logo,setLogo]=useState(data.centre.logo_url),[busy,setBusy]=useState(false);
-  const[confirmBranding,setConfirmBranding]=useState(false);
-  const[printSettings,setPrintSettings]=useState<{columns:number;sort:string;show_room:boolean}>(data.centre.emergency_print||{columns:3,sort:'room_then_name',show_room:true});
-  const[operations,setOperations]=useState({parent_history_days:data.centre.parent_history_days||7,sleep_check_minutes:data.centre.sleep_check_minutes||10,attendance_relationship_required:data.centre.attendance_relationship_required!==false});
-  const timezones=useMemo(()=>centreTimezoneOptions(timezone),[timezone]);
-  const upload=async(file:File)=>{
-    setBusy(true);
-    try{
-      const body=new FormData();body.append('file',file);
-      const response=await fetch('/api/admin/branding/logo',{method:'POST',credentials:'include',body});
-      if(!response.ok)throw new Error((await response.json()).detail||'Logo upload failed');
-      const result=await response.json();
-      setLogo(`${result.logo_url}?v=${Date.now()}`);
-      await saved();
-    }finally{setBusy(false)}
-  };
-  return <>
-    <section className="settings-section">
-      <h2>Centre &amp; branding</h2>
-      <form className="settings-grid" onSubmit={event=>{event.preventDefault();setConfirmBranding(true)}}>
-        <label>Display name<input value={display_name} onChange={event=>setName(event.target.value)}/></label>
-        <label>Secondary text<input value={secondary_text} onChange={event=>setSecondary(event.target.value)}/></label>
-        <label>Centre timezone<select aria-label="Centre timezone" value={timezone} onChange={event=>setTimezone(event.target.value)}>{timezones.map(option=><option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-        <div className="settings-action"><button>Save centre &amp; branding</button></div>
-      </form>
-      <ConfirmDialog open={confirmBranding} title="Apply branding changes?" message="Apply these branding changes to the centre?" confirmLabel="Apply branding" onCancel={()=>setConfirmBranding(false)} onConfirm={()=>{setConfirmBranding(false);void api('/admin/branding',{method:'PATCH',body:JSON.stringify({display_name,secondary_text,timezone})}).then(saved);}}/>
-      <div className="logo-settings">{logo&&<img className="branding-preview" src={logo} alt="Current centre logo"/>}<label>Logo — PNG, JPEG, or WebP<input aria-label="Upload centre logo" disabled={busy} type="file" accept="image/png,image/jpeg,image/webp" onChange={event=>{const file=event.target.files?.[0];if(file)void upload(file)}}/></label>{logo&&<button className="danger minor" onClick={()=>void api('/admin/branding/logo',{method:'DELETE'}).then(()=>{setLogo(null);return saved()})}>Remove logo</button>}</div>
-    </section>
-    <section className="settings-section"><h2>Parent experience</h2><form className="settings-grid" onSubmit={event=>{event.preventDefault();void api('/admin/operational-settings',{method:'PATCH',body:JSON.stringify(operations)}).then(saved)}}><label>Parent history window<select value={operations.parent_history_days} onChange={event=>setOperations({...operations,parent_history_days:Number(event.target.value)})}>{[7,14,30,60,90].map(days=><option value={days} key={days}>{days} days</option>)}</select><small>How far back families can view records online.</small></label><label className="active-switch">Require relationship on Parent sign-in<input type="checkbox" role="switch" checked={operations.attendance_relationship_required} onChange={event=>setOperations({...operations,attendance_relationship_required:event.target.checked})}/><span>{operations.attendance_relationship_required?'Required':'Optional'}</span></label><div className="settings-action"><button>Save Parent settings</button></div></form></section>
-    <section className="settings-section"><h2>Sleep &amp; care</h2><form className="settings-grid" onSubmit={event=>{event.preventDefault();void api('/admin/operational-settings',{method:'PATCH',body:JSON.stringify(operations)}).then(saved)}}><label>Sleep check interval<select value={operations.sleep_check_minutes} onChange={event=>setOperations({...operations,sleep_check_minutes:Number(event.target.value)})}>{[5,6,7,8,9,10].map(minutes=><option value={minutes} key={minutes}>{minutes} minutes</option>)}</select><small>Safety checks must remain between 5 and 10 minutes.</small></label><div className="settings-action"><button>Save Sleep settings</button></div></form></section>
-    <section className="settings-section"><h2>Emergency roll / printing</h2><form className="emergency-settings-grid" onSubmit={event=>{event.preventDefault();void api('/admin/emergency-print-settings',{method:'PATCH',body:JSON.stringify(printSettings)}).then(saved)}}><label>Columns<select value={printSettings.columns} onChange={event=>setPrintSettings({...printSettings,columns:Number(event.target.value)})}><option value={2}>2</option><option value={3}>3</option></select></label><label>Sort<select value={printSettings.sort} onChange={event=>setPrintSettings({...printSettings,sort:event.target.value})}><option value="alphabetical">Alphabetical</option><option value="room_then_name">Room then name</option></select></label><label className="active-switch">Show room names on printed roll<input type="checkbox" role="switch" checked={printSettings.show_room} onChange={event=>setPrintSettings({...printSettings,show_room:event.target.checked})}/><span>{printSettings.show_room?'On':'Off'}</span></label><button>Save print settings</button></form></section>
-  </>;
-}
+export{Branding,centreTimezoneOptions,timezoneOffset}from'./SettingsPage';
 
 
 function Help({demo}:{demo:boolean}){

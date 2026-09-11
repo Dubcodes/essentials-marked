@@ -1,5 +1,5 @@
-import os
-from datetime import timedelta
+import os,hashlib,re
+from datetime import datetime,timedelta
 from zoneinfo import ZoneInfo
 
 os.environ['DATABASE_URL']='sqlite:///./test.db'
@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from app.db import Base,engine,SessionLocal
 from app.main import app,pwd,soften_parent_text,centre_local_datetime,audit_category,audit_activity_out,utc
-from app.models import Centre,Account,Room,Staff,Child,Parent,ParentChild,Attendance,Device,Signature,Audit,ParentNote,CentreSafetyCheck,CentreSafetyCheckRoom,now
+from app.models import Centre,Account,Room,Staff,Child,Parent,ParentChild,Attendance,Device,Pairing,Signature,Audit,ParentNote,CentreSafetyCheck,CentreSafetyCheckRoom,now
 
 def setup_020():
     Base.metadata.drop_all(engine);Base.metadata.create_all(engine);db=SessionLocal()
@@ -320,4 +320,49 @@ def test_direct_sleep_creation_marks_attendance_for_parent_signature_recovery_on
         assert prepared.status_code==200 and prepared.json()['late_sign_in'] is True
         prepared_audits=list(db.scalars(select(Audit).where(Audit.entity=='attendance',Audit.entity_id==prepared.json()['attendance_id'],Audit.action=='prepared_for_sleep')))
         assert len(prepared_audits)==1 and prepared_audits[0].after['signature_evidence_required'] is True
+    finally:db.close()
+
+def test_three_word_pairing_normalisation_ttls_and_hash_only_storage(monkeypatch):
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        monkeypatch.setenv('PAIRING_QR_TTL_SECONDS','90');monkeypatch.setenv('PAIRING_WORD_TTL_SECONDS','180')
+        client=TestClient(app);login(client);created_at=now();created=client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Words tablet','mode':'classroom'});assert created.status_code==200
+        value=created.json();words=value['token'].split('-');assert len(words)==3 and len(set(words))==3 and all(re.fullmatch('[a-z]+',word) for word in words)
+        pairing=db.get(Pairing,value['id']);assert pairing.token_hash==hashlib.sha256(value['token'].encode()).hexdigest() and value['token'] not in str(pairing.__dict__)
+        assert 85<=(utc(pairing.expires_at)-created_at).total_seconds()<=95 and f"token={value['token']}" in value['pairing_url']
+        first=client.post(f"/api/admin/pairings/{pairing.id}/manual-token");assert first.status_code==200;first_expiry=first.json()['expires_at']
+        assert 175<=(utc(datetime.fromisoformat(first_expiry))-now()).total_seconds()<=185
+        second=client.post(f"/api/admin/pairings/{pairing.id}/manual-token");assert second.status_code==200 and second.json()['expires_at']==first_expiry
+        reveals=list(db.scalars(select(Audit).where(Audit.entity=='pairing',Audit.entity_id==pairing.id,Audit.action=='manual_token_revealed')));assert len(reveals)==1 and value['token'] not in str(reveals[0].before)+str(reveals[0].after)
+        assert client.post('/api/device/pair',json={'token':' '.join(words).upper(),'challenge':'000'}).status_code==400
+        paired=client.post('/api/device/pair',json={'token':' '.join(words).upper(),'challenge':value['challenge']});assert paired.status_code==200
+        assert client.post('/api/device/pair',json={'token':value['token'],'challenge':value['challenge']}).status_code==400
+        assert client.post(f"/api/admin/pairings/{pairing.id}/manual-token").status_code==409
+        expired=client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Expired tablet'}).json();expired_row=db.get(Pairing,expired['id']);expired_row.expires_at=now()-timedelta(seconds=1);db.commit()
+        assert client.post(f"/api/admin/pairings/{expired_row.id}/manual-token").status_code==409
+        assert client.post('/api/device/pair',json={'token':'only two','challenge':'123'}).status_code==422
+    finally:db.close()
+
+def test_attendance_bootstrap_keeps_current_arrival_separate_from_old_recovery():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        old=require_attendance_evidence(db,Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=now()-timedelta(days=3,hours=2),departed_at=now()-timedelta(days=3,hours=1),recorded_by_staff_id=staff.id))
+        current=Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=now()-timedelta(hours=2),recorded_by_staff_id=staff.id);db.add(current);db.commit()
+        kiosk=attendance_client(room);wire=kiosk.get('/api/attendance/bootstrap').json();row=next(item for item in wire['children'] if item['id']==child.id)
+        assert wire['centre']['timezone']=='Pacific/Auckland' and row['attendance_id']==old.id and utc(datetime.fromisoformat(row['arrived_at']))==utc(old.arrived_at)
+        assert utc(datetime.fromisoformat(row['current_arrived_at']))==utc(current.arrived_at) and row['current_arrived_at']!=row['arrived_at']
+    finally:db.close()
+
+def test_emergency_print_presentation_settings_validate_persist_bootstrap_and_audit():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        client=TestClient(app);login(client);payload={'columns':2,'sort':'alphabetical','show_room':False,'orientation':'landscape','name_size':'large'}
+        saved=client.patch('/api/admin/emergency-print-settings',json=payload);assert saved.status_code==200 and saved.json()==payload
+        assert client.patch('/api/admin/emergency-print-settings',json={**payload,'orientation':'square'}).status_code==422
+        assert client.patch('/api/admin/emergency-print-settings',json={**payload,'name_size':'tiny'}).status_code==422
+        db.expire_all();assert centre.emergency_orientation=='landscape' and centre.emergency_name_size=='large'
+        assert client.get('/api/admin/bootstrap').json()['centre']['emergency_print']==payload
+        event=db.scalar(select(Audit).where(Audit.action=='emergency_print_updated'));assert event.before['orientation']=='portrait' and event.before['name_size']=='standard' and event.after==payload
+        classroom=TestClient(app);login(classroom);pair=classroom.post('/api/admin/pairings',json={'room_id':room.id,'label':'Classroom'}).json();classroom.post('/api/device/pair',json={'token':pair['token'],'challenge':pair['challenge']})
+        assert classroom.get('/api/classroom/bootstrap').json()['centre']['emergency_print']==payload
     finally:db.close()

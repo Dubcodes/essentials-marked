@@ -4,7 +4,7 @@ import{act}from'react';
 import{createRoot}from'react-dom/client';
 import{afterEach,describe,expect,it}from'vitest';
 import TeacherLanding from'./TeacherLanding';
-import{accountLandingForRole,managementPagesForRole,quickNavForRole,settingsSections}from'./role-ui';
+import{accountLandingForRole,managementPagesForRole,quickNavForRole}from'./role-ui';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT=true;
 afterEach(()=>{document.body.innerHTML=''});
@@ -48,9 +48,4 @@ describe('role-aware account UI',()=>{
     expect(host.textContent).not.toContain('Operations');
   });
 
-  it('keeps Settings accordions collapsed until requested',()=>{
-    expect(settingsSections).toEqual([
-      {title:'Accounts',open:false},{title:'Branding',open:false}
-    ]);
-  });
 });

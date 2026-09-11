@@ -1,6 +1,7 @@
 import React,{useEffect,useMemo,useState}from'react';
 import{api}from'../api';
 import{useLiveReconciliation}from'../live';
+import{DismissibleOverlay}from'../ui/DismissibleOverlay';
 
 type Child={
   id:string;
@@ -405,7 +406,6 @@ export default function ParentView(){
   const[relationships,setRelationships]=useState<any[]>([]);
   const[newRelationship,setNewRelationship]=useState('');
   const loadRelationships=()=>api('/parent/relationships').then(setRelationships).catch(()=>undefined);
-  useEffect(()=>{if(!signature)return;const close=(event:KeyboardEvent)=>{if(event.key==='Escape')setSignature(undefined)};window.addEventListener('keydown',close);return()=>window.removeEventListener('keydown',close)},[signature]);
   const openSignature=(id:string,purpose:string,meta:any)=>void api('/parent/attendance/'+id+'/signature?purpose='+purpose).then((result:any)=>setSignature({...result,...meta,purpose}));
 
   const reconcile=async()=>{
@@ -699,7 +699,7 @@ export default function ParentView(){
         <div className="person-list">{relationships.map(option=><div className="person-row" key={option.id}><span><b>{option.label}</b><small>{option.active?'Active':'Inactive'}</small></span><button className="minor" onClick={()=>{if(window.confirm(`${option.active?'Remove':'Restore'} ${option.label} ${option.active?'from future sign-in choices?':'for future sign-in choices?'}`))void api(`/parent/relationships/${option.id}`,{method:'PATCH',body:JSON.stringify({active:!option.active})}).then(loadRelationships)}}>{option.active?'Remove':'Restore'}</button></div>)}</div>
         <div className="inline"><input aria-label="Add sign-in relationship" value={newRelationship} onChange={event=>setNewRelationship(event.target.value)} placeholder="Add relationship"/><button disabled={!newRelationship.trim()} onClick={()=>void api('/parent/relationships',{method:'POST',body:JSON.stringify({label:newRelationship.trim()})}).then(()=>{setNewRelationship('');return loadRelationships()})}>+ Add relationship</button></div>
       </details>
-      {signature&&<div className="modal-backdrop" role="presentation" onClick={()=>setSignature(undefined)}><section className="compact-signature-modal parent-signature-modal" role="dialog" aria-modal="true" aria-label="Signature" onClick={event=>event.stopPropagation()}><button className="close" aria-label="Close signature" onClick={()=>setSignature(undefined)}>×</button><h2>Signature</h2><img className="signature-view" src={signature.signature_data} alt="Parent attendance signature"/><h3>{signature.type}</h3><p>{new Date(signature.at||signature.signed_at).toLocaleString('en-NZ',{timeZone:data.timezone})}</p>{signature.relationship&&<p>Relationship: {signature.relationship}</p>}{signature.room&&<p>Room: {signature.room}</p>}</section></div>}
+      {signature&&<DismissibleOverlay onClose={()=>setSignature(undefined)} label="Signature" panelClass="compact-signature-modal parent-signature-modal"><button type="button" className="close" aria-label="Close signature" onClick={()=>setSignature(undefined)}>×</button><h2>Signature</h2><img className="signature-view" src={signature.signature_data} alt="Parent attendance signature"/><h3>{signature.type}</h3><p>{new Date(signature.at||signature.signed_at).toLocaleString('en-NZ',{timeZone:data.timezone})}</p>{signature.relationship&&<p>Relationship: {signature.relationship}</p>}{signature.room&&<p>Room: {signature.room}</p>}</DismissibleOverlay>}
 
       <div className="parent-actions">
         <a
