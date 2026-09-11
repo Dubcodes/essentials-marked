@@ -6,8 +6,8 @@ import{afterEach,describe,expect,it,vi}from'vitest';
 import ActivityLog,{activityContext,auditChanges}from'./admin/ActivityLog';
 import{Branding,centreTimezoneOptions,DashboardActivity,pairingShowsChallenge,SafetyChecks}from'./admin/AdminConsole';
 import{QrDialog}from'./admin/FamiliesManager';
-import AttendanceKiosk,{selectedRelationshipValue}from'./attendance/AttendanceKiosk';
-import ParentView,{attendanceDisplayTime}from'./parent/Parent';
+import AttendanceKiosk,{attendanceRowStatus,selectedRelationshipValue}from'./attendance/AttendanceKiosk';
+import ParentView,{attendanceDisplayTime,attendancePresentation}from'./parent/Parent';
 import{formatCentreDateTime}from'./centre-time';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT=true;
@@ -60,6 +60,12 @@ describe('0.2 settings and audit UX',()=>{
     expect(changed).toContain('Room: — → Harakeke');expect(changed).not.toContain(uuid);expect(detail.querySelector('pre')?.textContent).toContain(uuid);
   });
 
+  it('requests the actual recovery signature purpose from Activity',async()=>{
+    vi.useFakeTimers();vi.stubGlobal('EventSource',FakeEventSource as any);const urls:string[]=[];
+    vi.stubGlobal('fetch',vi.fn(async(url:any)=>{urls.push(String(url));return String(url).includes('/signature?')?json({signature_data:'data:image/png;base64,recovered',relationship:'Caregiver',signed_at:'2026-09-11T00:00:00Z'}):json({items:[{id:'attendance',source:'attendance',type:'attendance',activity:'Attendance',child_name:'Mila Chen',room:'Harakeke',teacher:'Sarah',effective_at:'2026-09-11T00:00:00Z',recorded_at:'2026-09-11T00:00:00Z',data:{arrived_at:'2026-09-11T00:00:00Z',departed_at:null},sign_in_signature_available:true,sign_in_signature_purpose:'parent_missing_sign_in_confirmation'}]})}));
+    const host=document.createElement('div');document.body.append(host);await act(async()=>createRoot(host).render(<ActivityLog data={{centre:{timezone:'Pacific/Auckland'},children:[],rooms:[],staff:[]}} isAdmin notice={()=>{}}/>));await act(async()=>vi.advanceTimersByTimeAsync(300));await act(async()=>{(host.querySelector('.person-row')as HTMLButtonElement).click()});await act(async()=>{([...host.querySelectorAll('button')].find(button=>button.textContent==='View sign-in signature')as HTMLButtonElement).click();await Promise.resolve()});expect(urls.some(url=>url.includes('purpose=parent_missing_sign_in_confirmation'))).toBe(true);
+  });
+
   it('offers departure correction only when Attendance is already closed',async()=>{
     vi.useFakeTimers();vi.stubGlobal('EventSource',FakeEventSource as any);
     for(const departed_at of [null,'2026-09-11T02:00:00Z']){
@@ -93,13 +99,46 @@ describe('0.2 kiosk and modal UX',()=>{
 
   it('requires an explicit DST occurrence and sends the selected second occurrence',async()=>{
     const requests:any[]=[];let correctionCalls=0;
-    vi.stubGlobal('fetch',vi.fn(async(url:any,init:any)=>{const value=String(url);if(value.includes('/attendance/bootstrap'))return json({centre:{display_name:'Demo',timezone:'Pacific/Auckland'},assigned_room:{id:'a',name:'Harakeke',accent:'#123456',icon:'🌿'},relationship_required:false,default_room_id:'a',children:[{id:'c',attendance_id:'old',arrived_at:'2026-04-04T00:00:00Z',first_name:'Mila',last_name:'Chen',room_id:'a',room_name:'Harakeke',present:true,stale_attendance:true}]});if(value.includes('/relationships/'))return json([]);if(value.includes('/missing-sign-out')){requests.push(JSON.parse(init.body));correctionCalls+=1;return correctionCalls===1?new Response(JSON.stringify({detail:'That local time occurs twice because of a daylight-saving clock change; choose first or second occurrence'}),{status:422,headers:{'Content-Type':'application/json'}}):json({id:'old'})}return json({})}));
+    vi.stubGlobal('fetch',vi.fn(async(url:any,init:any)=>{
+      const value=String(url);
+      if(value.includes('/attendance/bootstrap'))return json({centre:{display_name:'Demo',timezone:'Pacific/Auckland'},assigned_room:{id:'a',name:'Harakeke',accent:'#123456',icon:'🌿'},relationship_required:false,default_room_id:'a',children:[{id:'c',attendance_id:'old',arrived_at:'2026-04-04T00:00:00Z',first_name:'Mila',last_name:'Chen',room_id:'a',room_name:'Harakeke',present:true,stale_attendance:true}]});
+      if(value.includes('/relationships/'))return json([]);
+      if(value.includes('/missing-signature')){requests.push(JSON.parse(init.body));correctionCalls+=1;return correctionCalls===1?new Response(JSON.stringify({detail:'That local time occurs twice because of a daylight-saving clock change; choose first or second occurrence'}),{status:422,headers:{'Content-Type':'application/json'}}):json({id:'old',next_confirmation:null})}
+      return json({});
+    }));
     const host=document.createElement('div');document.body.append(host);await act(async()=>{createRoot(host).render(<AttendanceKiosk/>);await Promise.resolve()});await act(async()=>{([...host.querySelectorAll('button')].find(button=>button.textContent?.includes('Mila Chen'))as HTMLButtonElement).click();await Promise.resolve()});
     const fields=host.querySelectorAll('input');const date=[...fields].find(input=>input.type==='date')!,time=[...fields].find(input=>input.type==='time')!;await act(async()=>{enter(date,'2026-04-05');enter(time,'02:30')});
     const canvas=host.querySelector('canvas')! as any;canvas.setPointerCapture=()=>{};canvas.getContext=()=>({beginPath(){},moveTo(){},lineTo(){},stroke(){},clearRect(){}});canvas.toDataURL=()=> 'data:image/png;base64,signature';await act(async()=>{canvas.dispatchEvent(new MouseEvent('pointerdown',{bubbles:true,clientX:1,clientY:1}));canvas.dispatchEvent(new MouseEvent('pointermove',{bubbles:true,clientX:2,clientY:2}))});
     let confirm=[...host.querySelectorAll('button')].find(button=>button.textContent==='Confirm previous pickup')as HTMLButtonElement;expect(confirm.disabled).toBe(false);await act(async()=>{confirm.click();await Promise.resolve();await Promise.resolve()});
     const occurrence=host.querySelector('[aria-label="Choose occurrence"]')as HTMLSelectElement;expect(occurrence).toBeTruthy();expect(occurrence.value).toBe('');confirm=[...host.querySelectorAll('button')].find(button=>button.textContent==='Confirm previous pickup')as HTMLButtonElement;expect(confirm.disabled).toBe(true);
     await act(async()=>{Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value')!.set!.call(occurrence,'1');occurrence.dispatchEvent(new Event('change',{bubbles:true}))});expect(confirm.disabled).toBe(false);await act(async()=>{confirm.click();await Promise.resolve();await Promise.resolve()});expect(requests.at(-1).fold).toBe(1);
+  });
+
+  it('labels each attendance evidence state and prioritises recovery over the ordinary action',()=>{
+    expect(attendanceRowStatus({present:true,pending_attendance_confirmation:{phase:'sign_in'}})).toBe('Sign-in signature needed');
+    expect(attendanceRowStatus({present:false,pending_attendance_confirmation:{phase:'sign_out',needs_departure_time:false}})).toBe('Sign-out signature needed');
+    expect(attendanceRowStatus({present:true,pending_attendance_confirmation:{phase:'sign_out',needs_departure_time:true}})).toBe('Previous sign-out missing');
+  });
+
+  it('repairs a Teacher arrival before pickup and requires a newly drawn sign-out signature',async()=>{
+    const posts:any[]=[];const pending={attendance_id:'attendance',phase:'sign_in',arrived_at:'2026-09-10T20:47:00Z',departed_at:null,recorded_by:'Sarah T.',room_name:'Harakeke',needs_departure_time:false};
+    vi.stubGlobal('fetch',vi.fn(async(url:any,init:any={})=>{const value=String(url);if(value.includes('/attendance/bootstrap'))return json({centre:{display_name:'Demo',timezone:'Pacific/Auckland'},assigned_room:{id:'a',name:'Harakeke',accent:'#123456',icon:'🌿'},relationship_required:true,default_room_id:'a',children:[{id:'c',first_name:'Mila',last_name:'Chen',room_id:'a',room_name:'Harakeke',present:true,pending_attendance_confirmation:pending}]});if(value.includes('/relationships/'))return json(['Mother']);if(init.method==='POST'){posts.push({url:value,body:JSON.parse(init.body)});return json(value.includes('/missing-signature')?{id:'attendance',phase:'sign_in',next_confirmation:null}:{id:'attendance'})}return json({})}));
+    const host=document.createElement('div');document.body.append(host);await act(async()=>{createRoot(host).render(<AttendanceKiosk/>);await Promise.resolve()});expect(host.textContent).toContain('Sign-in signature needed');expect(host.textContent).toContain('Review');await act(async()=>{([...host.querySelectorAll('button')].find(button=>button.textContent?.includes('Mila Chen'))as HTMLButtonElement).click();await Promise.resolve()});expect(host.textContent).toContain('Sarah T.');expect(host.textContent).toContain('marked present at');
+    const prepareCanvas=()=>{const canvas=host.querySelector('canvas')! as any;canvas.setPointerCapture=()=>{};canvas.getContext=()=>({beginPath(){},moveTo(){},lineTo(){},stroke(){},clearRect(){}});canvas.toDataURL=()=>`data:image/png;base64,phase-${posts.length+1}`;return canvas};
+    let confirm=[...host.querySelectorAll('button')].find(button=>button.textContent==='Confirm previous sign-in')as HTMLButtonElement;expect(confirm.disabled).toBe(true);await act(async()=>{([...host.querySelectorAll('button')].find(button=>button.textContent==='Mother')as HTMLButtonElement).click();const canvas=prepareCanvas();canvas.dispatchEvent(new MouseEvent('pointerdown',{bubbles:true,clientX:1,clientY:1}));canvas.dispatchEvent(new MouseEvent('pointermove',{bubbles:true,clientX:2,clientY:2}))});expect(confirm.disabled).toBe(false);await act(async()=>{confirm.click();await Promise.resolve();await Promise.resolve()});
+    confirm=[...host.querySelectorAll('button')].find(button=>button.textContent==='Confirm sign out')as HTMLButtonElement;expect(confirm).toBeTruthy();expect(confirm.disabled).toBe(true);expect(posts[0].body.phase).toBe('sign_in');
+    await act(async()=>{([...host.querySelectorAll('button')].find(button=>button.textContent==='Mother')as HTMLButtonElement).click();const canvas=prepareCanvas();canvas.dispatchEvent(new MouseEvent('pointerdown',{bubbles:true,clientX:1,clientY:1}));canvas.dispatchEvent(new MouseEvent('pointermove',{bubbles:true,clientX:2,clientY:2}))});await act(async()=>{confirm.click();await Promise.resolve()});expect(posts[1].url).toContain('/attendance/kiosk');expect(posts[1].body.signature_data).not.toBe(posts[0].body.signature_data);
+  });
+
+  it('sequences both recovery phases for a closed Teacher attendance without pickup-time fields',async()=>{
+    const first={attendance_id:'attendance',phase:'sign_in',arrived_at:'2026-09-10T20:30:00Z',departed_at:'2026-09-11T03:50:00Z',recorded_by:'Michael N.',room_name:'Kōwhai',needs_departure_time:false};const second={...first,phase:'sign_out'};
+    vi.stubGlobal('fetch',vi.fn(async(url:any,init:any={})=>{const value=String(url);if(value.includes('/attendance/bootstrap'))return json({centre:{display_name:'Demo',timezone:'Pacific/Auckland'},assigned_room:{id:'a',name:'Harakeke',accent:'#123456',icon:'🌿'},relationship_required:false,default_room_id:'a',children:[{id:'c',first_name:'Theo',last_name:'Banks',room_id:'a',room_name:'Kōwhai',present:false,pending_attendance_confirmation:first}]});if(value.includes('/relationships/'))return json([]);if(value.includes('/missing-signature'))return json({id:'attendance',next_confirmation:JSON.parse(init.body).phase==='sign_in'?second:null});return json({})}));
+    const host=document.createElement('div');document.body.append(host);await act(async()=>{createRoot(host).render(<AttendanceKiosk/>);await Promise.resolve()});await act(async()=>{([...host.querySelectorAll('button')].find(button=>button.textContent?.includes('Theo Banks'))as HTMLButtonElement).click();await Promise.resolve()});const canvas=host.querySelector('canvas')! as any;canvas.setPointerCapture=()=>{};canvas.getContext=()=>({beginPath(){},moveTo(){},lineTo(){},stroke(){},clearRect(){}});canvas.toDataURL=()=> 'data:image/png;base64,first';await act(async()=>{canvas.dispatchEvent(new MouseEvent('pointerdown',{bubbles:true,clientX:1,clientY:1}));canvas.dispatchEvent(new MouseEvent('pointermove',{bubbles:true,clientX:2,clientY:2}))});await act(async()=>{([...host.querySelectorAll('button')].find(button=>button.textContent==='Confirm previous sign-in')as HTMLButtonElement).click();await Promise.resolve();await Promise.resolve()});expect(host.textContent).toContain('Sign-out signature needed');expect(host.textContent).toContain('Michael N.');expect(host.querySelector('input[type="date"]')).toBeNull();expect(([...host.querySelectorAll('button')].find(button=>button.textContent==='Confirm previous pickup')as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('uses recovery purposes in Parent attendance presentation',()=>{
+    const arrival=attendancePresentation('Drop off',{id:'a',staff:'Sarah T.',source:'classroom',sign_in_signature_available:true,sign_in_signature_purpose:'parent_missing_sign_in_confirmation',sign_in_relationship:'Caregiver'});expect(arrival.source).toBe('Teacher sign-in / Parent confirmed');expect(arrival.purpose).toBe('parent_missing_sign_in_confirmation');expect(arrival.staff).toBe('Sarah T.');
+    const pickup=attendancePresentation('Pick up',{id:'a',staff:'Michael N.',sign_out_signature_available:true,sign_out_signature_purpose:'parent_missing_sign_out_confirmation',sign_out_relationship:'Father'});expect(pickup.source).toBe('Teacher sign-out / Parent confirmed');expect(pickup.purpose).toBe('parent_missing_sign_out_confirmation');
   });
 
   it('keeps bounded QR content open for inside clicks and closes on backdrop or Escape',async()=>{

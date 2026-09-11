@@ -765,7 +765,7 @@ def test_device_attendance_kiosk_records_signer_and_signature_without_care_acces
         payload={'child_id':children[0].id,'room_id':room.id,'signer_name':'Demo Parent','relationship':'parent','signature_data':'data:image/png;base64,signature-evidence-014'}
         assert client.post('/api/attendance/kiosk',json={**payload,'action':'sign_in'}).status_code==200
         attendance=db.scalar(select(Attendance).where(Attendance.child_id==children[0].id));assert attendance.source=='parent_kiosk' and attendance.signer_name=='Demo Parent'
-        assert client.post('/api/attendance/kiosk',json={**payload,'action':'sign_out'}).status_code==200
+        assert client.post('/api/attendance/kiosk',json={**payload,'action':'sign_out','signature_data':'data:image/png;base64,separate-sign-out-evidence-014'}).status_code==200
         assert db.scalar(select(Signature).where(Signature.domain_type=='attendance')) is not None
     finally: db.close()
 

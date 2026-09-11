@@ -24,6 +24,11 @@ export type SleepSession={
   check_interval_minutes:number
 };
 
+export type SleepAction='put_down'|'fell_asleep'|'wake'|'wake_and_got_up'|'got_up';
+export const nextSleepActionForChild=(session?:SleepSession):SleepAction=>!session?'put_down':session.stale?'got_up':session.state==='settling'?'fell_asleep':session.state==='sleeping'?'wake':'got_up';
+export const sleepStateTone=(session?:SleepSession)=>!session?'':session.stale?'sleep-state-stale':`sleep-state-${session.state}`;
+export const sleepActionTone=(action:string)=>`sleep-action-${action.replaceAll('_','-')}`;
+
 export const sleepCounts=(sessions:SleepSession[],roomId:string)=>({
   settling:sessions.filter(s=>s.room_id===roomId&&s.state==='settling').length,
   sleeping:sessions.filter(s=>s.room_id===roomId&&s.state==='sleeping').length,
@@ -47,7 +52,7 @@ export function SleepWorkflow({
   ...props
 }:WorkflowProps&{
   check?:boolean;
-  initialAction?:'put_down'|'fell_asleep'|'wake'|'wake_and_got_up'|'got_up'
+  initialAction?:SleepAction
 }){
   const[sessions,setSessions]=useState<SleepSession[]>([]);
   const[selected,setSelected]=useState<string[]>([]);
@@ -74,10 +79,6 @@ export function SleepWorkflow({
     void load();
   },[]);
 
-  useEffect(()=>{
-    setSelected([]);
-  },[action]);
-
   const byChild=useMemo(
     ()=>Object.fromEntries(
       sessions.map(s=>[s.child_id,s])
@@ -92,7 +93,7 @@ export function SleepWorkflow({
     [props.data.rooms]
   );
 
-  const eligible=(child:Child)=>{
+  const eligibleFor=(child:Child,candidate=action)=>{
     const s:SleepSession|undefined=byChild[child.id];
     const sameRoom=!!s&&s.room_id===props.roomId;
 
@@ -103,9 +104,9 @@ export function SleepWorkflow({
         s.state==='sleeping';
     }
 
-    if(!child.present&&(action==='put_down'||action==='fell_asleep'))return true;
+    if(!child.present&&(candidate==='put_down'||candidate==='fell_asleep'))return true;
 
-    if(action==='put_down'){
+    if(candidate==='put_down'){
       return !s;
     }
 
@@ -113,27 +114,33 @@ export function SleepWorkflow({
       // A tired, physically present child can fall asleep without an
       // intermediate settling action. The server creates that session
       // atomically, so this remains safe for an offline/retry-prone tablet.
-      return action==='fell_asleep' && !s;
+      return candidate==='fell_asleep' && !s;
     }
 
     if(s.stale){
-      return action==='got_up';
+      return candidate==='got_up';
     }
 
-    if(action==='fell_asleep'){
+    if(candidate==='fell_asleep'){
       return s.state==='settling';
     }
 
-    if(action==='wake'||action==='wake_and_got_up'){
+    if(candidate==='wake'||candidate==='wake_and_got_up'){
       return s.state==='sleeping';
     }
 
-    if(action==='got_up'){
+    if(candidate==='got_up'){
       return true;
     }
 
     return false;
   };
+  const eligible=(child:Child)=>eligibleFor(child);
+  const selectForAction=(ids:string[])=>{
+    if(!check&&selected.length===0&&ids.length===1){const inferred=nextSleepActionForChild(byChild[ids[0]]);setAction(inferred);setSelected(ids);return}
+    setSelected(ids);
+  };
+  const chooseAction=(next:string)=>{setAction(next as SleepAction);setSelected([])};
 
   const reason=(child:Child)=>{
     const s:SleepSession|undefined=byChild[child.id];
@@ -247,7 +254,7 @@ export function SleepWorkflow({
           rooms={props.data.rooms}
           roomId={props.roomId}
           selected={selected}
-          setSelected={setSelected}
+          setSelected={selectForAction}
           onSelectionRequest={child=>{
             if(check||!['put_down','fell_asleep'].includes(action))return;
             const session:SleepSession|undefined=byChild[child.id],currentRoom=roomNames[props.roomId]||'this room';
@@ -255,9 +262,10 @@ export function SleepWorkflow({
             if(!child.present)return{title:'Child is not marked present',message:`${child.first_name} ${child.last_name} is not marked present. Mark ${child.first_name} present in ${currentRoom} and continue?`,confirmLabel:'Mark present and continue',confirm:async()=>{await api('/classroom/sleep/prepare',{method:'POST',body:JSON.stringify({client_id:operationId('sleep-prepare'),child_id:child.id,room_id:props.roomId,staff_id:props.staffId,effective_at:stableEffective(implicit,time)})});await props.refresh()}};
             if(!isPhysicallyInRoom(child,props.roomId))return{title:'Move child for sleep?',message:`${child.first_name} ${child.last_name} is currently in ${roomNames[child.visiting_room_id||child.room_id]||'another room'}. Move ${child.first_name} to ${currentRoom} for sleep?`,confirmLabel:`Move to ${currentRoom} and continue`,confirm:async()=>{await api('/classroom/sleep/prepare',{method:'POST',body:JSON.stringify({client_id:operationId('sleep-prepare'),child_id:child.id,room_id:props.roomId,staff_id:props.staffId,effective_at:stableEffective(implicit,time)})});await props.refresh()}};
           }}
-          filter={eligible}
+          filter={child=>!check&&selected.length===0?true:eligible(child)}
           eligibilityLabel={reason}
           stateLabel={state}
+          rowClassName={child=>sleepStateTone(byChild[child.id])}
           recentVisitorIds={props.data.recent_visitors?.[props.roomId]}
           bulkLabel={
             check
@@ -294,7 +302,8 @@ export function SleepWorkflow({
               'got_up'
             ]}
             value={action}
-            set={setAction}
+            set={chooseAction}
+            itemClassName={sleepActionTone}
           />
         )
       }

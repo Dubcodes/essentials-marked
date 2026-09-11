@@ -40,6 +40,7 @@ export function ChildSelector({
   filter,
   eligibilityLabel,
   stateLabel,
+  rowClassName,
   recentVisitorIds=[],
   bulkLabel='Select all present in this room',
   showBulkAction=true,
@@ -54,6 +55,7 @@ export function ChildSelector({
   filter?:(child:Child)=>boolean;
   eligibilityLabel?:(child:Child)=>string;
   stateLabel?:(child:Child)=>string;
+  rowClassName?:(child:Child)=>string;
   recentVisitorIds?:string[];
   bulkLabel?:string;
   showBulkAction?:boolean;
@@ -125,7 +127,7 @@ export function ChildSelector({
                 <button
                   type="button"
                   key={c.id}
-                  className={`${selected.includes(c.id)?'selected':''} ${filter&&!filter(c)?'ineligible':''}`}
+                  className={`${rowClassName?.(c)||''} ${selected.includes(c.id)?'selected':''} ${filter&&!filter(c)?'ineligible':''}`}
                   aria-disabled={filter&&!filter(c)}
                   onClick={()=>toggle(c)}
                 >

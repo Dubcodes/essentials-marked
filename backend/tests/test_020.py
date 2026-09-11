@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.db import Base,engine,SessionLocal
-from app.main import app,pwd,soften_parent_text,centre_local_datetime,audit_category,audit_activity_out
+from app.main import app,pwd,soften_parent_text,centre_local_datetime,audit_category,audit_activity_out,utc
 from app.models import Centre,Account,Room,Staff,Child,Parent,ParentChild,Attendance,Device,Signature,Audit,ParentNote,CentreSafetyCheck,CentreSafetyCheckRoom,now
 
 def setup_020():
@@ -67,7 +67,7 @@ def test_stale_attendance_parent_confirmation_preserves_arrival_evidence():
     db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
     try:
         kiosk=attendance_client(room);device=db.scalar(select(Device).where(Device.mode=='attendance'))
-        arrived=now()-timedelta(days=2);attendance=Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=arrived,source='parent_kiosk',device_id=device.id,signer_name='Original parent',signer_relationship='Mother');db.add(attendance);db.commit()
+        arrived=now()-timedelta(days=2);attendance=Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=arrived,source='parent_kiosk',device_id=device.id,signer_name='Original parent',signer_relationship='Mother');db.add(attendance);db.flush();db.add(Signature(centre_id=centre.id,parent_id=None,signer_name='Original parent',relationship='Mother',domain_type='attendance',domain_id=attendance.id,revision=1,purpose='kiosk_sign_in',signature_data='data:image/png;base64,original-sign-in'));db.commit()
         boot=kiosk.get('/api/attendance/bootstrap').json();row=next(item for item in boot['children'] if item['id']==child.id);assert row['stale_attendance'] is True and row['attendance_id']==attendance.id
         assert kiosk.post('/api/attendance/kiosk',json={'child_id':child.id,'room_id':room.id,'action':'sign_in','relationship':'Mother','signature_data':'data:image/png;base64,new-sign-in-blocked'}).status_code==409
         admin_client=TestClient(app);login(admin_client);attention=admin_client.get('/api/admin/bootstrap').json()['missing_sign_outs'];assert attention and attention[0]['attendance_id']==attendance.id
@@ -205,3 +205,68 @@ def test_missing_pickup_local_time_rejects_dst_gaps_and_requires_ambiguous_choic
     with pytest.raises(HTTPException,match='does not exist'):centre_local_datetime('2026-09-27T02:30','Pacific/Auckland')
     with pytest.raises(HTTPException,match='occurs twice'):centre_local_datetime('2026-04-05T02:30','Pacific/Auckland')
     assert centre_local_datetime('2026-04-05T02:30','Pacific/Auckland',0)!=centre_local_datetime('2026-04-05T02:30','Pacific/Auckland',1)
+
+def test_teacher_arrival_requires_parent_sign_in_recovery_before_pickup_and_keeps_attribution():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        arrived=now()-timedelta(hours=2);attendance=Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=arrived,recorded_by_staff_id=staff.id,source='classroom');db.add(attendance);db.commit()
+        kiosk=attendance_client(room);boot=next(item for item in kiosk.get('/api/attendance/bootstrap').json()['children'] if item['id']==child.id);pending=boot['pending_attendance_confirmation']
+        assert pending['phase']=='sign_in' and pending['recorded_by']=='Sarah T.' and pending['needs_departure_time'] is False
+        normal={'child_id':child.id,'room_id':room.id,'action':'sign_out','relationship':'Caregiver','signature_data':'data:image/png;base64,normal-pickup'}
+        assert kiosk.post('/api/attendance/kiosk',json=normal).status_code==409
+        recovery={'child_id':child.id,'attendance_id':attendance.id,'phase':'sign_in','relationship':'Caregiver','signature_data':'data:image/png;base64,arrival-confirmation'}
+        confirmed=kiosk.post('/api/attendance/missing-signature',json=recovery);assert confirmed.status_code==200 and confirmed.json()['next_confirmation'] is None
+        db.expire_all();saved=db.get(Attendance,attendance.id);assert utc(saved.arrived_at)==utc(arrived) and saved.recorded_by_staff_id==staff.id and saved.source=='classroom' and saved.device_id is None
+        evidence=db.scalar(select(Audit).where(Audit.action=='parent_confirmed_missing_sign_in'));assert evidence and 'signature' not in str(evidence.after).lower() and evidence.after['relationship']=='Caregiver'
+        assert kiosk.post('/api/attendance/kiosk',json={**normal,'signature_data':recovery['signature_data']}).status_code==409
+        assert kiosk.post('/api/attendance/kiosk',json=normal).status_code==200
+        purposes={row.purpose for row in db.scalars(select(Signature).where(Signature.domain_id==attendance.id))};assert purposes=={'parent_missing_sign_in_confirmation','kiosk_sign_out'}
+    finally:db.close()
+
+def test_normal_parent_sign_in_is_complete_without_recovery():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        kiosk=attendance_client(room);signed=kiosk.post('/api/attendance/kiosk',json={'child_id':child.id,'room_id':room.id,'action':'sign_in','relationship':'Mother','signature_data':'data:image/png;base64,normal-arrival'});assert signed.status_code==200
+        row=next(item for item in kiosk.get('/api/attendance/bootstrap').json()['children'] if item['id']==child.id)
+        assert row['present'] is True and row['pending_attendance_confirmation'] is None
+        signature=db.scalar(select(Signature).where(Signature.domain_id==signed.json()['id']));assert signature.purpose=='kiosk_sign_in'
+    finally:db.close()
+
+def test_closed_teacher_attendance_recovers_both_phases_in_order_with_fresh_signatures():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        arrived=now()-timedelta(hours=3);departed=now()-timedelta(hours=1);attendance=Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=arrived,departed_at=departed,recorded_by_staff_id=staff.id,source='classroom');db.add(attendance);db.commit();kiosk=attendance_client(room)
+        first=next(item for item in kiosk.get('/api/attendance/bootstrap').json()['children'] if item['id']==child.id)['pending_attendance_confirmation'];assert first['phase']=='sign_in'
+        shared={'child_id':child.id,'attendance_id':attendance.id,'relationship':'Mother','signature_data':'data:image/png;base64,first-phase'}
+        arrival=kiosk.post('/api/attendance/missing-signature',json={**shared,'phase':'sign_in'});assert arrival.status_code==200 and arrival.json()['next_confirmation']['phase']=='sign_out' and arrival.json()['next_confirmation']['needs_departure_time'] is False
+        assert kiosk.post('/api/attendance/missing-signature',json={**shared,'phase':'sign_out'}).status_code==409
+        pickup=kiosk.post('/api/attendance/missing-signature',json={**shared,'phase':'sign_out','signature_data':'data:image/png;base64,second-phase'});assert pickup.status_code==200 and pickup.json()['next_confirmation'] is None
+        db.expire_all();saved=db.get(Attendance,attendance.id);assert utc(saved.arrived_at)==utc(arrived) and utc(saved.departed_at)==utc(departed) and saved.recorded_by_staff_id==staff.id and saved.source=='classroom'
+        signatures=list(db.scalars(select(Signature).where(Signature.domain_id==attendance.id)));assert len(signatures)==2 and len({item.signature_data for item in signatures})==2
+        admin_client=TestClient(app);login(admin_client);assert admin_client.get('/api/admin/bootstrap').json()['attendance_signature_issues']==[]
+    finally:db.close()
+
+def test_recovery_evidence_flows_to_parent_activity_csv_and_scoped_viewers():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        attendance=Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=now()-timedelta(hours=2),departed_at=now()-timedelta(hours=1),recorded_by_staff_id=staff.id,source='classroom');db.add(attendance);db.flush()
+        db.add_all([Signature(centre_id=centre.id,parent_id=None,signer_name='Parent confirmation',relationship='Caregiver',domain_type='attendance',domain_id=attendance.id,revision=1,purpose='parent_missing_sign_in_confirmation',signature_data='data:image/png;base64,recovered-in'),Signature(centre_id=centre.id,parent_id=None,signer_name='Parent confirmation',relationship='Caregiver',domain_type='attendance',domain_id=attendance.id,revision=1,purpose='parent_missing_sign_out_confirmation',signature_data='data:image/png;base64,recovered-out')]);db.commit()
+        parent_client=TestClient(app);assert parent_client.post('/api/auth/parent/login',json={'login':'family','pin':'123456'}).status_code==200
+        day=parent_client.get(f'/api/parent/children/{child.id}/day').json()['attendance'][0];assert day['sign_in_signature_purpose']=='parent_missing_sign_in_confirmation' and day['sign_out_signature_purpose']=='parent_missing_sign_out_confirmation'
+        assert parent_client.get(f'/api/parent/attendance/{attendance.id}/signature?purpose=parent_missing_sign_in_confirmation').status_code==200
+        exported=parent_client.get(f'/api/parent/children/{child.id}/export').text;assert 'Teacher sign-in / Parent confirmed' in exported and 'Teacher sign-out / Parent confirmed' in exported and 'Caregiver,Yes' in exported
+        admin_client=TestClient(app);login(admin_client);activity=admin_client.get(f'/api/admin/activity?child_id={child.id}&type=attendance').json()['items'][0];assert activity['self_signed'] is False and activity['teacher']=='Sarah' and activity['sign_in_signature_purpose']=='parent_missing_sign_in_confirmation' and activity['sign_out_signature_purpose']=='parent_missing_sign_out_confirmation'
+        assert admin_client.get(f'/api/admin/activity/attendance/{attendance.id}/signature?purpose=parent_missing_sign_in_confirmation').status_code==200
+        unrelated=Parent(centre_id=centre.id,name='Other family',login='other-family',pin_hash=pwd.hash('654321'));db.add(unrelated);db.flush();db.add(ParentChild(parent_id=unrelated.id,child_id=absent.id));db.commit()
+        unrelated_client=TestClient(app);assert unrelated_client.post('/api/auth/parent/login',json={'login':'other-family','pin':'654321'}).status_code==200;assert unrelated_client.get(f'/api/parent/attendance/{attendance.id}/signature?purpose=parent_missing_sign_in_confirmation').status_code==404
+        other_client=TestClient(app);login(other_client,'other-admin');assert other_client.get(f'/api/admin/activity/attendance/{attendance.id}/signature?purpose=parent_missing_sign_in_confirmation').status_code==404
+        assert audit_category(Audit(entity='attendance',action='parent_confirmed_missing_sign_in'))=='management' and audit_category(Audit(entity='attendance',action='future_signature_action'))=='security'
+    finally:db.close()
+
+def test_ancient_unsigned_completed_attendance_does_not_block_current_kiosk_use():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        db.add(Attendance(centre_id=centre.id,child_id=child.id,room_id=room.id,arrived_at=now()-timedelta(days=20,hours=2),departed_at=now()-timedelta(days=20,hours=1),recorded_by_staff_id=staff.id,source='classroom'));db.commit();kiosk=attendance_client(room)
+        row=next(item for item in kiosk.get('/api/attendance/bootstrap').json()['children'] if item['id']==child.id);assert row['pending_attendance_confirmation'] is None
+        assert kiosk.post('/api/attendance/kiosk',json={'child_id':child.id,'room_id':room.id,'action':'sign_in','relationship':'Mother','signature_data':'data:image/png;base64,today-arrival'}).status_code==200
+    finally:db.close()

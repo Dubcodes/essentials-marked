@@ -15,6 +15,7 @@ import{Presence}from'./Presence';
 import{ParentNotes}from'./ParentNotes';
 import{ClassroomHelp}from'./ClassroomHelp';
 import type{Bootstrap,WorkflowProps}from'./types';
+import{FullscreenToggle}from'../FullscreenToggle';
 
 type View=
   'toileting'|
@@ -324,16 +325,7 @@ export default function Classroom(){
             {liveState}
           </em>
 
-          <button
-            className="minor"
-            title={wake}
-            onClick={()=>
-              document.documentElement
-                .requestFullscreen?.()
-            }
-          >
-            ⛶ Fullscreen
-          </button>
+          <span title={wake}><FullscreenToggle/></span>
         </div>
       </header>
 
@@ -492,8 +484,8 @@ export default function Classroom(){
         <ParentNotes {...workflow}/>
       }
       {view==='emergency'&&<EmergencyRoll data={data} roomId={roomId} offline={offlineSnapshot||syncState==='Offline'} close={()=>setView('')}/>}
-      {view==='sync'&&<div className="sheet" role="dialog" aria-modal="true"><section><button className="close" onClick={()=>setView('')}>×</button><h2>Sync details</h2><p>{syncState}</p><p>Ordinary care records queue automatically during retryable outages. Medication and incident finalisation require a live connection.</p></section></div>}
-      {view==='help'&&<div className="workflow-workspace" role="dialog" aria-modal="true" aria-label="Classroom help"><section className="workflow-panel workflow-single"><header className="workflow-header"><h2>Classroom Help</h2><button className="close" onClick={()=>setView('')}>×</button></header><div className="workflow-body"><div className="workflow-details"><ClassroomHelp/></div></div><footer className="workflow-footer"><button className="minor" onClick={()=>setView('')}>Close</button></footer></section></div>}
+      {view==='sync'&&<div className="sheet" role="dialog" aria-modal="true"><section><button type="button" className="close" onClick={()=>setView('')}>×</button><h2>Sync details</h2><p>{syncState}</p><p>Ordinary care records queue automatically during retryable outages. Medication and incident finalisation require a live connection.</p></section></div>}
+      {view==='help'&&<div className="workflow-workspace" role="dialog" aria-modal="true" aria-label="Classroom help"><section className="workflow-panel workflow-single"><header className="workflow-header"><h2>Classroom Help</h2><button type="button" className="close" onClick={()=>setView('')}>×</button></header><div className="workflow-body"><div className="workflow-details"><ClassroomHelp/></div></div><footer className="workflow-footer"><button type="button" className="minor" onClick={()=>setView('')}>Close</button></footer></section></div>}
     </main>
   );
 }
@@ -506,7 +498,7 @@ function EmergencyRoll({data,roomId,offline,close}:{data:Bootstrap;roomId:string
   const active=data.children.filter(c=>c.active!==false),currentRoom=data.rooms.find(room=>room.id===roomId)||data.rooms[0],roster=wholeCentre?active:active.filter(c=>c.room_id===currentRoom?.id||(c.present&&c.visiting_room_id===currentRoom?.id)),present=roster.filter(c=>c.present),absent=roster.filter(c=>!c.present);
   const roomName=(id?:string|null)=>data.rooms.find(room=>room.id===id)?.name||'No room';
   const section=(title:string,items:any[],location:(child:any)=>string)=>{const ordered=sortEmergencyChildren(items,settings.sort,location);return <section className="emergency-section"><h2>{title} ({items.length})</h2><div className="emergency-names" style={{gridTemplateColumns:`repeat(${settings.columns},minmax(0,1fr))`}}>{ordered.length?ordered.map(child=><p key={child.id}>☐ <b>{child.preferred_name||child.first_name} {child.last_name}</b> {settings.show_room&&<small>{location(child)}</small>}</p>):<p>None</p>}</div></section>};
-  return <div className="emergency-overlay" role="dialog" aria-modal="true" aria-label="Emergency roll"><section className="emergency-roll"><div className="no-print"><button className="close" onClick={close}>×</button></div><h1>{data.centre?.display_name||'Essentials Marked'} — Emergency roll</h1><p className="no-print"><button className={!wholeCentre?'active':''} onClick={()=>setWholeCentre(false)}>This room</button> <button className={wholeCentre?'active':''} onClick={()=>setWholeCentre(true)}>Whole centre</button></p>{offline&&<p className="offline-banner">OFFLINE — LAST KNOWN ROSTER</p>}{stale&&<p className="offline-banner">STALE — confirm against another source</p>}<p>{wholeCentre?'Whole centre':currentRoom?.name} · Generated {new Date().toLocaleString()} · last confirmed {confirmed.toLocaleString()}</p>{section('PRESENT / LAST-KNOWN PRESENT',present,child=>roomName(child.visiting_room_id||child.room_id))}{section('NOT MARKED PRESENT',absent,child=>roomName(child.room_id))}<button className="no-print" onClick={()=>print()}>Print emergency roll</button></section></div>
+  return <div className="emergency-overlay" role="dialog" aria-modal="true" aria-label="Emergency roll"><section className="emergency-roll"><div className="no-print"><button type="button" className="close" onClick={close}>×</button></div><h1>{data.centre?.display_name||'Essentials Marked'} — Emergency roll</h1><p className="no-print"><button type="button" className={!wholeCentre?'active':''} onClick={()=>setWholeCentre(false)}>This room</button> <button type="button" className={wholeCentre?'active':''} onClick={()=>setWholeCentre(true)}>Whole centre</button></p>{offline&&<p className="offline-banner">OFFLINE — LAST KNOWN ROSTER</p>}{stale&&<p className="offline-banner">STALE — confirm against another source</p>}<p>{wholeCentre?'Whole centre':currentRoom?.name} · Generated {new Date().toLocaleString()} · last confirmed {confirmed.toLocaleString()}</p>{section('PRESENT / LAST-KNOWN PRESENT',present,child=>roomName(child.visiting_room_id||child.room_id))}{section('NOT MARKED PRESENT',absent,child=>roomName(child.room_id))}<button type="button" className="no-print" onClick={()=>print()}>Print emergency roll</button></section></div>
 }
 
 function Metric({

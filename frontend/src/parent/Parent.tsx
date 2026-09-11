@@ -13,7 +13,7 @@ type Attendance={
   arrived_at?:string|null;
   departed_at?:string|null;
   room?:string|null;
-  source?:string|null;late_sign_in?:boolean;staff?:string|null;device?:string|null;relationship?:string|null;signature_available?:boolean;sign_in_relationship?:string|null;sign_out_relationship?:string|null;sign_in_signature_available?:boolean;sign_out_signature_available?:boolean;sign_out_signature_purpose?:'kiosk_sign_out'|'parent_missing_sign_out_confirmation'|null;
+  source?:string|null;late_sign_in?:boolean;staff?:string|null;sign_out_staff?:string|null;device?:string|null;relationship?:string|null;signature_available?:boolean;sign_in_relationship?:string|null;sign_out_relationship?:string|null;sign_in_signature_available?:boolean;sign_out_signature_available?:boolean;sign_in_signature_purpose?:'kiosk_sign_in'|'parent_missing_sign_in_confirmation'|null;sign_out_signature_purpose?:'kiosk_sign_out'|'parent_missing_sign_out_confirmation'|null;
 };
 
 type Sleep={
@@ -360,12 +360,12 @@ export const attendancePresentation=(type:'Drop off'|'Pick up',value:Attendance)
   const signIn=type==='Drop off';
   return{
     source:signIn
-      ?value.late_sign_in?'Teacher late sign-in':value.source==='parent_kiosk'?'Parent sign-in':value.source==='classroom'?'Teacher sign-in':value.source?.replaceAll('_',' ')||''
-      :value.sign_out_signature_available?'Parent sign-out':'',
+      ?value.sign_in_signature_purpose==='parent_missing_sign_in_confirmation'?'Teacher sign-in / Parent confirmed':value.late_sign_in?'Teacher late sign-in':value.source==='parent_kiosk'?'Parent sign-in':value.source==='classroom'?'Teacher sign-in':value.source?.replaceAll('_',' ')||''
+      :value.sign_out_signature_purpose==='parent_missing_sign_out_confirmation'?'Teacher sign-out / Parent confirmed':value.sign_out_signature_available?'Parent sign-out':'Teacher sign-out',
     relationship:signIn?(value.sign_in_relationship??value.relationship):value.sign_out_relationship,
-    staff:signIn?value.staff:null,
+    staff:signIn?value.staff:value.sign_out_signature_purpose==='parent_missing_sign_out_confirmation'?value.sign_out_staff:null,
     signatureAvailable:signIn?(value.sign_in_signature_available??value.signature_available):value.sign_out_signature_available,
-    purpose:signIn?'kiosk_sign_in' as const:(value.sign_out_signature_purpose||'kiosk_sign_out')
+    purpose:signIn?(value.sign_in_signature_purpose||'kiosk_sign_in'):(value.sign_out_signature_purpose||'kiosk_sign_out')
   };
 };
 
@@ -374,7 +374,7 @@ function AttendanceRow({
   value,onSignature,selectedDay,timezone
 }:{
   type:'Drop off'|'Pick up';
-  value?:Attendance|null;selectedDay:string;timezone:string;onSignature:(id:string,purpose:'kiosk_sign_in'|'kiosk_sign_out'|'parent_missing_sign_out_confirmation',meta:any)=>void;
+  value?:Attendance|null;selectedDay:string;timezone:string;onSignature:(id:string,purpose:'kiosk_sign_in'|'parent_missing_sign_in_confirmation'|'kiosk_sign_out'|'parent_missing_sign_out_confirmation',meta:any)=>void;
 }){
   const at=type==='Drop off'?value?.arrived_at:value?.departed_at;if(!value||!at)return null;
   const{source,relationship,staff,signatureAvailable,purpose}=attendancePresentation(type,value);

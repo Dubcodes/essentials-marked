@@ -240,7 +240,7 @@ export default function AdminConsole(){
               </div></section>
 
               <section className="dashboard-section"><h2>Needs attention</h2><div className="cards">
-                <Card value={(data.missing_sign_outs||[]).length} label="missing sign-outs" onClick={()=>setPage('Dashboard')}/>
+                <Card value={(data.attendance_signature_issues||data.missing_sign_outs||[]).length} label="attendance evidence issues" onClick={()=>setPage('Dashboard')}/>
                 <Card
                   value={data.incident_drafts||0}
                   label="incident drafts"
@@ -263,7 +263,7 @@ export default function AdminConsole(){
                     setPage('Data requests')
                   }
                 />
-              </div>{(data.missing_sign_outs||[]).length>0&&<details className="attention-list"><summary>Children awaiting Parent correction</summary>{data.missing_sign_outs.map((item:any)=><div className="person-row" key={item.attendance_id}><span><b>{item.child_name}</b><small>Signed in: {formatCentreDateTime(item.arrived_at,data.centre.timezone)}{item.room?' · '+item.room:''}</small></span><small>{item.status}</small></div>)}</details>}</section>
+              </div>{(data.attendance_signature_issues||data.missing_sign_outs||[]).length>0&&<details className="attention-list"><summary>Children awaiting Parent attendance evidence</summary>{(data.attendance_signature_issues||data.missing_sign_outs).map((item:any)=><div className="person-row" key={item.attendance_id+'-'+(item.phase||'sign_out')}><span><b>{item.child_name}</b><small>{item.phase==='sign_in'?'Marked present':item.departed_at?'Departure recorded':'Open since'}: {formatCentreDateTime(item.phase==='sign_out'&&item.departed_at?item.departed_at:item.arrived_at,data.centre.timezone)}{item.room?' · '+item.room:''}</small></span><small>{item.status}</small></div>)}</details>}</section>
 
               <section className="dashboard-section"><h2>Quick actions</h2><div className="inline-actions"><button onClick={()=>openClassroom(data.rooms[0]?.id)}>Open Classroom</button><button onClick={()=>setPage('Children')}>Children</button><button onClick={()=>setPage('Activity log')}>Activity log</button><button onClick={()=>setPage('Safety check')}>Start safety check</button>{isAdmin&&<button onClick={()=>setPrinting(true)}>Print emergency roll</button>}{isAdmin&&<button onClick={()=>setPage('Devices')}>Pair new tablet</button>}</div></section>
               <section className="dashboard-section dashboard-status"><h2>Operational status</h2><p><b>{liveState}</b> live reconciliation</p><p>{data.devices.filter((x:any)=>!x.revoked).length} active devices</p></section>
