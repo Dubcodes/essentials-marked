@@ -15,7 +15,7 @@ describe('role-aware account UI',()=>{
     expect(managementPagesForRole('admin')).toContain('Teachers');
     expect(managementPagesForRole('admin')).not.toContain('Staff');
     expect(managementPagesForRole('administration')).toEqual([
-      'Dashboard','Children','Families','Teachers','Activity log',
+      'Dashboard','Safety check','Children','Families','Teachers','Activity log',
       'Data requests','Settings','Help'
     ]);
     expect(managementPagesForRole('teacher')).toEqual([]);

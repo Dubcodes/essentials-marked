@@ -1,6 +1,6 @@
-"""Isolated PostgreSQL 16 trial probe; invoked only by test_postgres_integration."""
+"""Isolated PostgreSQL 15 release probe; invoked only by test_postgres_integration."""
 import os,uuid
-from sqlalchemy import create_engine,text
+from sqlalchemy import create_engine,inspect,text
 from sqlalchemy.engine import make_url
 from alembic.config import Config
 from alembic import command
@@ -10,7 +10,36 @@ admin_engine=create_engine(base_url,isolation_level='AUTOCOMMIT')
 with admin_engine.connect() as connection:connection.execute(text(f'CREATE SCHEMA "{schema}"'))
 url=make_url(base_url);query=dict(url.query);query['options']=f'-csearch_path={schema}';schema_url=str(url.set(query=query));os.environ['DATABASE_URL']=schema_url;os.environ['DEMO_SEED']='false'
 try:
-    config=Config('alembic.ini');config.set_main_option('sqlalchemy.url',schema_url.replace('%','%%'));command.upgrade(config,'head')
+    config=Config('alembic.ini');config.set_main_option('sqlalchemy.url',schema_url.replace('%','%%'))
+    command.upgrade(config,'0006')
+    with admin_engine.connect() as connection:
+        connection.execute(text(f"INSERT INTO \"{schema}\".centres (id,name) VALUES ('upgrade-centre','Existing centre')"))
+        connection.execute(text(f"INSERT INTO \"{schema}\".accounts (id,centre_id,email,password_hash) VALUES ('upgrade-account','upgrade-centre','existing@example.test','hash')"))
+        connection.execute(text(f"INSERT INTO \"{schema}\".devices (id,centre_id,label,created_at,last_active_at) VALUES ('upgrade-device','upgrade-centre','Existing tablet',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"))
+        connection.execute(text(f"INSERT INTO \"{schema}\".pairings (id,centre_id,label,token_hash,challenge,expires_at) VALUES ('upgrade-pairing','upgrade-centre','Existing pairing','hash','123456',CURRENT_TIMESTAMP)"))
+        connection.commit()
+    command.upgrade(config,'0008')
+    with admin_engine.connect() as connection:
+        row=connection.execute(text(f'SELECT login_id,email FROM "{schema}".accounts WHERE id=\'upgrade-account\'')).one()
+        assert row.login_id=='existing@example.test' and row.email=='existing@example.test'
+        connection.execute(text(f'UPDATE "{schema}".accounts SET email=NULL WHERE id=\'upgrade-account\''))
+        modes=connection.execute(text(f'SELECT d.mode,p.mode FROM "{schema}".devices d CROSS JOIN "{schema}".pairings p WHERE d.id=\'upgrade-device\' AND p.id=\'upgrade-pairing\'')).one()
+        assert tuple(modes)==('classroom','classroom')
+        connection.execute(text(f"INSERT INTO \"{schema}\".parents (id,centre_id,name,login,pin_hash) VALUES ('upgrade-parent','upgrade-centre','Existing parent','existing-parent','hash')"))
+        connection.execute(text(f"INSERT INTO \"{schema}\".parent_relationship_options (id,centre_id,parent_id,label,created_at) VALUES ('upgrade-relationship','upgrade-centre','upgrade-parent','Grandparent',CURRENT_TIMESTAMP)"))
+        connection.commit()
+    command.upgrade(config,'head')
+    with admin_engine.connect() as connection:
+        assert connection.execute(text(f'SELECT attendance_relationship_required FROM "{schema}".centres WHERE id=\'upgrade-centre\'')).scalar_one() is True
+        assert connection.execute(text(f'SELECT count(*) FROM "{schema}".parent_relationship_options WHERE id=\'upgrade-relationship\'')).scalar_one()==1
+    inspector=inspect(admin_engine)
+    check_tables={'centre_safety_checks','centre_safety_check_rooms'}
+    assert check_tables.issubset(set(inspector.get_table_names(schema=schema)))
+    assert {'ix_centre_safety_checks_centre_id'}.issubset({item['name'] for item in inspector.get_indexes('centre_safety_checks',schema=schema)})
+    assert {'ix_centre_safety_check_rooms_safety_check_id','ix_centre_safety_check_rooms_centre_id'}.issubset({item['name'] for item in inspector.get_indexes('centre_safety_check_rooms',schema=schema)})
+    assert len(inspector.get_foreign_keys('centre_safety_checks',schema=schema))==3
+    assert len(inspector.get_foreign_keys('centre_safety_check_rooms',schema=schema))==4
+    assert any(set(item.get('column_names') or ())=={'safety_check_id','room_id'} for item in inspector.get_unique_constraints('centre_safety_check_rooms',schema=schema))
     from fastapi.testclient import TestClient
     from app.main import app,pwd
     from app.db import SessionLocal

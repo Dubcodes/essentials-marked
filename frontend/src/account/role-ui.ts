@@ -1,5 +1,6 @@
 export const adminPages=[
   'Dashboard',
+  'Safety check',
   'Rooms',
   'Children',
   'Families',

@@ -4,13 +4,15 @@ import{useLiveReconciliation}from'../live';
 import AccountPassword from'../account/AccountPassword';
 import AccountsSettings from'../account/AccountsSettings';
 import FamiliesManager from'./FamiliesManager';
-import ActivityLog from'./ActivityLog';
+import ActivityLog,{activityContext}from'./ActivityLog';
+import{formatCentreDateTime}from'../centre-time';
 import{ConfirmDialog}from'./ConfirmDialog';
 import{managementPagesForRole,settingsSections,type AdminPage}from'../account/role-ui';
 
 type Page=AdminPage;
 
 type Notice=(message:string)=>void;
+export const pairingShowsChallenge=(pair:any)=>Boolean(pair&&!pair.consumed_at);
 
 export default function AdminConsole(){
   const[data,setData]=useState<any>();
@@ -77,8 +79,9 @@ export default function AdminConsole(){
       ).catch(()=>null);
 
       if(status?.consumed_at){
+        setPair((value:any)=>({...value,...status}));
         setPairState(
-          `Paired successfully to ${label}`
+          'Paired successfully'
         );
         stopped=true;
         void load();
@@ -237,6 +240,7 @@ export default function AdminConsole(){
               </div></section>
 
               <section className="dashboard-section"><h2>Needs attention</h2><div className="cards">
+                <Card value={(data.missing_sign_outs||[]).length} label="missing sign-outs" onClick={()=>setPage('Dashboard')}/>
                 <Card
                   value={data.incident_drafts||0}
                   label="incident drafts"
@@ -259,11 +263,11 @@ export default function AdminConsole(){
                     setPage('Data requests')
                   }
                 />
-              </div></section>
+              </div>{(data.missing_sign_outs||[]).length>0&&<details className="attention-list"><summary>Children awaiting Parent correction</summary>{data.missing_sign_outs.map((item:any)=><div className="person-row" key={item.attendance_id}><span><b>{item.child_name}</b><small>Signed in: {formatCentreDateTime(item.arrived_at,data.centre.timezone)}{item.room?' · '+item.room:''}</small></span><small>{item.status}</small></div>)}</details>}</section>
 
-              <section className="dashboard-section"><h2>Quick actions</h2><div className="inline-actions"><button onClick={()=>openClassroom(data.rooms[0]?.id)}>Open Classroom</button><button onClick={()=>setPage('Children')}>Children</button><button onClick={()=>setPage('Activity log')}>Activity log</button>{isAdmin&&<button onClick={()=>setPrinting(true)}>Print emergency roll</button>}{isAdmin&&<button onClick={()=>setPage('Devices')}>Pair new tablet</button>}</div></section>
+              <section className="dashboard-section"><h2>Quick actions</h2><div className="inline-actions"><button onClick={()=>openClassroom(data.rooms[0]?.id)}>Open Classroom</button><button onClick={()=>setPage('Children')}>Children</button><button onClick={()=>setPage('Activity log')}>Activity log</button><button onClick={()=>setPage('Safety check')}>Start safety check</button>{isAdmin&&<button onClick={()=>setPrinting(true)}>Print emergency roll</button>}{isAdmin&&<button onClick={()=>setPage('Devices')}>Pair new tablet</button>}</div></section>
               <section className="dashboard-section dashboard-status"><h2>Operational status</h2><p><b>{liveState}</b> live reconciliation</p><p>{data.devices.filter((x:any)=>!x.revoked).length} active devices</p></section>
-              <div className="dashboard-activity"><DashboardActivity notice={notice} openAll={()=>setPage('Activity log')} openRecord={item=>{setActivityRecord(item);setPage('Activity log')}}/></div>
+              <div className="dashboard-activity"><DashboardActivity timezone={data.centre.timezone} notice={notice} openAll={()=>setPage('Activity log')} openRecord={item=>{setActivityRecord(item);setPage('Activity log')}}/></div>
             </div>
           }
 
@@ -274,6 +278,8 @@ export default function AdminConsole(){
               notice={notice}
             />
           }
+
+          {page==='Safety check'&&<SafetyChecks data={data} notice={notice}/>}
 
           {page==='Children'&&
             <ChildrenManager
@@ -360,7 +366,8 @@ export default function AdminConsole(){
                   Pair new tablet
                 </button>
 
-                {pair&&
+                {pair&&pair.consumed_at&&<div className="pair-success" role="status"><h2>✓ Paired successfully</h2><p>{deviceMode==='attendance'?'Sign-in tablet':'Classroom tablet'} · {data.rooms.find((item:any)=>item.id===room)?.name}</p><button className="minor" onClick={()=>{setPair(undefined);setPairState('');setSeconds(0)}}>Pair another tablet</button></div>}
+                {pairingShowsChallenge(pair)&&
                   <>
                     <p>
                       {pairState} · {seconds}s
@@ -510,7 +517,7 @@ export default function AdminConsole(){
             </>
           }
 
-          {page==='Settings'&&<section className="settings-panels"><details><summary>My sign-in</summary><AccountPassword embedded/></details>{isAdmin&&<><details open={settingsSections[0].open}><summary>{settingsSections[0].title}</summary><AccountsSettings/></details><details open={settingsSections[1].open}><summary>{settingsSections[1].title}</summary><Branding data={data} saved={async()=>{await load();notice('Branding saved')}}/></details></>}</section>}
+          {page==='Settings'&&<section className="settings-panels"><details><summary>My sign-in</summary><AccountPassword embedded/></details>{isAdmin&&<><details open={settingsSections[0].open}><summary>Accounts</summary><AccountsSettings/></details><Branding data={data} saved={async()=>{await load();notice('Settings saved')}}/></>}</section>}
 
           {page==='Help'&&
             <Help demo={data.demo_mode}/>
@@ -563,12 +570,33 @@ function Card({
   );
 }
 
-function DashboardActivity({notice,openAll,openRecord}:{notice:Notice;openAll:()=>void;openRecord:(item:any)=>void}){
+export function DashboardActivity({timezone,notice,openAll,openRecord}:{timezone:string;notice:Notice;openAll:()=>void;openRecord:(item:any)=>void}){
   const[items,setItems]=useState<any[]>([]);
   const load=()=>api('/admin/activity?limit=10').then((result:any)=>setItems(result.items)).catch((error:any)=>notice(error.message));
   useEffect(()=>{void load()},[]);useLiveReconciliation(load);
-  return <section className="dashboard-section"><div className="manager-toolbar"><h2>Recent activity</h2><button className="minor" onClick={openAll}>View all activity</button></div><div className="person-list">{items.map(item=><button className="person-row" key={`${item.source}-${item.id}`} onClick={()=>openRecord(item)}><span><b>{item.activity||item.type}</b><small>{item.child_name||'Centre'} · {item.teacher||'No teacher'} · {item.room||'No room'}{item.corrected?' · corrected':''}</small></span><small>{new Date(item.effective_at).toLocaleString()}</small></button>)}</div></section>;
+  return <section className="dashboard-section"><div className="manager-toolbar"><h2>Recent activity</h2><button className="minor" onClick={openAll}>View all activity</button></div><div className="person-list">{items.map(item=><button className="person-row" key={`${item.source}-${item.id}`} onClick={()=>openRecord(item)}><span><b>{item.activity||item.type}</b><small>{activityContext(item)}{item.corrected?' · corrected':''}</small></span><small>{formatCentreDateTime(item.effective_at,timezone)}</small></button>)}</div></section>;
 }
+
+export function SafetyChecks({data,notice}:{data:any;notice:Notice}){
+  const[history,setHistory]=useState<any[]>([]),[current,setCurrent]=useState<any>(),[staffId,setStaffId]=useState(''),[pin,setPin]=useState(''),[observed,setObserved]=useState(0),[note,setNote]=useState(''),[reauthPin,setReauthPin]=useState('');
+  const load=()=>api('/admin/safety-checks').then((rows:any[])=>{setHistory(rows);setCurrent((value:any)=>value?rows.find(row=>row.id===value.id)||value:rows.find(row=>row.status==='open'))}).catch((error:any)=>notice(error.message));
+  useEffect(()=>{void load()},[]);
+  const next=current?.rooms?.find((room:any)=>!room.checked_at);
+  useEffect(()=>{if(next)setObserved(next.expected_count)},[next?.room_id,next?.expected_count]);
+  const start=async()=>{try{const result=await api('/admin/safety-checks',{method:'POST',body:JSON.stringify({staff_id:staffId,staff_pin:pin})});setPin('');setCurrent(result);await load()}catch(error:any){setPin('');notice(error.message)}};
+  const confirmRoom=async()=>{try{const result=await api('/admin/safety-checks/'+current.id+'/rooms/'+next.room_id,{method:'POST',body:JSON.stringify({expected_count:next.expected_count,observed_count:observed,note:note.trim()||null,staff_pin:reauthPin||null})});setNote('');setReauthPin('');setCurrent(result);await load()}catch(error:any){
+    notice(error.message);
+    if(error.status===409&&error.message==='The system count changed while this Room was being checked. Please recount.'){
+      setNote('');setReauthPin('');
+      try{const refreshed:any=await api('/admin/safety-checks/'+current.id);setCurrent(refreshed);setHistory(items=>items.map(item=>item.id===refreshed.id?refreshed:item));const refreshedNext=refreshed.rooms?.find((room:any)=>!room.checked_at);if(refreshedNext)setObserved(refreshedNext.expected_count)}catch(refreshError:any){notice(refreshError.message)}
+    }
+  }};
+  const complete=async()=>{try{const result=await api('/admin/safety-checks/'+current.id+'/complete',{method:'POST'});setCurrent(result);await load()}catch(error:any){notice(error.message)}};
+  const timezone=data.centre?.timezone||'Pacific/Auckland';
+  return <section className="safety-checks"><div className="manager-toolbar"><div><h2>Centre Safety Check</h2><p>Confirm physical head counts without changing Attendance.</p></div></div>{!current||current.status!=='open'?<section className="manager-editor safety-start"><h3>Start safety check</h3><label>Checker<select value={staffId} onChange={event=>setStaffId(event.target.value)}><option value="">Select active Staff</option>{data.staff.filter((staff:any)=>staff.active).map((staff:any)=><option value={staff.id} key={staff.id}>{staff.preferred_name||staff.first_name} {staff.last_name}</option>)}</select></label><label>Staff PIN<input type="password" inputMode="numeric" autoComplete="off" value={pin} onChange={event=>setPin(event.target.value.replace(/\D/g,'').slice(0,4))}/></label><button disabled={!staffId||pin.length!==4} onClick={()=>void start()}>Start safety check</button></section>:<section className="manager-editor safety-round"><header><div><h3>{current.checked_count} of {current.room_count} Rooms checked</h3><p>Checked by {current.checker}</p><p>Started {formatCentreDateTime(current.started_at,timezone)}</p></div><progress value={current.checked_count} max={current.room_count}/></header>{next?<div className="safety-room"><h2>{next.room_name}</h2><p>System expects: <b>{next.expected_count}</b></p><div className="count-stepper"><button aria-label="Decrease observed count" onClick={()=>setObserved(Math.max(0,observed-1))}>−</button><label>Observed now<input aria-label="Observed count" type="number" min={0} value={observed} onChange={event=>setObserved(Math.max(0,Number(event.target.value)))}/></label><button aria-label="Increase observed count" onClick={()=>setObserved(observed+1)}>+</button></div><details><summary>View expected children</summary><ul>{next.expected_children.map((child:any)=><li key={child.id}>{child.name}</li>)}</ul></details>{observed===next.expected_count?<p className="safety-match">✓ Count matches</p>:<div className="safety-mismatch"><h3>⚠ Count mismatch</h3><p>Expected: {next.expected_count} · Observed: {observed}</p><label>Investigation note<textarea value={note} onChange={event=>setNote(event.target.value)} required/></label><button className="minor" onClick={()=>setObserved(next.expected_count)}>Recount</button></div>}<label className="reauth-pin">PIN if resuming an older round<input type="password" inputMode="numeric" value={reauthPin} onChange={event=>setReauthPin(event.target.value.replace(/\D/g,'').slice(0,4))}/></label><button disabled={observed!==next.expected_count&&note.trim().length<3} onClick={()=>void confirmRoom()}>{observed===next.expected_count?'Confirm count':'Confirm mismatch'}</button></div>:<button onClick={()=>void complete()}>Complete safety check</button>}</section>}{current&&current.status==='completed'&&<SafetySummary value={current} timezone={timezone}/>}<section className="safety-history"><h3>Recent checks</h3>{history.filter(item=>item.status==='completed').map(item=><details key={item.id}><summary>{formatCentreDateTime(item.completed_at||item.started_at,timezone)} · {item.checker} · {item.has_mismatch?'⚠ Mismatch':'✓ Match'}</summary><SafetySummary value={item} timezone={timezone}/></details>)}{!history.length&&<p>No previous safety checks.</p>}</section></section>;
+}
+
+function SafetySummary({value,timezone}:{value:any;timezone:string}){return <div className="safety-summary"><p>Started: {formatCentreDateTime(value.started_at,timezone)}{value.completed_at&&<> · Completed: {formatCentreDateTime(value.completed_at,timezone)}</>}</p><p>Checked by: {value.checker}</p>{value.rooms.filter((room:any)=>room.checked_at).map((room:any)=><div className="person-row" key={room.room_id}><span><b>{room.room_name}</b><small>Checked {formatCentreDateTime(room.checked_at,timezone)} · Expected {room.expected_count} · Observed {room.observed_count}{room.note?' · '+room.note:''}</small></span><b>{room.match?'✓':'⚠'}</b></div>)}</div>}
 
 function AdminEmergencyRoll({data,close}:{data:any;close:()=>void}){
   const active=data.children.filter((child:any)=>child.active!==false),present=active.filter((child:any)=>child.present),notPresent=active.filter((child:any)=>!child.present);
@@ -968,7 +996,7 @@ export function ChildrenManager({
           <ChildEditor child={selected} rooms={data.rooms} reload={reload} notice={notice} canDelete={data.account?.role==='admin'}/>
           <h4>Linked families</h4>
           <div className="person-list">{selected.families?.length?selected.families.map((family:any)=><div className="person-row" key={family.id}><span><b>{family.name}</b><small>{family.login}</small></span><small>{family.active?'Active':'Inactive'}</small></div>):<p>No family login linked.</p>}</div>
-          <ChildHistory child={selected} notice={notice} openHistory={openHistory} openRecord={openRecord}/>
+          <ChildHistory child={selected} timezone={data.centre.timezone} notice={notice} openHistory={openHistory} openRecord={openRecord}/>
         </section>
       }
 
@@ -1026,10 +1054,10 @@ export function ChildrenManager({
   );
 }
 
-function ChildHistory({child,notice,openHistory,openRecord}:{child:any;notice:Notice;openHistory:(id:string)=>void;openRecord:(item:any)=>void}){
+function ChildHistory({child,timezone,notice,openHistory,openRecord}:{child:any;timezone:string;notice:Notice;openHistory:(id:string)=>void;openRecord:(item:any)=>void}){
   const[items,setItems]=useState<any[]>([]);
   useEffect(()=>{void api(`/admin/activity?child_id=${child.id}&limit=12`).then((result:any)=>setItems(result.items)).catch((error:any)=>notice(error.message))},[child.id]);
-  return <section className="child-history"><div className="manager-toolbar"><h4>Recent activity</h4><button className="minor" onClick={()=>openHistory(child.id)}>View full history</button></div>{items.map(item=><button className="person-row" key={`${item.source}-${item.id}`} onClick={()=>openRecord(item)}><span><b>{item.activity||item.type}</b><small>{item.teacher||'No teacher'} · {item.room||'No room'}{item.corrected?' · corrected':''}</small></span><small>{new Date(item.effective_at).toLocaleString()}</small></button>)}</section>;
+  return <section className="child-history"><div className="manager-toolbar"><h4>Recent activity</h4><button className="minor" onClick={()=>openHistory(child.id)}>View full history</button></div>{items.map(item=><button className="person-row" key={`${item.source}-${item.id}`} onClick={()=>openRecord(item)}><span><b>{item.activity||item.type}</b><small>{activityContext(item)}{item.corrected?' · corrected':''}</small></span><small>{formatCentreDateTime(item.effective_at,timezone)}</small></button>)}</section>;
 }
 
 
@@ -1708,160 +1736,49 @@ function Table({
 }
 
 
-function Branding({
-  data,
-  saved
-}:{
+const timezoneNames:Record<string,string>={'Pacific/Auckland':'Auckland, New Zealand','Pacific/Chatham':'Chatham Islands, New Zealand','Australia/Sydney':'Sydney, Australia'};
+export const timezoneOffset=(zone:string,at=new Date())=>{const raw=new Intl.DateTimeFormat('en-NZ',{timeZone:zone,timeZoneName:'longOffset'}).formatToParts(at).find(part=>part.type==='timeZoneName')?.value||'GMT';const match=/GMT([+-])(\d{1,2})(?::(\d{2}))?/.exec(raw);return match?`UTC${match[1]}${String(match[2]).padStart(2,'0')}:${match[3]||'00'}`:'UTC+00:00'};
+export const centreTimezoneOptions=(current='Pacific/Auckland')=>{const fallback=['Pacific/Auckland','Pacific/Chatham','Australia/Sydney','Australia/Melbourne','Pacific/Fiji','UTC'];const supported=typeof(Intl as any).supportedValuesOf==='function'?(Intl as any).supportedValuesOf('timeZone') as string[]:fallback;return [...new Set([current,'Pacific/Auckland',...supported])].map(value=>({value,label:`${timezoneNames[value]||value.split('/').reverse().join(', ').replaceAll('_',' ')} — ${timezoneOffset(value)}`}));};
+
+export function Branding({data,saved}:{
   data:any;
   saved:()=>void|Promise<void>;
 }){
-  const[display_name,setName]=useState(
-    data.centre.display_name||''
-  );
-  const[secondary_text,setSecondary]=
-    useState(
-      data.centre.secondary_text||''
-    );
-  const[timezone,setTimezone]=useState(
-    data.centre.timezone||
-    'Pacific/Auckland'
-  );
-  const[logo,setLogo]=useState(
-    data.centre.logo_url
-  );
-  const[busy,setBusy]=useState(false);
+  const[display_name,setName]=useState(data.centre.display_name||'');
+  const[secondary_text,setSecondary]=useState(data.centre.secondary_text||'');
+  const[timezone,setTimezone]=useState(data.centre.timezone||'Pacific/Auckland');
+  const[logo,setLogo]=useState(data.centre.logo_url),[busy,setBusy]=useState(false);
   const[confirmBranding,setConfirmBranding]=useState(false);
   const[printSettings,setPrintSettings]=useState<{columns:number;sort:string;show_room:boolean}>(data.centre.emergency_print||{columns:3,sort:'room_then_name',show_room:true});
-
+  const[operations,setOperations]=useState({parent_history_days:data.centre.parent_history_days||7,sleep_check_minutes:data.centre.sleep_check_minutes||10,attendance_relationship_required:data.centre.attendance_relationship_required!==false});
+  const timezones=useMemo(()=>centreTimezoneOptions(timezone),[timezone]);
   const upload=async(file:File)=>{
     setBusy(true);
-
     try{
-      const body=new FormData();
-      body.append('file',file);
-
-      const response=await fetch(
-        '/api/admin/branding/logo',
-        {
-          method:'POST',
-          credentials:'include',
-          body
-        }
-      );
-
-      if(!response.ok){
-        throw new Error(
-          (await response.json()).detail||
-          'Logo upload failed'
-        );
-      }
-
+      const body=new FormData();body.append('file',file);
+      const response=await fetch('/api/admin/branding/logo',{method:'POST',credentials:'include',body});
+      if(!response.ok)throw new Error((await response.json()).detail||'Logo upload failed');
       const result=await response.json();
-
-      setLogo(
-        `${result.logo_url}?v=${Date.now()}`
-      );
-
+      setLogo(`${result.logo_url}?v=${Date.now()}`);
       await saved();
-    }finally{
-      setBusy(false);
-    }
+    }finally{setBusy(false)}
   };
-
-  return(
-    <section>
-      <form
-        onSubmit={e=>{
-          e.preventDefault();
-
-          setConfirmBranding(true);
-        }}
-      >
-        <label>
-          Display name
-          <input
-            value={display_name}
-            onChange={e=>
-              setName(e.target.value)
-            }
-          />
-        </label>
-
-        <label>
-          Secondary text
-          <input
-            value={secondary_text}
-            onChange={e=>
-              setSecondary(e.target.value)
-            }
-          />
-        </label>
-
-        <label>
-          Centre timezone
-          <input
-            value={timezone}
-            onChange={e=>
-              setTimezone(e.target.value)
-            }
-          />
-        </label>
-
-        <button>Save branding</button>
+  return <>
+    <section className="settings-section">
+      <h2>Centre &amp; branding</h2>
+      <form className="settings-grid" onSubmit={event=>{event.preventDefault();setConfirmBranding(true)}}>
+        <label>Display name<input value={display_name} onChange={event=>setName(event.target.value)}/></label>
+        <label>Secondary text<input value={secondary_text} onChange={event=>setSecondary(event.target.value)}/></label>
+        <label>Centre timezone<select aria-label="Centre timezone" value={timezone} onChange={event=>setTimezone(event.target.value)}>{timezones.map(option=><option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+        <div className="settings-action"><button>Save centre &amp; branding</button></div>
       </form>
       <ConfirmDialog open={confirmBranding} title="Apply branding changes?" message="Apply these branding changes to the centre?" confirmLabel="Apply branding" onCancel={()=>setConfirmBranding(false)} onConfirm={()=>{setConfirmBranding(false);void api('/admin/branding',{method:'PATCH',body:JSON.stringify({display_name,secondary_text,timezone})}).then(saved);}}/>
-
-      <form onSubmit={event=>{event.preventDefault();void api('/admin/emergency-print-settings',{method:'PATCH',body:JSON.stringify(printSettings)}).then(saved);}}>
-        <h2>Emergency print</h2>
-        <label>Columns<select value={printSettings.columns} onChange={event=>setPrintSettings({...printSettings,columns:Number(event.target.value)})}><option value={2}>2</option><option value={3}>3</option></select></label>
-        <label>Sort<select value={printSettings.sort} onChange={event=>setPrintSettings({...printSettings,sort:event.target.value})}><option value="alphabetical">Alphabetical</option><option value="room_then_name">Room then name</option></select></label>
-        <label className="active-switch">Show room<input type="checkbox" role="switch" checked={printSettings.show_room} onChange={event=>setPrintSettings({...printSettings,show_room:event.target.checked})}/><span>{printSettings.show_room?'On':'Off'}</span></label>
-        <button>Save emergency print settings</button>
-      </form>
-
-      <h2>Logo</h2>
-
-      {logo&&
-        <img
-          className="branding-preview"
-          src={logo}
-          alt="Current centre logo"
-        />
-      }
-
-      <label>
-        Upload PNG, JPEG, or WebP
-        <input
-          aria-label="Upload centre logo"
-          disabled={busy}
-          type="file"
-          accept="image/png,image/jpeg,image/webp"
-          onChange={e=>{
-            const file=e.target.files?.[0];
-
-            if(file){
-              void upload(file);
-            }
-          }}
-        />
-      </label>
-
-      {logo&&
-        <button
-          className="danger"
-          onClick={()=>void api(
-            '/admin/branding/logo',
-            {method:'DELETE'}
-          ).then(()=>{
-            setLogo(null);
-            return saved();
-          })}
-        >
-          Remove logo
-        </button>
-      }
+      <div className="logo-settings">{logo&&<img className="branding-preview" src={logo} alt="Current centre logo"/>}<label>Logo — PNG, JPEG, or WebP<input aria-label="Upload centre logo" disabled={busy} type="file" accept="image/png,image/jpeg,image/webp" onChange={event=>{const file=event.target.files?.[0];if(file)void upload(file)}}/></label>{logo&&<button className="danger minor" onClick={()=>void api('/admin/branding/logo',{method:'DELETE'}).then(()=>{setLogo(null);return saved()})}>Remove logo</button>}</div>
     </section>
-  );
+    <section className="settings-section"><h2>Parent experience</h2><form className="settings-grid" onSubmit={event=>{event.preventDefault();void api('/admin/operational-settings',{method:'PATCH',body:JSON.stringify(operations)}).then(saved)}}><label>Parent history window<select value={operations.parent_history_days} onChange={event=>setOperations({...operations,parent_history_days:Number(event.target.value)})}>{[7,14,30,60,90].map(days=><option value={days} key={days}>{days} days</option>)}</select><small>How far back families can view records online.</small></label><label className="active-switch">Require relationship on Parent sign-in<input type="checkbox" role="switch" checked={operations.attendance_relationship_required} onChange={event=>setOperations({...operations,attendance_relationship_required:event.target.checked})}/><span>{operations.attendance_relationship_required?'Required':'Optional'}</span></label><div className="settings-action"><button>Save Parent settings</button></div></form></section>
+    <section className="settings-section"><h2>Sleep &amp; care</h2><form className="settings-grid" onSubmit={event=>{event.preventDefault();void api('/admin/operational-settings',{method:'PATCH',body:JSON.stringify(operations)}).then(saved)}}><label>Sleep check interval<select value={operations.sleep_check_minutes} onChange={event=>setOperations({...operations,sleep_check_minutes:Number(event.target.value)})}>{[5,6,7,8,9,10].map(minutes=><option value={minutes} key={minutes}>{minutes} minutes</option>)}</select><small>Safety checks must remain between 5 and 10 minutes.</small></label><div className="settings-action"><button>Save Sleep settings</button></div></form></section>
+    <section className="settings-section"><h2>Emergency roll / printing</h2><form className="emergency-settings-grid" onSubmit={event=>{event.preventDefault();void api('/admin/emergency-print-settings',{method:'PATCH',body:JSON.stringify(printSettings)}).then(saved)}}><label>Columns<select value={printSettings.columns} onChange={event=>setPrintSettings({...printSettings,columns:Number(event.target.value)})}><option value={2}>2</option><option value={3}>3</option></select></label><label>Sort<select value={printSettings.sort} onChange={event=>setPrintSettings({...printSettings,sort:event.target.value})}><option value="alphabetical">Alphabetical</option><option value="room_then_name">Room then name</option></select></label><label className="active-switch">Show room names on printed roll<input type="checkbox" role="switch" checked={printSettings.show_room} onChange={event=>setPrintSettings({...printSettings,show_room:event.target.checked})}/><span>{printSettings.show_room?'On':'Off'}</span></label><button>Save print settings</button></form></section>
+  </>;
 }
 
 

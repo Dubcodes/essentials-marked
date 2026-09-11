@@ -911,7 +911,8 @@ def test_attendance_device_capability_minimal_bootstrap_and_cross_room_sign_in()
         pairing=client.post('/api/admin/pairings',json={'room_id':room.id,'label':'Sign-in tablet','mode':'attendance'}).json();paired_result=client.post('/api/device/pair',json={'token':pairing['token'],'challenge':pairing['challenge']})
         assert paired_result.status_code==200 and paired_result.json()['mode']=='attendance'
         boot=client.get('/api/attendance/bootstrap');assert boot.status_code==200
-        wire=boot.json();assert set(wire)=={'device_id','default_room_id','centre','assigned_room','children'}
+        wire=boot.json();assert set(wire)=={'device_id','default_room_id','centre','assigned_room','relationship_required','children'}
+        assert wire['assigned_room']=={'id':room.id,'name':'R','accent':'#176b5b','icon':'🌿'} and wire['relationship_required'] is True
         assert not ({'staff','notes','medications','incidents','alerts','accounts'}&set(wire))
         assert {item['id'] for item in wire['children']}=={c.id for c in children};expected_room=next(item['room_id'] for item in wire['children'] if item['id']==children[0].id);assert expected_room==enrolled_elsewhere.id
         assert client.get('/api/classroom/bootstrap').status_code==403

@@ -294,3 +294,4 @@ button:disabled{
 }
 
 .build-update{position:fixed;right:12px;bottom:12px;z-index:20;box-shadow:0 3px 12px #0003}.parent-first{display:grid;gap:14px;place-items:stretch}.parent-first a{text-align:center;padding:14px;border-radius:10px;text-decoration:none;font-weight:800}.primary-link{background:#176b5b;color:#fff}.secondary-link{background:#e7efeb;color:#17312d}
+.parent-relationships,.parent-help{margin:16px 20px;padding:14px 18px;border:1px solid #d7e2dc;border-radius:14px;background:#fff}.parent-relationships>summary,.parent-help>summary{cursor:pointer;font-weight:750}.parent-relationships>summary h2{display:inline;font-size:1.05rem}.parent-signature-modal{height:auto}.parent-signature-modal .signature-view{aspect-ratio:700/220;max-height:none;background:#fff}.parent-help p{max-width:820px}

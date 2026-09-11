@@ -12,7 +12,7 @@ from sqlalchemy import select, func, delete, or_, and_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .db import get_db
-from .models import Centre, Room, Staff, Account, Child, Parent, ParentChild, Event, Attendance, RoomVisit, Device, Pairing, Audit, ParentNote, ParentDataRequest, ChildAlert, AppSession, LoginAttempt, SleepSession, SleepCheck, DomainOperation, MedicationAuthority, MedicationReceipt, MedicationAdministration, Incident, IncidentBodyArea, IncidentAction, Signature, ParentRelationshipOption, now
+from .models import Centre, Room, Staff, Account, Child, Parent, ParentChild, Event, Attendance, RoomVisit, Device, Pairing, Audit, ParentNote, ParentDataRequest, ChildAlert, AppSession, LoginAttempt, SleepSession, SleepCheck, DomainOperation, MedicationAuthority, MedicationReceipt, MedicationAdministration, Incident, IncidentBodyArea, IncidentAction, Signature, ParentRelationshipOption, CentreSafetyCheck, CentreSafetyCheckRoom, now
 
 app = FastAPI(title='Essentials Marked', version='0.1.0')
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv('CORS_ORIGINS','http://localhost:5173').split(','), allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
@@ -203,6 +203,30 @@ def clean_domain_data(value):
     if isinstance(value,dict): return {k:clean_domain_data(v) for k,v in value.items() if 'pin' not in k.lower() and 'password' not in k.lower() and 'token' not in k.lower()}
     if isinstance(value,list): return [clean_domain_data(v) for v in value]
     return value
+PARENT_TEXT_REPLACEMENTS={'shit':'poo','piss':'pee','fuck':'fudge'}
+PARENT_TEXT_PATTERN=re.compile(r'(?<!\w)('+'|'.join(map(re.escape,PARENT_TEXT_REPLACEMENTS))+r')(?!\w)',re.IGNORECASE)
+def soften_parent_text(value:str|None):
+    if not value:return value
+    return PARENT_TEXT_PATTERN.sub(lambda match:PARENT_TEXT_REPLACEMENTS[match.group(0).casefold()],value)
+def is_stale_attendance(row:Attendance,centre:Centre,at:datetime|None=None):
+    return bool(row.arrived_at and row.departed_at is None and utc(row.arrived_at).astimezone(ZoneInfo(centre.timezone)).date()<(at or now()).astimezone(ZoneInfo(centre.timezone)).date())
+def centre_local_datetime(value:str,timezone_name:str,fold:int|None=None):
+    try:
+        local=datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(422,'Enter a valid pickup date and time')
+    if local.tzinfo is not None:raise HTTPException(422,'Enter pickup time in the Centre timezone')
+    zone=ZoneInfo(timezone_name);candidates=[]
+    for occurrence in (0,1):
+        aware=local.replace(tzinfo=zone,fold=occurrence);instant=aware.astimezone(timezone.utc)
+        if instant.astimezone(zone).replace(tzinfo=None)==local and all(existing[1]!=instant for existing in candidates):candidates.append((occurrence,instant))
+    if not candidates:raise HTTPException(422,'That local time does not exist because of a daylight-saving clock change')
+    if len(candidates)>1 and fold is None:raise HTTPException(422,'That local time occurs twice because of a daylight-saving clock change; choose first or second occurrence')
+    if fold is not None:
+        chosen=next((instant for occurrence,instant in candidates if occurrence==fold),None)
+        if chosen:return chosen
+        raise HTTPException(422,'Choose a valid daylight-saving occurrence')
+    return candidates[0][1]
 ALERT_LABELS={'nappies_low':'Nappies running low','nappies_out':'Nappies out','spare_clothes_needed':'Spare clothes needed','soiled_clothes':'Soiled clothes to take home'}
 def alert_out(row:ChildAlert,db:Session):
     child=db.get(Child,row.child_id)
@@ -286,7 +310,7 @@ class AttendanceKioskIn(BaseModel):
     room_id:str
     action:Literal['sign_in','sign_out']
     signer_name:str|None=Field(default=None,max_length=200)
-    relationship:str=Field(min_length=1,max_length=100)
+    relationship:str|None=Field(default=None,max_length=100)
     signature_data:str=Field(min_length=12,max_length=500000)
     effective_at:datetime|None=None
 class NoteIn(BaseModel): child_id: str; body: str=Field(min_length=1,max_length=1500)
@@ -312,6 +336,14 @@ class SignatureIn(BaseModel): signer_name:str=Field(min_length=2,max_length=200)
 class DataRequestIn(BaseModel): child_id:str; start_date:date; end_date:date; note:str|None=Field(default=None,max_length=1500)
 class DataRequestAction(BaseModel): status:Literal['new','in_progress','completed','declined']
 class BrandingIn(BaseModel): display_name:str|None=Field(default=None,max_length=200); secondary_text:str|None=Field(default=None,max_length=240); timezone:str|None=Field(default=None,max_length=80)
+class CentreOperationalSettingsIn(BaseModel):
+    parent_history_days:int=Field(ge=1,le=365)
+    sleep_check_minutes:int=Field(ge=5,le=10)
+    attendance_relationship_required:bool=True
+class MissingSignOutIn(BaseModel):
+    child_id:str; attendance_id:str; pickup_date:date; pickup_time:str=Field(pattern=r'^\d{2}:\d{2}$'); relationship:str|None=Field(default=None,max_length=100); signature_data:str=Field(min_length=12,max_length=500000); fold:Literal[0,1]|None=None
+class SafetyCheckStartIn(BaseModel): staff_id:str; staff_pin:str=Field(min_length=1,max_length=20)
+class SafetyCheckRoomIn(BaseModel): expected_count:int=Field(ge=0,le=500); observed_count:int=Field(ge=0,le=500); note:str|None=Field(default=None,max_length=500); staff_pin:str|None=Field(default=None,max_length=20)
 class FamilyCreateIn(BaseModel):
     name:str=Field(min_length=1,max_length=200); login:str=Field(min_length=1,max_length=100); pin:str=Field(pattern=r'^\d{6}$'); active:bool=True; child_ids:list[str]=Field(default_factory=list,max_length=50)
 class FamilyUpdateIn(BaseModel):
@@ -485,8 +517,19 @@ def admin_settings(a:Account=Depends(admin_only),db:Session=Depends(get_db)):
         'display_name':centre.display_name,
         'secondary_text':centre.secondary_text,
         'timezone':centre.timezone,
+        'parent_history_days':centre.parent_history_days,
+        'sleep_check_minutes':centre.sleep_check_minutes,
+        'attendance_relationship_required':centre.attendance_relationship_required,
         'account_count':db.scalar(select(func.count()).select_from(Account).where(Account.centre_id==a.centre_id))
     }
+
+@app.patch('/api/admin/operational-settings')
+def update_operational_settings(body:CentreOperationalSettingsIn,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
+    centre=db.get(Centre,a.centre_id)
+    before={'parent_history_days':centre.parent_history_days,'sleep_check_minutes':centre.sleep_check_minutes,'attendance_relationship_required':centre.attendance_relationship_required}
+    centre.parent_history_days=body.parent_history_days;centre.sleep_check_minutes=body.sleep_check_minutes;centre.attendance_relationship_required=body.attendance_relationship_required
+    after={'parent_history_days':centre.parent_history_days,'sleep_check_minutes':centre.sleep_check_minutes,'attendance_relationship_required':centre.attendance_relationship_required}
+    audit(db,a.centre_id,'centre',centre.id,'operational_settings_updated',before,after,a.id);db.commit();return after
 
 @app.get('/api/admin/accounts')
 def admin_accounts(a:Account=Depends(admin_only),db:Session=Depends(get_db)):
@@ -668,6 +711,12 @@ def bootstrap(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
         )
     )
 
+    missing_sign_outs=[]
+    for attendance_row in attendance.values():
+        if is_stale_attendance(attendance_row,c):
+            child=db.get(Child,attendance_row.child_id);attendance_room=db.get(Room,attendance_row.room_id) if attendance_row.room_id else None
+            missing_sign_outs.append({'attendance_id':attendance_row.id,'child_id':attendance_row.child_id,'child_name':' '.join(part for part in [child.preferred_name or child.first_name,child.last_name] if part) if child else 'Unknown child','arrived_at':attendance_row.arrived_at,'room':attendance_room.name if attendance_room else None,'status':'Awaiting Parent correction'})
+
     return {
         'account':account_out(a),
         'centre':{
@@ -676,6 +725,8 @@ def bootstrap(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
             'branch':c.branch,
             'parent_history_days':c.parent_history_days,
             'timezone':c.timezone,
+            'sleep_check_minutes':c.sleep_check_minutes,
+            'attendance_relationship_required':c.attendance_relationship_required,
             'display_name':c.display_name,
             'secondary_text':c.secondary_text,
             'logo_url':(
@@ -730,6 +781,7 @@ def bootstrap(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
             for x in requests
         ],
         'child_alerts':[alert_out(x,db) for x in db.scalars(select(ChildAlert).where(ChildAlert.centre_id==a.centre_id,ChildAlert.resolved_at.is_(None)).order_by(ChildAlert.created_at.desc()))],
+        'missing_sign_outs':missing_sign_outs,
         'demo_mode':(
             os.getenv('DEMO_SEED','false').lower()=='true'
         )
@@ -1436,6 +1488,76 @@ def pairing_status(pairing_id:str,a:Account=Depends(admin_only),db:Session=Depen
     p=db.scalar(select(Pairing).where(Pairing.id==pairing_id,Pairing.centre_id==a.centre_id))
     if not p:raise HTTPException(404,'Pairing not found')
     return {'id':p.id,'label':p.label,'expires_at':p.expires_at,'consumed_at':p.consumed_at,'device_id':p.device_id}
+
+def safety_expected_children(db:Session,centre_id:str,room_id:str):
+    attendances=list(db.scalars(select(Attendance).where(Attendance.centre_id==centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None))))
+    ids=[]
+    for attendance in attendances:
+        physical=attendance.visit_room_id if attendance.visit_room_id and attendance.visit_ended_at is None else attendance.room_id
+        if physical==room_id and attendance.child_id not in ids:ids.append(attendance.child_id)
+    children=[db.get(Child,child_id) for child_id in ids]
+    return [{'id':child.id,'name':' '.join(part for part in [child.preferred_name or child.first_name,child.last_name] if part)} for child in children if child and child.centre_id==centre_id]
+
+def safety_check_out(check:CentreSafetyCheck,db:Session,include_live:bool=True):
+    staff=db.get(Staff,check.staff_id);records=list(db.scalars(select(CentreSafetyCheckRoom).where(CentreSafetyCheckRoom.safety_check_id==check.id).order_by(CentreSafetyCheckRoom.checked_at)))
+    saved={record.room_id:record for record in records};rooms=list(db.scalars(select(Room).where(Room.centre_id==check.centre_id).order_by(Room.name)))
+    room_rows=[]
+    for room in rooms:
+        record=saved.get(room.id)
+        if record:room_rows.append({'id':record.id,'room_id':record.room_id,'room_name':record.room_name,'expected_count':record.expected_count,'observed_count':record.observed_count,'expected_children':record.expected_children,'checked_at':record.checked_at,'match':record.expected_count==record.observed_count,'note':record.note})
+        elif include_live:
+            expected=safety_expected_children(db,check.centre_id,room.id);room_rows.append({'room_id':room.id,'room_name':room.name,'expected_count':len(expected),'observed_count':len(expected),'expected_children':expected,'checked_at':None,'match':None,'note':None})
+    return {'id':check.id,'started_at':check.started_at,'completed_at':check.completed_at,'status':check.status,'staff_id':check.staff_id,'checker':((staff.preferred_name or staff.first_name)+' '+staff.last_name[:1]+'.') if staff else 'Unknown','rooms':room_rows,'checked_count':len(records),'room_count':len(rooms),'has_mismatch':any(record.expected_count!=record.observed_count for record in records)}
+
+@app.get('/api/admin/safety-checks')
+def safety_check_history(a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    checks=list(db.scalars(select(CentreSafetyCheck).where(CentreSafetyCheck.centre_id==a.centre_id).order_by(CentreSafetyCheck.started_at.desc()).limit(20)))
+    return [safety_check_out(check,db,include_live=check.status=='open') for check in checks]
+
+@app.post('/api/admin/safety-checks')
+def start_safety_check(body:SafetyCheckStartIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    staff=db.scalar(select(Staff).where(Staff.id==body.staff_id,Staff.centre_id==a.centre_id,Staff.active.is_(True)))
+    if not staff:raise HTTPException(404,'Choose an active checker')
+    verify_staff_pin(db,staff,body.staff_pin,'Checker PIN is incorrect')
+    check=CentreSafetyCheck(centre_id=a.centre_id,staff_id=staff.id,account_id=a.id,status='open');db.add(check);db.flush()
+    audit(db,a.centre_id,'centre_safety_check',check.id,'started',after={'staff_id':staff.id,'account_id':a.id},actor=a.id);db.commit()
+    return safety_check_out(check,db)
+
+@app.get('/api/admin/safety-checks/{check_id}')
+def get_safety_check(check_id:str,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    check=db.scalar(select(CentreSafetyCheck).where(CentreSafetyCheck.id==check_id,CentreSafetyCheck.centre_id==a.centre_id))
+    if not check:raise HTTPException(404,'Safety check not found')
+    return safety_check_out(check,db,include_live=check.status=='open')
+
+@app.post('/api/admin/safety-checks/{check_id}/rooms/{room_id}')
+def confirm_safety_check_room(check_id:str,room_id:str,body:SafetyCheckRoomIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    check=db.scalar(select(CentreSafetyCheck).where(CentreSafetyCheck.id==check_id,CentreSafetyCheck.centre_id==a.centre_id))
+    if not check:raise HTTPException(404,'Safety check not found')
+    if check.status!='open':raise HTTPException(409,'This safety check is complete')
+    room=db.scalar(select(Room).where(Room.id==room_id,Room.centre_id==a.centre_id))
+    if not room:raise HTTPException(404,'Room not found')
+    if db.scalar(select(CentreSafetyCheckRoom).where(CentreSafetyCheckRoom.safety_check_id==check.id,CentreSafetyCheckRoom.room_id==room.id)):raise HTTPException(409,'This Room count is already confirmed')
+    expected=safety_expected_children(db,a.centre_id,room.id)
+    if body.expected_count!=len(expected):raise HTTPException(409,'The system count changed while this Room was being checked. Please recount.')
+    if now()-utc(check.started_at)>timedelta(minutes=30):
+        staff=db.scalar(select(Staff).where(Staff.id==check.staff_id,Staff.centre_id==a.centre_id,Staff.active.is_(True)))
+        if not staff:raise HTTPException(409,'The original checker is no longer active. Start a new safety check.')
+        verify_staff_pin(db,staff,body.staff_pin,'Re-enter the checker PIN to continue this older safety check')
+    if body.observed_count!=len(expected) and len((body.note or '').strip())<3:raise HTTPException(422,'Add a short note before confirming a mismatch')
+    record=CentreSafetyCheckRoom(safety_check_id=check.id,centre_id=a.centre_id,room_id=room.id,room_name=room.name,expected_count=len(expected),observed_count=body.observed_count,expected_children=expected,staff_id=check.staff_id,note=(body.note or '').strip() or None)
+    db.add(record);db.flush();audit(db,a.centre_id,'centre_safety_check_room',record.id,'confirmed',after={'safety_check_id':check.id,'room_id':room.id,'expected_count':record.expected_count,'observed_count':record.observed_count,'match':record.expected_count==record.observed_count,'staff_id':check.staff_id},actor=a.id);db.commit()
+    return safety_check_out(check,db)
+
+@app.post('/api/admin/safety-checks/{check_id}/complete')
+def complete_safety_check(check_id:str,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    check=db.scalar(select(CentreSafetyCheck).where(CentreSafetyCheck.id==check_id,CentreSafetyCheck.centre_id==a.centre_id))
+    if not check:raise HTTPException(404,'Safety check not found')
+    if check.status!='open':return safety_check_out(check,db,include_live=False)
+    room_count=db.scalar(select(func.count()).select_from(Room).where(Room.centre_id==a.centre_id));checked=db.scalar(select(func.count()).select_from(CentreSafetyCheckRoom).where(CentreSafetyCheckRoom.safety_check_id==check.id))
+    if checked!=room_count:raise HTTPException(409,'Confirm every Room before completing the safety check')
+    check.status='completed';check.completed_at=now();audit(db,a.centre_id,'centre_safety_check',check.id,'completed',after={'staff_id':check.staff_id,'rooms_checked':checked},actor=a.id);db.commit()
+    return safety_check_out(check,db,include_live=False)
+
 def activity_event_out(event:Event,db:Session):
     child=db.get(Child,event.child_id);room=db.get(Room,event.room_id) if event.room_id else None;staff=db.get(Staff,event.performed_by_id) if event.performed_by_id else None
     return {'id':event.id,'source':'event','category':'classroom','type':event.type,'child_id':event.child_id,'child_name':(child.preferred_name or child.first_name) if child else None,'room_id':event.room_id,'room':room.name if room else None,'staff_id':event.performed_by_id,'teacher':(staff.preferred_name or staff.first_name) if staff else None,'effective_at':event.effective_at,'recorded_at':event.created_at,'data':clean_domain_data(event.data),'revision':event.revision,'corrected':event.revision>1,'correction_reason':db.scalar(select(Audit.reason).where(Audit.centre_id==event.centre_id,Audit.entity=='event',Audit.entity_id==event.id,Audit.action=='ordinary_corrected').order_by(Audit.created_at.desc())),'finalised':event.finalised}
@@ -1464,9 +1586,43 @@ def corrected_event_data(event:Event, correction:EventCorrectionData|None):
         updates['total_servings']=round(sum(updates['servings']),2)
     return {**event.data,**updates}
 
-def activity_names(db:Session,child_id:str|None=None,room_id:str|None=None,staff_id:str|None=None):
-    child=db.get(Child,child_id) if child_id else None; room=db.get(Room,room_id) if room_id else None; staff=db.get(Staff,staff_id) if staff_id else None
-    return {'child_name':(child.preferred_name or child.first_name) if child else None,'room':room.name if room else None,'teacher':(staff.preferred_name or staff.first_name) if staff else None}
+def activity_names(db:Session,child_id:str|None=None,room_id:str|None=None,staff_id:str|None=None,centre_id:str|None=None):
+    child=db.scalar(select(Child).where(Child.id==child_id,Child.centre_id==centre_id)) if child_id and centre_id else (db.get(Child,child_id) if child_id else None);room=db.scalar(select(Room).where(Room.id==room_id,Room.centre_id==centre_id)) if room_id and centre_id else (db.get(Room,room_id) if room_id else None);staff=db.scalar(select(Staff).where(Staff.id==staff_id,Staff.centre_id==centre_id)) if staff_id and centre_id else (db.get(Staff,staff_id) if staff_id else None)
+    return {'child_name':' '.join(part for part in [child.preferred_name or child.first_name,child.last_name] if part) if child else None,'room':room.name if room else None,'teacher':(staff.preferred_name or staff.first_name) if staff else None}
+
+def activity_device(db:Session,centre_id:str,device_id:str|None):
+    item=db.scalar(select(Device).where(Device.id==device_id,Device.centre_id==centre_id)) if device_id else None
+    return {'device_id':item.id if item else device_id,'device':item.label if item else None,'device_mode':item.mode if item else None}
+
+AUDIT_STAFF_ID_FIELDS={'staff_id','performed_by_id','recorded_by_staff_id','started_by_staff_id','ended_by_staff_id','opened_by_staff_id','closed_by_staff_id'}
+AUDIT_ACCOUNT_ID_FIELDS={'actor_id','account_id','viewer_account_id'}
+AUDIT_TECHNICAL_ONLY_FIELDS={'safety_check_id','attendance_id','note_id'}
+def audit_display_data(db:Session,centre_id:str,value:dict):
+    display={key:item for key,item in value.items() if key not in AUDIT_TECHNICAL_ONLY_FIELDS}
+    for key,identifier in value.items():
+        if key in AUDIT_TECHNICAL_ONLY_FIELDS:continue
+        if not identifier:continue
+        if key=='room_id':
+            row=db.scalar(select(Room).where(Room.id==identifier,Room.centre_id==centre_id));display[key]=row.name if row else 'Unavailable'
+        elif key=='child_id':
+            row=db.scalar(select(Child).where(Child.id==identifier,Child.centre_id==centre_id));display[key]=' '.join(part for part in [row.preferred_name or row.first_name,row.last_name] if part) if row else 'Unavailable'
+        elif key in AUDIT_STAFF_ID_FIELDS:
+            row=db.scalar(select(Staff).where(Staff.id==identifier,Staff.centre_id==centre_id));display[key]=' '.join(part for part in [row.preferred_name or row.first_name,row.last_name] if part) if row else 'Unavailable'
+        elif key=='device_id':
+            row=db.scalar(select(Device).where(Device.id==identifier,Device.centre_id==centre_id));display[key]=row.label if row else 'Unavailable'
+        elif key in AUDIT_ACCOUNT_ID_FIELDS:
+            row=db.scalar(select(Account).where(Account.id==identifier,Account.centre_id==centre_id));display[key]=row.login_id if row else 'Unavailable'
+    return display
+
+def audit_activity_out(item:Audit,db:Session):
+    after=clean_domain_data(item.after) or {};before=clean_domain_data(item.before) or {};values={**before,**after}
+    room_id=values.get('room_id');child_id=values.get('child_id');staff_id=values.get('staff_id') or values.get('performed_by_id');device_id=values.get('device_id')
+    if item.entity=='room' and not room_id:room_id=item.entity_id
+    if item.entity=='child' and not child_id:child_id=item.entity_id
+    if item.entity=='device' and not device_id:device_id=item.entity_id
+    actor=db.scalar(select(Account).where(Account.id==item.actor_id,Account.centre_id==item.centre_id)) if item.actor_id else None
+    names=activity_names(db,child_id,room_id,staff_id,item.centre_id);device_values=activity_device(db,item.centre_id,device_id)
+    return {'id':item.id,'source':'audit','category':audit_category(item),'type':item.action,'activity':f"{item.entity.replace('_',' ')} {item.action.replace('_',' ')}",'entity':item.entity,'entity_id':item.entity_id,'effective_at':item.created_at,'recorded_at':item.created_at,'data':after,'before':before,'display_data':audit_display_data(db,item.centre_id,after),'display_before':audit_display_data(db,item.centre_id,before),'reason':item.reason,'actor_id':item.actor_id,'actor':actor.login_id if actor else ('System' if not item.actor_id else None),'actor_kind':'account' if actor else 'system','corrected':False,**names,**device_values}
 
 def activity_correction(db:Session,centre_id:str,entity:str,entity_id:str):
     latest=db.scalar(select(Audit).where(Audit.centre_id==centre_id,Audit.entity==entity,Audit.entity_id==entity_id,Audit.action.like('%corrected')).order_by(Audit.created_at.desc()))
@@ -1496,7 +1652,8 @@ def activity_classroom_rows(db:Session,centre_id:str,limit:int,child_id:str|None
     if end:attendance_q=attendance_q.where(Attendance.arrived_at<end)
     for attendance in db.scalars(attendance_q.order_by(Attendance.arrived_at.desc()).limit(limit)):
         meta=activity_correction(db,centre_id,'attendance',attendance.id)
-        rows.append({'id':attendance.id,'source':'attendance','category':'classroom','type':'attendance','activity':'attendance','child_id':attendance.child_id,'room_id':attendance.room_id,'staff_id':attendance.recorded_by_staff_id,'effective_at':attendance.arrived_at,'recorded_at':attendance.arrived_at,'data':{'arrived_at':attendance.arrived_at.isoformat() if attendance.arrived_at else None,'departed_at':attendance.departed_at.isoformat() if attendance.departed_at else None},'revision':None,'finalised':True,**meta,**activity_names(db,attendance.child_id,attendance.room_id,attendance.recorded_by_staff_id)})
+        signatures={signature.purpose:signature for signature in db.scalars(select(Signature).where(Signature.centre_id==centre_id,Signature.domain_type=='attendance',Signature.domain_id==attendance.id))}
+        rows.append({'id':attendance.id,'source':'attendance','category':'classroom','type':'attendance','activity':'attendance','child_id':attendance.child_id,'room_id':attendance.room_id,'staff_id':attendance.recorded_by_staff_id,'effective_at':attendance.arrived_at,'recorded_at':attendance.arrived_at,'attendance_source':attendance.source,'self_signed':attendance.source=='parent_kiosk','relationship':(signatures.get('kiosk_sign_in').relationship if signatures.get('kiosk_sign_in') else attendance.signer_relationship),'sign_in_signature_available':'kiosk_sign_in' in signatures,'sign_out_relationship':signatures.get('kiosk_sign_out').relationship if signatures.get('kiosk_sign_out') else None,'sign_out_signature_available':'kiosk_sign_out' in signatures,'missing_sign_out_signature_available':'parent_missing_sign_out_confirmation' in signatures,'data':{'arrived_at':attendance.arrived_at.isoformat() if attendance.arrived_at else None,'departed_at':attendance.departed_at.isoformat() if attendance.departed_at else None},'revision':None,'finalised':True,**meta,**activity_names(db,attendance.child_id,attendance.room_id,attendance.recorded_by_staff_id),**activity_device(db,centre_id,attendance.device_id)})
     visit_q=select(RoomVisit).where(RoomVisit.centre_id==centre_id)
     if type and type!='room_visit':visit_q=visit_q.where(False)
     if child_id:visit_q=visit_q.where(RoomVisit.child_id==child_id)
@@ -1542,16 +1699,29 @@ def activity_classroom_rows(db:Session,centre_id:str,limit:int,child_id:str|None
     if end:incident_q=incident_q.where(Incident.effective_at<end)
     for incident in db.scalars(incident_q.order_by(Incident.effective_at.desc()).limit(limit)):
         rows.append({'id':incident.id,'source':'incident','category':'classroom','type':'incident','activity':'incident','child_id':incident.child_id,'room_id':incident.room_id,'staff_id':incident.created_by_id,'effective_at':incident.effective_at,'recorded_at':incident.created_at,'data':{'incident_type':incident.incident_type,'location':incident.location,'description':incident.description,'status':incident.status},'revision':incident.revision,'corrected':incident.revision>1,'finalised':incident.status=='finalised',**activity_names(db,incident.child_id,incident.room_id,incident.created_by_id)})
+    note_q=select(ParentNote).where(ParentNote.centre_id==centre_id)
+    if type and type!='parent_note':note_q=note_q.where(False)
+    if child_id:note_q=note_q.where(ParentNote.child_id==child_id)
+    if room_id or staff_id:note_q=note_q.where(False)
+    if start:note_q=note_q.where(ParentNote.created_at>=start)
+    if end:note_q=note_q.where(ParentNote.created_at<end)
+    for note in db.scalars(note_q.order_by(ParentNote.created_at.desc()).limit(limit)):
+        rows.append({'id':note.id,'source':'parent_note','category':'classroom','type':'parent_note','activity':'parent note','child_id':note.child_id,'room_id':None,'staff_id':None,'effective_at':note.created_at,'recorded_at':note.created_at,'data':{'body':soften_parent_text(note.body)},'original_available':True,'corrected':False,'finalised':True,**activity_names(db,note.child_id)})
     return rows
 
 def management_audit_condition():
     """The explicit allow-list; every other audit operation is Security."""
     return or_(
-        *[and_(Audit.entity==entity,Audit.action.in_(['created','updated','handled','ordinary_corrected','logo_removed','logo_uploaded'])) for entity in {'child','parent','staff','room','centre','data_request'}]
+        *[and_(Audit.entity==entity,Audit.action.in_(['created','updated','handled','ordinary_corrected','logo_removed','logo_uploaded'])) for entity in {'child','parent','staff','room','centre','data_request'}],
+        and_(Audit.entity=='centre',Audit.action=='operational_settings_updated'),
+        and_(Audit.entity=='centre_safety_check',Audit.action.in_(['started','completed'])),
+        and_(Audit.entity=='centre_safety_check_room',Audit.action=='confirmed'),
+        and_(Audit.entity=='attendance',Audit.action=='parent_confirmed_missing_sign_out')
     )
 
 def audit_category(item:Audit):
-    return 'management' if item.entity in {'child','parent','staff','room','centre','data_request'} and item.action in {'created','updated','handled','ordinary_corrected','logo_removed','logo_uploaded'} else 'security'
+    known_management=(item.entity in {'child','parent','staff','room','centre','data_request'} and item.action in {'created','updated','handled','ordinary_corrected','logo_removed','logo_uploaded'}) or (item.entity=='centre' and item.action=='operational_settings_updated') or (item.entity=='centre_safety_check' and item.action in {'started','completed'}) or (item.entity=='centre_safety_check_room' and item.action=='confirmed') or (item.entity=='attendance' and item.action=='parent_confirmed_missing_sign_out')
+    return 'management' if known_management else 'security'
 
 @app.get('/api/admin/activity')
 def activity(from_date:date|None=None,to_date:date|None=None,room_id:str|None=None,staff_id:str|None=None,child_id:str|None=None,type:str|None=None,category:Literal['classroom','management','security']|None=None,search:str|None=None,limit:int=100,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
@@ -1568,12 +1738,28 @@ def activity(from_date:date|None=None,to_date:date|None=None,room_id:str|None=No
         if end:q=q.where(Audit.created_at<end)
         management=management_audit_condition()
         q=q.where(management if category=='management' else ~management)
+        q=q.where(~and_(Audit.entity=='parent_note',Audit.action=='submitted'))
         audits=list(db.scalars(q.order_by(Audit.created_at.desc()).limit(candidate_limit)))
-        rows=[{'id':item.id,'source':'audit','category':audit_category(item),'type':item.action,'entity':item.entity,'effective_at':item.created_at,'recorded_at':item.created_at,'data':clean_domain_data(item.after),'before':clean_domain_data(item.before),'reason':item.reason,'actor_id':item.actor_id,'corrected':False} for item in audits]
+        rows=[audit_activity_out(item,db) for item in audits]
     if search:
-        needle=search.strip().lower();rows=[row for row in rows if needle in ' '.join(str(value) for value in [row.get('type'),row.get('activity'),row.get('child_name'),row.get('room'),row.get('teacher'),row.get('entity'),row.get('data'),row.get('reason')]).lower()]
+        needle=search.strip().lower();rows=[row for row in rows if needle in ' '.join(str(value) for value in [row.get('type'),row.get('activity'),row.get('child_name'),row.get('room'),row.get('teacher'),row.get('entity'),row.get('data'),row.get('display_data'),row.get('reason'),row.get('actor'),row.get('device')]).lower()]
     rows.sort(key=lambda row:row['effective_at'],reverse=True)
     return {'items':rows[:limit],'limit':limit}
+
+@app.get('/api/admin/activity/attendance/{attendance_id}/signature')
+def admin_attendance_signature(attendance_id:str,purpose:Literal['kiosk_sign_in','kiosk_sign_out','parent_missing_sign_out_confirmation']='kiosk_sign_in',a:Account=Depends(operations_account),db:Session=Depends(get_db)):
+    attendance=db.scalar(select(Attendance).where(Attendance.id==attendance_id,Attendance.centre_id==a.centre_id))
+    if not attendance:raise HTTPException(404,'Attendance not found')
+    signature=db.scalar(select(Signature).where(Signature.centre_id==a.centre_id,Signature.domain_type=='attendance',Signature.domain_id==attendance.id,Signature.purpose==purpose).order_by(Signature.signed_at.desc()))
+    if not signature:raise HTTPException(404,'Signature not found')
+    return {'id':signature.id,'signature_data':signature.signature_data,'relationship':soften_parent_text(signature.relationship),'signed_at':signature.signed_at,'purpose':signature.purpose}
+
+@app.get('/api/admin/parent-notes/{note_id}/original')
+def admin_parent_note_original(note_id:str,a:Account=Depends(admin_only),db:Session=Depends(get_db)):
+    note=db.scalar(select(ParentNote).where(ParentNote.id==note_id,ParentNote.centre_id==a.centre_id))
+    if not note:raise HTTPException(404,'Parent note not found')
+    audit(db,a.centre_id,'parent_note',note.id,'parent_note_original_viewed',after={'note_id':note.id,'child_id':note.child_id,'viewer_account_id':a.id},actor=a.id)
+    db.commit();return {'id':note.id,'body':note.body,'viewed_at':now()}
 
 @app.patch('/api/admin/activity/events/{event_id}')
 def correct_ordinary_event(event_id:str,body:OrdinaryCorrectionIn,a:Account=Depends(operations_account),db:Session=Depends(get_db)):
@@ -1784,12 +1970,12 @@ def classroom_bootstrap(d:Device=Depends(classroom_device),db:Session=Depends(ge
     return {'device_id':d.id,'default_room_id':d.default_room_id,'centre':{'id':centre.id,'name':centre.name,'display_name':centre.display_name,'secondary_text':centre.secondary_text,'logo_url':f'/api/branding/{centre.id}/logo' if centre.logo_path else None,'timezone':centre.timezone,'emergency_print':{'columns':centre.emergency_columns or 3,'sort':centre.emergency_sort or 'room_then_name','show_room':centre.emergency_show_room is not False}},'last_confirmed_at':now(),'rooms':[{'id':r.id,'name':r.name,'accent':r.accent,'icon':r.icon} for r in scoped(db,Room,d.centre_id)],'staff':[{'id':s.id,'name':(s.preferred_name or s.first_name)+' '+s.last_name[:1]+'.'} for s in scoped(db,Staff,d.centre_id) if s.active],'children':[public_child(c)|{'present':c.id in active_att,'arrived_at':active_att[c.id].arrived_at if c.id in active_att else None,'visiting_room_id':active_att[c.id].visit_room_id if c.id in active_att and active_att[c.id].visit_ended_at is None else None} for c in children],'recent_visitors':recent,'unread_notes':db.scalar(select(func.count()).select_from(ParentNote).where(ParentNote.centre_id==d.centre_id,ParentNote.read_at.is_(None))),'incident_drafts':db.scalar(select(func.count()).select_from(Incident).where(Incident.centre_id==d.centre_id,Incident.status=='draft')),'child_alerts':[alert_out(x,db) for x in db.scalars(select(ChildAlert).where(ChildAlert.centre_id==d.centre_id,ChildAlert.resolved_at.is_(None)).order_by(ChildAlert.created_at.desc()))]}
 @app.get('/api/attendance/bootstrap')
 def attendance_bootstrap(d:Device=Depends(attendance_device),db:Session=Depends(get_db)):
-    centre=db.get(Centre,d.centre_id);children=list(db.scalars(select(Child).where(Child.centre_id==d.centre_id,Child.active.is_(True))));active={x.child_id:x for x in db.scalars(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None)))};rooms={r.id:r.name for r in scoped(db,Room,d.centre_id)}
-    return {'device_id':d.id,'default_room_id':d.default_room_id,'centre':{'display_name':centre.display_name or centre.name,'secondary_text':centre.secondary_text},'assigned_room':rooms.get(d.default_room_id),'children':[{'id':c.id,'first_name':c.preferred_name or c.first_name,'last_name':c.last_name,'room_id':c.room_id,'room_name':rooms.get(c.room_id),'present':c.id in active} for c in children]}
+    centre=db.get(Centre,d.centre_id);children=list(db.scalars(select(Child).where(Child.centre_id==d.centre_id,Child.active.is_(True))));active={x.child_id:x for x in db.scalars(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.arrived_at.is_not(None),Attendance.departed_at.is_(None)))};rooms={r.id:r for r in scoped(db,Room,d.centre_id)};assigned=rooms.get(d.default_room_id)
+    return {'device_id':d.id,'default_room_id':d.default_room_id,'centre':{'display_name':centre.display_name or centre.name,'secondary_text':centre.secondary_text,'timezone':centre.timezone},'assigned_room':{'id':assigned.id,'name':assigned.name,'accent':assigned.accent,'icon':assigned.icon} if assigned else None,'relationship_required':centre.attendance_relationship_required,'children':[{'id':c.id,'first_name':c.preferred_name or c.first_name,'last_name':c.last_name,'room_id':c.room_id,'room_name':rooms[c.room_id].name if c.room_id in rooms else None,'present':c.id in active,'attendance_id':active[c.id].id if c.id in active else None,'arrived_at':active[c.id].arrived_at if c.id in active else None,'stale_attendance':is_stale_attendance(active[c.id],centre) if c.id in active else False} for c in children]}
 @app.get('/api/classroom/parent-notes')
 def classroom_parent_notes(d:Device=Depends(classroom_device),db:Session=Depends(get_db)):
     rows=db.scalars(select(ParentNote).where(ParentNote.centre_id==d.centre_id).order_by(ParentNote.pinned.desc(),ParentNote.created_at.desc()).limit(100))
-    return [{'id':n.id,'child_id':n.child_id,'child_name':(db.get(Child,n.child_id).preferred_name or db.get(Child,n.child_id).first_name),'body':n.body,'created_at':n.created_at,'read_at':n.read_at,'pinned':n.pinned} for n in rows]
+    return [{'id':n.id,'child_id':n.child_id,'child_name':(db.get(Child,n.child_id).preferred_name or db.get(Child,n.child_id).first_name),'body':soften_parent_text(n.body),'created_at':n.created_at,'read_at':n.read_at,'pinned':n.pinned} for n in rows]
 @app.patch('/api/classroom/parent-notes/{note_id}')
 def classroom_parent_note_action(note_id:str,body:ParentNoteAction,d:Device=Depends(classroom_device),db:Session=Depends(get_db)):
     note=db.scalar(select(ParentNote).where(ParentNote.id==note_id,ParentNote.centre_id==d.centre_id))
@@ -1855,19 +2041,40 @@ def attendance_kiosk(body:AttendanceKioskIn,d:Device=Depends(attendance_device),
     # another enrolled room.  Parent sign-in must never manufacture a visit.
     room_id=child.room_id or body.room_id
     room_for_device(db,d,room_id)
+    centre=db.get(Centre,d.centre_id);relationship=(body.relationship or '').strip() or None
+    if centre.attendance_relationship_required and not relationship:raise HTTPException(422,'Choose a relationship')
     when=body.effective_at or now()
     active=db.scalar(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.child_id==child.id,Attendance.departed_at.is_(None)).order_by(Attendance.arrived_at.desc()))
     if body.action=='sign_in':
         if active: raise HTTPException(409,'Child is already signed in')
-        active=Attendance(centre_id=d.centre_id,child_id=child.id,room_id=room_id,arrived_at=when,device_id=d.id,source='parent_kiosk',signer_name=body.signer_name.strip() if body.signer_name else None,signer_relationship=body.relationship.strip())
+        active=Attendance(centre_id=d.centre_id,child_id=child.id,room_id=room_id,arrived_at=when,device_id=d.id,source='parent_kiosk',signer_name=body.signer_name.strip() if body.signer_name else None,signer_relationship=relationship)
         db.add(active);db.flush();action='kiosk_sign_in'
     else:
         if not active: raise HTTPException(409,'Child is not signed in')
+        if utc(when)<=utc(active.arrived_at):raise HTTPException(409,'Sign-out must be after sign-in')
         active.departed_at=when;action='kiosk_sign_out'
-    db.add(Signature(centre_id=d.centre_id,parent_id=None,signer_name=body.signer_name.strip() if body.signer_name else 'Parent signature',relationship=body.relationship,domain_type='attendance',domain_id=active.id,revision=1,purpose=action,signature_data=body.signature_data))
-    audit(db,d.centre_id,'attendance',active.id,action,after={'child_id':child.id,'room_id':room_id,'effective_at':when.isoformat(),'source':'parent_kiosk','relationship':body.relationship},actor=d.id)
+    db.add(Signature(centre_id=d.centre_id,parent_id=None,signer_name=body.signer_name.strip() if body.signer_name else 'Parent signature',relationship=relationship,domain_type='attendance',domain_id=active.id,revision=1,purpose=action,signature_data=body.signature_data))
+    audit(db,d.centre_id,'attendance',active.id,action,after={'child_id':child.id,'room_id':room_id,'effective_at':when.isoformat(),'source':'parent_kiosk','relationship':relationship,'device_id':d.id},actor=d.id)
     db.commit()
     return {'id':active.id,'action':body.action,'effective_at':when}
+
+@app.post('/api/attendance/missing-sign-out')
+def confirm_missing_sign_out(body:MissingSignOutIn,d:Device=Depends(attendance_device),db:Session=Depends(get_db)):
+    centre=db.get(Centre,d.centre_id);child=db.scalar(select(Child).where(Child.id==body.child_id,Child.centre_id==d.centre_id,Child.active.is_(True)))
+    attendance=db.scalar(select(Attendance).where(Attendance.id==body.attendance_id,Attendance.child_id==body.child_id,Attendance.centre_id==d.centre_id))
+    if not child or not attendance:raise HTTPException(404,'Previous attendance not found')
+    if not is_stale_attendance(attendance,centre):raise HTTPException(409,'This attendance no longer needs a missing sign-out confirmation')
+    relationship=(body.relationship or '').strip() or None
+    if centre.attendance_relationship_required and not relationship:raise HTTPException(422,'Choose a relationship')
+    departed=centre_local_datetime(f'{body.pickup_date.isoformat()}T{body.pickup_time}',centre.timezone,body.fold)
+    if departed<=utc(attendance.arrived_at):raise HTTPException(409,'Pickup must be after the original sign-in')
+    if departed>now():raise HTTPException(409,'Pickup cannot be in the future')
+    following=db.scalar(select(Attendance).where(Attendance.centre_id==d.centre_id,Attendance.child_id==child.id,Attendance.id!=attendance.id,Attendance.arrived_at>attendance.arrived_at).order_by(Attendance.arrived_at))
+    if following and departed>=utc(following.arrived_at):raise HTTPException(409,'Pickup must be before the next attendance')
+    attendance.departed_at=departed
+    db.add(Signature(centre_id=d.centre_id,parent_id=None,signer_name='Parent confirmation',relationship=relationship,domain_type='attendance',domain_id=attendance.id,revision=1,purpose='parent_missing_sign_out_confirmation',signature_data=body.signature_data))
+    audit(db,d.centre_id,'attendance',attendance.id,'parent_confirmed_missing_sign_out',after={'attendance_id':attendance.id,'child_id':child.id,'previous_open':True,'confirmed_departed_at':departed.isoformat(),'relationship':relationship,'device_id':d.id,'timestamp':now().isoformat()},actor=d.id)
+    db.commit();return {'id':attendance.id,'departed_at':departed,'relationship':relationship,'next_action':'sign_in'}
 @app.get('/api/attendance/relationships/{child_id}')
 def attendance_relationships(child_id:str,d:Device=Depends(attendance_device),db:Session=Depends(get_db)):
     if not db.scalar(select(Child).where(Child.id==child_id,Child.centre_id==d.centre_id)):raise HTTPException(404,'Child not found')
@@ -2238,7 +2445,7 @@ def update_parent_relationship(relationship_id:str,body:dict,p:Parent=Depends(pa
     if not row:raise HTTPException(404,'Relationship option not found')
     row.active=bool(body.get('active'));db.commit();return {'id':row.id,'active':row.active}
 @app.get('/api/parent/attendance/{attendance_id}/signature')
-def parent_attendance_signature(attendance_id:str,purpose:Literal['kiosk_sign_in','kiosk_sign_out']='kiosk_sign_in',p:Parent=Depends(parent),db:Session=Depends(get_db)):
+def parent_attendance_signature(attendance_id:str,purpose:Literal['kiosk_sign_in','kiosk_sign_out','parent_missing_sign_out_confirmation']='kiosk_sign_in',p:Parent=Depends(parent),db:Session=Depends(get_db)):
     attendance=db.scalar(select(Attendance).where(Attendance.id==attendance_id,Attendance.centre_id==p.centre_id))
     if not attendance or not db.scalar(select(ParentChild).where(ParentChild.parent_id==p.id,ParentChild.child_id==attendance.child_id)):raise HTTPException(404,'Signature not found')
     signature=db.scalar(select(Signature).where(Signature.centre_id==p.centre_id,Signature.domain_type=='attendance',Signature.domain_id==attendance.id,Signature.purpose==purpose).order_by(Signature.signed_at.desc()))
@@ -2348,6 +2555,9 @@ def parent_day(child_id:str,day:date|None=None,p:Parent=Depends(parent),db:Sessi
         room=db.get(Room,a.room_id) if a.room_id else None
         sign_in_signature=db.scalar(select(Signature).where(Signature.centre_id==p.centre_id,Signature.domain_type=='attendance',Signature.domain_id==a.id,Signature.purpose=='kiosk_sign_in').order_by(Signature.signed_at.desc()))
         sign_out_signature=db.scalar(select(Signature).where(Signature.centre_id==p.centre_id,Signature.domain_type=='attendance',Signature.domain_id==a.id,Signature.purpose=='kiosk_sign_out').order_by(Signature.signed_at.desc()))
+        missing_signature=db.scalar(select(Signature).where(Signature.centre_id==p.centre_id,Signature.domain_type=='attendance',Signature.domain_id==a.id,Signature.purpose=='parent_missing_sign_out_confirmation').order_by(Signature.signed_at.desc()))
+        departure_signature=sign_out_signature or missing_signature
+        attendance_device=db.scalar(select(Device).where(Device.id==a.device_id,Device.centre_id==p.centre_id)) if a.device_id else None
         attendance_out.append({
             'id':a.id,
             'arrived_at':a.arrived_at,
@@ -2355,13 +2565,15 @@ def parent_day(child_id:str,day:date|None=None,p:Parent=Depends(parent),db:Sessi
             'room':room.name if room else None,
             'source':a.source,
             'late_sign_in':a.late_sign_in,
+            'device':attendance_device.label if attendance_device else None,
             'staff':((db.get(Staff,a.recorded_by_staff_id).preferred_name or db.get(Staff,a.recorded_by_staff_id).first_name)+' '+db.get(Staff,a.recorded_by_staff_id).last_name[:1]+'.') if a.recorded_by_staff_id and db.get(Staff,a.recorded_by_staff_id) else None,
             'relationship':sign_in_signature.relationship if sign_in_signature else a.signer_relationship,
             'signature_available':bool(sign_in_signature),
             'sign_in_relationship':sign_in_signature.relationship if sign_in_signature else a.signer_relationship,
-            'sign_out_relationship':sign_out_signature.relationship if sign_out_signature else None,
+            'sign_out_relationship':departure_signature.relationship if departure_signature else None,
             'sign_in_signature_available':bool(sign_in_signature),
-            'sign_out_signature_available':bool(sign_out_signature)
+            'sign_out_signature_available':bool(departure_signature),
+            'sign_out_signature_purpose':departure_signature.purpose if departure_signature else None
         })
 
     sleep_out=[]
@@ -2403,7 +2615,7 @@ def parent_day(child_id:str,day:date|None=None,p:Parent=Depends(parent),db:Sessi
 @app.post('/api/parent/notes')
 def parent_note(body:NoteIn,p:Parent=Depends(parent),db:Session=Depends(get_db)):
     if not db.scalar(select(ParentChild).where(ParentChild.parent_id==p.id,ParentChild.child_id==body.child_id)):raise HTTPException(404,'Child not found')
-    n=ParentNote(centre_id=p.centre_id,child_id=body.child_id,body=body.body);db.add(n);db.commit();return {'id':n.id,'created_at':n.created_at}
+    n=ParentNote(centre_id=p.centre_id,child_id=body.child_id,body=body.body);db.add(n);db.flush();audit(db,p.centre_id,'parent_note',n.id,'submitted',after={'note_id':n.id,'child_id':n.child_id},actor=p.id);db.commit();return {'id':n.id,'created_at':n.created_at}
 @app.post('/api/parent/data-requests')
 def create_data_request(body:DataRequestIn,p:Parent=Depends(parent),db:Session=Depends(get_db)):
     if body.end_date<body.start_date:raise HTTPException(422,'End date must be on or after start date')
@@ -2427,18 +2639,20 @@ def export(child_id:str,day:date|None=None,p:Parent=Depends(parent),db:Session=D
     exported_at=now().astimezone(zone).strftime('%Y-%m-%d-%H%M')
     child_slug=safe_slug(' '.join(part for part in [child.preferred_name or child.first_name,child.last_name] if part))
     filename=f'{child_slug}_daily-care_{record_date}_exported-{exported_at}.csv'
-    record=parent_day(child_id,day,p,db);out=io.StringIO();w=csv.writer(out);w.writerow(['effective_time','type','summary','room','performed_by'])
+    record=parent_day(child_id,day,p,db);out=io.StringIO();w=csv.writer(out);w.writerow(['effective_time','type','summary','room','performed_by','source','relationship','signature_recorded'])
     arrivals=sorted((x for x in record['attendance'] if x['arrived_at']),key=lambda x:x['arrived_at'])
     departures=sorted((x for x in record['attendance'] if x['departed_at']),key=lambda x:x['departed_at'])
-    if arrivals:w.writerow([local_time(arrivals[0]['arrived_at']),'Drop off','Arrived at centre',arrivals[0]['room'],''])
+    if arrivals:
+        arrival=arrivals[0];parent_signed=arrival['source']=='parent_kiosk';w.writerow([local_time(arrival['arrived_at']),'Drop off','Arrived at centre',arrival['room'],'Self signed' if parent_signed else (arrival['staff'] or ''),'Parent sign-in' if parent_signed else ('Teacher sign-in' if arrival['staff'] else ''),arrival.get('sign_in_relationship') or '', 'Yes' if arrival.get('sign_in_signature_available') else 'No'])
     rows=[]
     for sleep in record['sleep_sessions']:
         moments=[f"put down {local_time(sleep['put_down_at'])}" if sleep['put_down_at'] else None,f"fell asleep {local_time(sleep['fell_asleep_at'])}" if sleep['fell_asleep_at'] else None,f"woke {local_time(sleep['woke_at'])}" if sleep['woke_at'] else None,f"got up {local_time(sleep['got_up_at'])}" if sleep['got_up_at'] else None]
-        rows.append((sleep['put_down_at'] or sleep['fell_asleep_at'],'Sleep','; '.join(x for x in moments if x)+(f"; duration {sleep['duration_minutes']} min" if sleep['duration_minutes'] is not None else ''),sleep['room'],''))
+        rows.append((sleep['put_down_at'] or sleep['fell_asleep_at'],'Sleep','; '.join(x for x in moments if x)+(f"; duration {sleep['duration_minutes']} min" if sleep['duration_minutes'] is not None else ''),sleep['room'],'','','',''))
     for event in record['events']:
-        rows.append((event['effective_at'],event['type'].replace('_',' ').title(),' · '.join(f'{k}: {v}' for k,v in event['data'].items() if v not in (None,'',[])),event['room'],event['performed_by']))
+        rows.append((event['effective_at'],event['type'].replace('_',' ').title(),' · '.join(f'{k}: {v}' for k,v in event['data'].items() if v not in (None,'',[])),event['room'],event['performed_by'],'Teacher entry' if event['performed_by'] else '','',''))
     for row in sorted(rows,key=lambda x:x[0] or ''):w.writerow([local_time(row[0]),*row[1:]])
-    if departures:w.writerow([local_time(departures[-1]['departed_at']),'Pick up','Departed centre',departures[-1]['room'],''])
+    if departures:
+        departure=departures[-1];parent_signed=bool(departure.get('sign_out_signature_available'));w.writerow([local_time(departure['departed_at']),'Pick up','Departed centre',departure['room'],'Self signed' if parent_signed else '', 'Parent sign-out' if parent_signed else '',departure.get('sign_out_relationship') or '', 'Yes' if parent_signed else 'No'])
     return Response(out.getvalue(),media_type='text/csv',headers={'Content-Disposition':f'attachment; filename="{filename}"'})
 
 @app.on_event('startup')

@@ -13,7 +13,7 @@ type Attendance={
   arrived_at?:string|null;
   departed_at?:string|null;
   room?:string|null;
-  source?:string|null;late_sign_in?:boolean;staff?:string|null;relationship?:string|null;signature_available?:boolean;sign_in_relationship?:string|null;sign_out_relationship?:string|null;sign_in_signature_available?:boolean;sign_out_signature_available?:boolean;
+  source?:string|null;late_sign_in?:boolean;staff?:string|null;device?:string|null;relationship?:string|null;signature_available?:boolean;sign_in_relationship?:string|null;sign_out_relationship?:string|null;sign_in_signature_available?:boolean;sign_out_signature_available?:boolean;sign_out_signature_purpose?:'kiosk_sign_out'|'parent_missing_sign_out_confirmation'|null;
 };
 
 type Sleep={
@@ -67,6 +67,12 @@ function time(value?:string|null){
       minute:'2-digit'
     }
   );
+}
+
+export function attendanceDisplayTime(value:string|undefined|null,selectedDay:string,timezone='Pacific/Auckland'){
+  if(!value)return '—';
+  const instant=new Date(value);const parts=Object.fromEntries(new Intl.DateTimeFormat('en-NZ',{timeZone:timezone,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(instant).map(part=>[part.type,part.value]));const localDay=[parts.year,parts.month,parts.day].join('-');
+  return localDay===selectedDay?instant.toLocaleTimeString('en-NZ',{timeZone:timezone,hour:'numeric',minute:'2-digit'}):instant.toLocaleString('en-NZ',{timeZone:timezone,day:'numeric',month:'short',hour:'numeric',minute:'2-digit'});
 }
 
 function duration(minutes?:number|null){
@@ -359,16 +365,16 @@ export const attendancePresentation=(type:'Drop off'|'Pick up',value:Attendance)
     relationship:signIn?(value.sign_in_relationship??value.relationship):value.sign_out_relationship,
     staff:signIn?value.staff:null,
     signatureAvailable:signIn?(value.sign_in_signature_available??value.signature_available):value.sign_out_signature_available,
-    purpose:signIn?'kiosk_sign_in' as const:'kiosk_sign_out' as const
+    purpose:signIn?'kiosk_sign_in' as const:(value.sign_out_signature_purpose||'kiosk_sign_out')
   };
 };
 
 function AttendanceRow({
   type,
-  value,onSignature
+  value,onSignature,selectedDay,timezone
 }:{
   type:'Drop off'|'Pick up';
-  value?:Attendance|null;onSignature:(id:string,purpose:'kiosk_sign_in'|'kiosk_sign_out')=>void;
+  value?:Attendance|null;selectedDay:string;timezone:string;onSignature:(id:string,purpose:'kiosk_sign_in'|'kiosk_sign_out'|'parent_missing_sign_out_confirmation',meta:any)=>void;
 }){
   const at=type==='Drop off'?value?.arrived_at:value?.departed_at;if(!value||!at)return null;
   const{source,relationship,staff,signatureAvailable,purpose}=attendancePresentation(type,value);
@@ -376,7 +382,7 @@ function AttendanceRow({
   return(
     <div className="attendance-row">
       <b>{type}</b>
-      <time>{time(at)}</time><small>{[value.room,relationship,staff?`Entered by ${staff}`:null,source].filter(Boolean).join(' · ')}</small>{signatureAvailable&&<button className="minor" onClick={()=>onSignature(value.id,purpose)}>View signature</button>}
+      <time>{attendanceDisplayTime(at,selectedDay,timezone)}</time><small>{[value.room,relationship,staff?`Entered by ${staff}`:null,!staff?value.device:null,source].filter(Boolean).join(' · ')}</small>{signatureAvailable&&<button className="minor" onClick={()=>onSignature(value.id,purpose,{type,at,relationship,room:value.room})}>View signature</button>}
     </div>
   );
 }
@@ -395,10 +401,12 @@ export default function ParentView(){
   const[error,setError]=useState('');
   const[errorStatus,setErrorStatus]=useState<number>();
   const[requestState,setRequestState]=useState<'idle'|'sending'|'sent'>('idle');
-  const[signature,setSignature]=useState<string>();
+  const[signature,setSignature]=useState<any>();
   const[relationships,setRelationships]=useState<any[]>([]);
   const[newRelationship,setNewRelationship]=useState('');
   const loadRelationships=()=>api('/parent/relationships').then(setRelationships).catch(()=>undefined);
+  useEffect(()=>{if(!signature)return;const close=(event:KeyboardEvent)=>{if(event.key==='Escape')setSignature(undefined)};window.addEventListener('keydown',close);return()=>window.removeEventListener('keydown',close)},[signature]);
+  const openSignature=(id:string,purpose:string,meta:any)=>void api('/parent/attendance/'+id+'/signature?purpose='+purpose).then((result:any)=>setSignature({...result,...meta,purpose}));
 
   const reconcile=async()=>{
     const me=await api('/parent/me');
@@ -636,7 +644,9 @@ export default function ParentView(){
           <AttendanceRow
             type="Drop off"
             value={dropOff}
-            onSignature={(id,purpose)=>void api(`/parent/attendance/${id}/signature?purpose=${purpose}`).then((x:any)=>setSignature(x.signature_data))}
+            selectedDay={day}
+            timezone={data.timezone}
+            onSignature={openSignature}
           />
 
           <div className="story-divider"/>
@@ -669,7 +679,9 @@ export default function ParentView(){
             <AttendanceRow
               type="Pick up"
               value={pickUp}
-              onSignature={(id,purpose)=>void api(`/parent/attendance/${id}/signature?purpose=${purpose}`).then((x:any)=>setSignature(x.signature_data))}
+              selectedDay={day}
+              timezone={data.timezone}
+              onSignature={openSignature}
             />
             :
             dropOff&&
@@ -681,13 +693,13 @@ export default function ParentView(){
         </section></>
       }
 
-      <section className="parent-relationships">
-        <h2>Sign-in relationships</h2>
+      <details className="parent-relationships">
+        <summary><h2>Sign-in relationships · {relationships.filter(option=>option.active).length} active</h2></summary>
         <p>These are available for future kiosk sign-ins. Removing one keeps past attendance unchanged.</p>
         <div className="person-list">{relationships.map(option=><div className="person-row" key={option.id}><span><b>{option.label}</b><small>{option.active?'Active':'Inactive'}</small></span><button className="minor" onClick={()=>{if(window.confirm(`${option.active?'Remove':'Restore'} ${option.label} ${option.active?'from future sign-in choices?':'for future sign-in choices?'}`))void api(`/parent/relationships/${option.id}`,{method:'PATCH',body:JSON.stringify({active:!option.active})}).then(loadRelationships)}}>{option.active?'Remove':'Restore'}</button></div>)}</div>
         <div className="inline"><input aria-label="Add sign-in relationship" value={newRelationship} onChange={event=>setNewRelationship(event.target.value)} placeholder="Add relationship"/><button disabled={!newRelationship.trim()} onClick={()=>void api('/parent/relationships',{method:'POST',body:JSON.stringify({label:newRelationship.trim()})}).then(()=>{setNewRelationship('');return loadRelationships()})}>+ Add relationship</button></div>
-      </section>
-      {signature&&<div className="workflow-workspace" role="dialog" aria-modal="true"><section className="workflow-panel workflow-single"><header className="workflow-header"><h2>Signature</h2><button className="close" onClick={()=>setSignature(undefined)}>×</button></header><div className="workflow-details"><img className="signature-view" src={signature} alt="Parent sign-in signature"/></div></section></div>}
+      </details>
+      {signature&&<div className="modal-backdrop" role="presentation" onClick={()=>setSignature(undefined)}><section className="compact-signature-modal parent-signature-modal" role="dialog" aria-modal="true" aria-label="Signature" onClick={event=>event.stopPropagation()}><button className="close" aria-label="Close signature" onClick={()=>setSignature(undefined)}>×</button><h2>Signature</h2><img className="signature-view" src={signature.signature_data} alt="Parent attendance signature"/><h3>{signature.type}</h3><p>{new Date(signature.at||signature.signed_at).toLocaleString('en-NZ',{timeZone:data.timezone})}</p>{signature.relationship&&<p>Relationship: {signature.relationship}</p>}{signature.room&&<p>Room: {signature.room}</p>}</section></div>}
 
       <div className="parent-actions">
         <a
@@ -728,6 +740,7 @@ export default function ParentView(){
           Send note
         </button>
       </section>
+      <details className="parent-help"><summary>Help</summary><h2>Using your daily record</h2><p>Choose a child at the top, then use the arrows or date box to change day.</p><p>Drop off is when your child arrived. Pick up is when they left. Select View signature to see the saved attendance confirmation.</p><p>Daily care entries show meals, sleep, toileting and other updates shared by Teachers. Sign-in relationships control the choices offered on the sign-in tablet.</p><p>Use Note for the teachers to send a message. Download this day saves the selected day as a spreadsheet-friendly CSV file.</p><p>If a sign-out was missed, the sign-in tablet will ask you to confirm the actual pickup date and time before the next sign-in.</p><p>Records are available from {data.oldest_online_date}; ask the centre for anything older.</p></details>
     </main>
   );
 }

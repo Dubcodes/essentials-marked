@@ -20,6 +20,7 @@ class Centre(Base):
     emergency_columns: Mapped[int] = mapped_column(Integer, default=3)
     emergency_sort: Mapped[str] = mapped_column(String(30), default='room_then_name')
     emergency_show_room: Mapped[bool] = mapped_column(Boolean, default=True)
+    attendance_relationship_required: Mapped[bool] = mapped_column(Boolean, default=True)
 class Room(Base):
     __tablename__ = 'rooms'
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
@@ -125,3 +126,10 @@ class Signature(Base):
 class ParentRelationshipOption(Base):
     __tablename__='parent_relationship_options'; __table_args__=(UniqueConstraint('parent_id','label'),)
     id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); centre_id: Mapped[str]=mapped_column(ForeignKey('centres.id'),index=True); parent_id: Mapped[str]=mapped_column(ForeignKey('parents.id'),index=True); label: Mapped[str]=mapped_column(String(100)); active: Mapped[bool]=mapped_column(Boolean,default=True); created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+
+class CentreSafetyCheck(Base):
+    __tablename__='centre_safety_checks'
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); centre_id: Mapped[str]=mapped_column(ForeignKey('centres.id'),index=True); started_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); completed_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True)); staff_id: Mapped[str]=mapped_column(ForeignKey('staff.id')); account_id: Mapped[str]=mapped_column(ForeignKey('accounts.id')); status: Mapped[str]=mapped_column(String(20),default='open')
+class CentreSafetyCheckRoom(Base):
+    __tablename__='centre_safety_check_rooms'; __table_args__=(UniqueConstraint('safety_check_id','room_id'),)
+    id: Mapped[str]=mapped_column(String(36),primary_key=True,default=uid); safety_check_id: Mapped[str]=mapped_column(ForeignKey('centre_safety_checks.id'),index=True); centre_id: Mapped[str]=mapped_column(ForeignKey('centres.id'),index=True); room_id: Mapped[str]=mapped_column(ForeignKey('rooms.id')); room_name: Mapped[str]=mapped_column(String(100)); expected_count: Mapped[int]=mapped_column(Integer); observed_count: Mapped[int]=mapped_column(Integer); expected_children: Mapped[list]=mapped_column(JSON,default=list); checked_at: Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now); staff_id: Mapped[str]=mapped_column(ForeignKey('staff.id')); note: Mapped[str|None]=mapped_column(Text)
