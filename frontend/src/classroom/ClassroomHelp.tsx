@@ -6,7 +6,7 @@ const topics=[
   ['Food','Select children and record the meal, serving and enjoyment. Extra servings stay with the serving controls. Save creates one atomic batch; a retryable outage queues the exact batch for sync.'],
   ['Sleep','Put down, Fell asleep, Wake and Got up describe one lifecycle. A child who is elsewhere or absent can be moved/marked present for sleep after confirmation; never depart a child with an open sleep.'],
   ['Sleep Check','Only sleeping children appear here. Record warmth, breathing and wellbeing, then save. Individual check timing signals when a check is due; if nobody is asleep there is nothing to record.'],
-  ['Sunscreen, medicine and incidents','Sunscreen is ordinary care. Medication administration needs a live staff PIN check. Incidents stay drafts until explicitly reviewed and finalised.'],
+  ['Sunscreen, medicine and Incident / Injury','Sunscreen is ordinary care. Medication administration needs a live staff PIN check. Incident / Injury records stay drafts until explicitly reviewed and finalised.'],
   ['Emergency roll','Emergency Roll opens for this Room by default and includes enrolled children plus visitors. Use Whole centre when needed. Offline/stale warnings mean check another source before relying on the printout.'],
   ['Keyboard and sync','Alt+1–8 open workflows, / focuses child search, ? opens help, and Escape closes ordinary workflows. Shortcuts do not run while typing. Open Sync to see queued ordinary-care records.']
 ];

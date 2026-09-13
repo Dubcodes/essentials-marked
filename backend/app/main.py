@@ -1590,7 +1590,7 @@ def safety_check_out(check:CentreSafetyCheck,db:Session,include_live:bool=True):
         if record:room_rows.append({'id':record.id,'room_id':record.room_id,'room_name':record.room_name,'expected_count':record.expected_count,'observed_count':record.observed_count,'expected_children':record.expected_children,'checked_at':record.checked_at,'match':record.expected_count==record.observed_count,'note':record.note})
         elif include_live:
             expected=safety_expected_children(db,check.centre_id,room.id);room_rows.append({'room_id':room.id,'room_name':room.name,'expected_count':len(expected),'observed_count':len(expected),'expected_children':expected,'checked_at':None,'match':None,'note':None})
-    return {'id':check.id,'started_at':check.started_at,'completed_at':check.completed_at,'status':check.status,'staff_id':check.staff_id,'checker':((staff.preferred_name or staff.first_name)+' '+staff.last_name[:1]+'.') if staff else 'Unknown','rooms':room_rows,'checked_count':len(records),'room_count':len(rooms),'has_mismatch':any(record.expected_count!=record.observed_count for record in records)}
+    return {'id':check.id,'started_at':check.started_at,'completed_at':check.completed_at,'status':check.status,'staff_id':check.staff_id,'checker':((staff.preferred_name or staff.first_name)+' '+staff.last_name[:1]+'.') if staff else 'Unknown','rooms':room_rows,'checked_count':len(records),'room_count':len(rooms),'has_mismatch':any(record.expected_count!=record.observed_count for record in records),'reauth_required':check.status=='open' and now()-utc(check.started_at)>timedelta(minutes=30)}
 
 @app.get('/api/admin/safety-checks')
 def safety_check_history(a:Account=Depends(operations_account),db:Session=Depends(get_db)):

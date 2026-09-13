@@ -42,15 +42,17 @@ type SleepAction=
   'wake_and_got_up'|
   'got_up';
 
-export const restoreContext=(data:Bootstrap)=>({
-  roomId:
-    data.rooms.some(
-      r=>r.id===localStorage.getItem('classroom-room')
-    )
-      ? localStorage.getItem('classroom-room')!
-      : data.default_room_id||
-        data.rooms[0]?.id||
-        '',
+export const resolveInitialRoom=(data:Bootstrap,explicitRoom:string|null,rememberedRoom:string|null)=>
+  data.rooms.some(room=>room.id===explicitRoom)
+    ?explicitRoom!
+    :data.rooms.some(room=>room.id===rememberedRoom)
+      ?rememberedRoom!
+      :data.rooms.some(room=>room.id===data.default_room_id)
+        ?data.default_room_id
+        :data.rooms[0]?.id||'';
+
+export const restoreContext=(data:Bootstrap,explicitRoom:string|null=null)=>({
+  roomId:resolveInitialRoom(data,explicitRoom,localStorage.getItem('classroom-room')),
 
   staffId:
     data.staff.some(
@@ -66,6 +68,7 @@ export const noticeFadeDelay=59500;
 
 export default function Classroom(){
   const[data,setData]=useState<Bootstrap>();
+  const[accessDenied,setAccessDenied]=useState(false);
   const[roomId,setRoomState]=useState('');
   const[staffId,setStaffState]=useState('');
   const[view,setView]=useState<View>('');
@@ -132,15 +135,20 @@ export default function Classroom(){
   useEffect(()=>{
     void refresh()
       .then(boot=>{
-        const context=restoreContext(boot);
+        const requested=new URLSearchParams(location.search).get('room');
+        const context=restoreContext(boot,requested);
+        if(requested&&boot.rooms.some((room:any)=>room.id===requested)){
+          localStorage.setItem('classroom-room',requested);
+          const url=new URL(location.href);url.searchParams.delete('room');history.replaceState({},'',url.pathname+url.search+url.hash);
+        }
         setRoomState(context.roomId);
         setStaffState(context.staffId);
       })
       .catch(async(error:any)=>{
-        if(error?.status===403){location.assign('/attendance');return}
+        if(error?.status===403){setAccessDenied(true);return}
         if(error?.status===401){location.assign('/classroom/pair');return}
         const cached=await loadSnapshot('classroom-emergency');
-        if(cached?.value){const snapshot=cached.value;const boot={device_id:'offline',default_room_id:snapshot.default_room_id,rooms:snapshot.rooms,staff:[],children:snapshot.children,unread_notes:0,centre:snapshot.centre,last_confirmed_at:snapshot.confirmedAt};setData(boot);setSleeps([]);setMeds([]);const context=restoreContext(boot);setRoomState(context.roomId);setStaffState('');setSyncState('Offline · cached roll');setOfflineSnapshot(true)}
+        if(cached?.value){const snapshot=cached.value;const boot={device_id:'offline',default_room_id:snapshot.default_room_id,rooms:snapshot.rooms,staff:[],children:snapshot.children,unread_notes:0,centre:snapshot.centre,last_confirmed_at:snapshot.confirmedAt};setData(boot);setSleeps([]);setMeds([]);const context=restoreContext(boot,new URLSearchParams(location.search).get('room'));setRoomState(context.roomId);setStaffState('');setSyncState('Offline · cached roll');setOfflineSnapshot(true)}
       });
   },[]);
 
@@ -238,6 +246,8 @@ export default function Classroom(){
     setSleepAction(action);
     setView('sleep');
   };
+
+  if(accessDenied)return <main className="login classroom-access-denied"><h1>Classroom isn’t available on this browser</h1><p>This browser is paired as a Child sign-in tablet. Use a Classroom tablet or pair this browser for Classroom use.</p><div className="inline-actions"><button type="button" className="minor" onClick={()=>location.assign('/')}>Back to administration</button><button type="button" onClick={()=>location.assign('/attendance')}>Open Child sign-in</button></div></main>;
 
   if(!data){
     return(
@@ -412,7 +422,7 @@ export default function Classroom(){
             ['food','🍽','Food'],
             ['sunscreen','☀','Sunscreen'],
             ['medicine','💊','Medicine'],
-            ['incident','⚠','Incident / Injury / Illness'],
+            ['incident','⚠','Incident / Injury'],
             ['presence','↔','Attendance / Presence']
           ]as const).map(
             ([id,icon,label])=>(

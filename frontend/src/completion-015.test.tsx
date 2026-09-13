@@ -54,7 +54,7 @@ describe('0.1.5 completion UI',()=>{
 
   it('uses explicit incident and medicine help contexts without clearing mounted state',async()=>{
     const host=document.createElement('div');document.body.append(host);const root=createRoot(host);
-    for(const [title,helpContext,expected] of [['Incident / Injury / Illness','incident','Finalisation requires connectivity'],['Review incident','incident','Finalisation requires connectivity'],['Medicine','medicine','live connection and PIN'],['Receive medication','medicine','live connection and PIN'],['Administer medication','medicine','live connection and PIN']]){
+    for(const [title,helpContext,expected] of [['Incident / Injury','incident','Finalisation requires connectivity'],['Review incident','incident','Finalisation requires connectivity'],['Medicine','medicine','live connection and PIN'],['Receive medication','medicine','live connection and PIN'],['Administer medication','medicine','live connection and PIN']]){
       function Stateful(){const[value,setValue]=useState(`${title} state`);return <WorkflowWorkspace title={title} helpContext={helpContext} close={()=>{}}><input aria-label="Preserved state" value={value} onChange={event=>setValue(event.target.value)}/></WorkflowWorkspace>}
       await act(async()=>root.render(<Stateful/>));await act(async()=>{(host.querySelector('.workflow-header-actions .minor')as HTMLButtonElement).click()});
       expect(host.textContent).toContain(expected);expect((host.querySelector('[aria-label="Preserved state"]')as HTMLInputElement).value).toBe(`${title} state`);

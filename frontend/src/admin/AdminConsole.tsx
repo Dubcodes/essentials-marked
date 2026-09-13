@@ -244,7 +244,7 @@ export default function AdminConsole(){
               </div></section>
 
               <section className="dashboard-section dashboard-attention"><h2>Needs attention</h2><div className="cards">
-                <Card value={(data.attendance_signature_issues||data.missing_sign_outs||[]).length} label="attendance evidence issues" onClick={()=>setPage('Dashboard')}/>
+                <Card value={(data.attendance_signature_issues||data.missing_sign_outs||[]).length} label="attendance evidence issues"/>
                 <Card
                   value={data.incident_drafts||0}
                   label="incident drafts"
@@ -538,14 +538,8 @@ export default function AdminConsole(){
 }
 
 
-function openClassroom(roomId:string){
-  localStorage.setItem(
-    'classroom-room',
-    roomId
-  );
-
-  location.assign('/classroom');
-}
+export const classroomUrl=(roomId:string)=>`/classroom?room=${encodeURIComponent(roomId)}`;
+export function openClassroom(roomId:string){location.assign(classroomUrl(roomId))}
 
 
 function Card({
@@ -586,27 +580,31 @@ export function DashboardActivity({timezone,notice,openAll,openRecord}:{timezone
 }
 
 export function SafetyChecks({data,notice}:{data:any;notice:Notice}){
-  const[history,setHistory]=useState<any[]>([]),[current,setCurrent]=useState<any>(),[staffId,setStaffId]=useState(''),[pin,setPin]=useState(''),[observed,setObserved]=useState(0),[note,setNote]=useState(''),[reauthPin,setReauthPin]=useState('');
+  const[history,setHistory]=useState<any[]>([]),[current,setCurrent]=useState<any>(),[selectedRoomId,setSelectedRoomId]=useState(''),[staffId,setStaffId]=useState(''),[pin,setPin]=useState(''),[observed,setObserved]=useState(0),[note,setNote]=useState(''),[reauthPin,setReauthPin]=useState('');
   const load=()=>api('/admin/safety-checks').then((rows:any[])=>{setHistory(rows);setCurrent((value:any)=>value?rows.find(row=>row.id===value.id)||value:rows.find(row=>row.status==='open'))}).catch((error:any)=>notice(error.message));
   useEffect(()=>{void load()},[]);
-  const next=current?.rooms?.find((room:any)=>!room.checked_at);
-  useEffect(()=>{if(next)setObserved(next.expected_count)},[next?.room_id,next?.expected_count]);
-  const start=async()=>{try{const result=await api('/admin/safety-checks',{method:'POST',body:JSON.stringify({staff_id:staffId,staff_pin:pin})});setPin('');setCurrent(result);await load()}catch(error:any){setPin('');notice(error.message)}};
-  const confirmRoom=async()=>{try{const result=await api('/admin/safety-checks/'+current.id+'/rooms/'+next.room_id,{method:'POST',body:JSON.stringify({expected_count:next.expected_count,observed_count:observed,note:note.trim()||null,staff_pin:reauthPin||null})});setNote('');setReauthPin('');setCurrent(result);await load()}catch(error:any){
+  const selected=current?.rooms?.find((room:any)=>room.room_id===selectedRoomId&&!room.checked_at);
+  const allChecked=Boolean(current)&&current.rooms.every((room:any)=>room.checked_at);
+  useEffect(()=>{if(selected){setObserved(selected.expected_count);setNote('');setReauthPin('')}},[selected?.room_id,selected?.expected_count]);
+  const refreshCurrent=async(resetRoom=false)=>{const previous=current?.rooms?.find((room:any)=>room.room_id===selectedRoomId);const refreshed:any=await api('/admin/safety-checks/'+current.id);setCurrent(refreshed);setHistory(items=>items.map(item=>item.id===refreshed.id?refreshed:item));const refreshedRoom=refreshed.rooms?.find((room:any)=>room.room_id===selectedRoomId&&!room.checked_at);if(refreshedRoom&&(resetRoom||refreshedRoom.expected_count!==previous?.expected_count)){setObserved(refreshedRoom.expected_count);setNote('')}return refreshed};
+  const start=async()=>{try{const result=await api('/admin/safety-checks',{method:'POST',body:JSON.stringify({staff_id:staffId,staff_pin:pin})});setPin('');setSelectedRoomId('');setCurrent(result);await load()}catch(error:any){setPin('');notice(error.message)}};
+  const confirmRoom=async()=>{if(!selected)return;try{const result=await api('/admin/safety-checks/'+current.id+'/rooms/'+selected.room_id,{method:'POST',body:JSON.stringify({expected_count:selected.expected_count,observed_count:observed,note:note.trim()||null,staff_pin:current.reauth_required?reauthPin:null})});setNote('');setReauthPin('');setSelectedRoomId('');setCurrent(result);await load()}catch(error:any){
     notice(error.message);
     if(error.status===409&&error.message==='The system count changed while this Room was being checked. Please recount.'){
       setNote('');setReauthPin('');
-      try{const refreshed:any=await api('/admin/safety-checks/'+current.id);setCurrent(refreshed);setHistory(items=>items.map(item=>item.id===refreshed.id?refreshed:item));const refreshedNext=refreshed.rooms?.find((room:any)=>!room.checked_at);if(refreshedNext)setObserved(refreshedNext.expected_count)}catch(refreshError:any){notice(refreshError.message)}
+      try{await refreshCurrent(true)}catch(refreshError:any){notice(refreshError.message)}
+    }else if(error.status===403&&error.message==='Re-enter the checker PIN to continue this older safety check'){
+      try{await refreshCurrent()}catch(refreshError:any){notice(refreshError.message)}
     }
   }};
   const complete=async()=>{try{const result=await api('/admin/safety-checks/'+current.id+'/complete',{method:'POST'});setCurrent(result);await load()}catch(error:any){notice(error.message)}};
   const timezone=data.centre?.timezone||'Pacific/Auckland';
-  return <section className="safety-checks"><div className="manager-toolbar"><div><h2>Centre Safety Check</h2><p>Confirm physical head counts without changing Attendance.</p></div></div>{!current||current.status!=='open'?<section className="manager-editor safety-start"><h3>Start safety check</h3><label>Checker<select value={staffId} onChange={event=>setStaffId(event.target.value)}><option value="">Select active Staff</option>{data.staff.filter((staff:any)=>staff.active).map((staff:any)=><option value={staff.id} key={staff.id}>{staff.preferred_name||staff.first_name} {staff.last_name}</option>)}</select></label><label>Staff PIN<input type="password" inputMode="numeric" autoComplete="off" value={pin} onChange={event=>setPin(event.target.value.replace(/\D/g,'').slice(0,4))}/></label><button disabled={!staffId||pin.length!==4} onClick={()=>void start()}>Start safety check</button></section>:<section className="manager-editor safety-round"><header><div><h3>{current.checked_count} of {current.room_count} Rooms checked</h3><p>Checked by {current.checker}</p><p>Started {formatCentreDateTime(current.started_at,timezone)}</p></div><progress value={current.checked_count} max={current.room_count}/></header>{next?<div className="safety-room"><h2>{next.room_name}</h2><p>System expects: <b>{next.expected_count}</b></p><div className="count-stepper"><button aria-label="Decrease observed count" onClick={()=>setObserved(Math.max(0,observed-1))}>−</button><label>Observed now<input aria-label="Observed count" type="number" min={0} value={observed} onChange={event=>setObserved(Math.max(0,Number(event.target.value)))}/></label><button aria-label="Increase observed count" onClick={()=>setObserved(observed+1)}>+</button></div><details><summary>View expected children</summary><ul>{next.expected_children.map((child:any)=><li key={child.id}>{child.name}</li>)}</ul></details>{observed===next.expected_count?<p className="safety-match">✓ Count matches</p>:<div className="safety-mismatch"><h3>⚠ Count mismatch</h3><p>Expected: {next.expected_count} · Observed: {observed}</p><label>Investigation note<textarea value={note} onChange={event=>setNote(event.target.value)} required/></label><button className="minor" onClick={()=>setObserved(next.expected_count)}>Recount</button></div>}<label className="reauth-pin">PIN if resuming an older round<input type="password" inputMode="numeric" value={reauthPin} onChange={event=>setReauthPin(event.target.value.replace(/\D/g,'').slice(0,4))}/></label><button disabled={observed!==next.expected_count&&note.trim().length<3} onClick={()=>void confirmRoom()}>{observed===next.expected_count?'Confirm count':'Confirm mismatch'}</button></div>:<button onClick={()=>void complete()}>Complete safety check</button>}</section>}{current&&current.status==='completed'&&<SafetySummary value={current} timezone={timezone}/>}<section className="safety-history"><h3>Recent checks</h3>{history.filter(item=>item.status==='completed').map(item=><details key={item.id}><summary>{formatCentreDateTime(item.completed_at||item.started_at,timezone)} · {item.checker} · {item.has_mismatch?'⚠ Mismatch':'✓ Match'}</summary><SafetySummary value={item} timezone={timezone}/></details>)}{!history.length&&<p>No previous safety checks.</p>}</section></section>;
+  return <section className="safety-checks"><div className="manager-toolbar"><div><h2>Centre Safety Check</h2><p>Confirm physical head counts without changing Attendance.</p></div></div>{!current||current.status!=='open'?<section className="manager-editor safety-start"><h3>Start safety check</h3><label>Checker<select value={staffId} onChange={event=>setStaffId(event.target.value)}><option value="">Select active Staff</option>{data.staff.filter((staff:any)=>staff.active).map((staff:any)=><option value={staff.id} key={staff.id}>{staff.preferred_name||staff.first_name} {staff.last_name}</option>)}</select></label><label>Staff PIN<input type="password" inputMode="numeric" autoComplete="off" value={pin} onChange={event=>setPin(event.target.value.replace(/\D/g,'').slice(0,4))}/></label><button disabled={!staffId||pin.length!==4} onClick={()=>void start()}>Start safety check</button></section>:<section className="manager-editor safety-round"><header><div><h3>{current.checked_count} of {current.room_count} Rooms checked</h3><p>Checked by {current.checker}</p><p>Started {formatCentreDateTime(current.started_at,timezone)}</p></div><progress value={current.checked_count} max={current.room_count}/></header>{selected?<div className="safety-room"><button type="button" className="minor" onClick={()=>setSelectedRoomId('')}>← Choose another Room</button><h2>{selected.room_name}</h2><p>System expects: <b>{selected.expected_count}</b></p><div className="count-stepper"><button aria-label="Decrease observed count" onClick={()=>setObserved(Math.max(0,observed-1))}>−</button><label>Observed now<input aria-label="Observed count" type="number" min={0} value={observed} onChange={event=>setObserved(Math.max(0,Number(event.target.value)))}/></label><button aria-label="Increase observed count" onClick={()=>setObserved(observed+1)}>+</button></div><details><summary>View expected children</summary><ul>{selected.expected_children.map((child:any)=><li key={child.id}>{child.name}</li>)}</ul></details>{observed===selected.expected_count?<p className="safety-match">✓ Count matches</p>:<div className="safety-mismatch"><h3>⚠ Count mismatch</h3><p>Expected: {selected.expected_count} · Observed: {observed}</p><label>Investigation note<textarea value={note} onChange={event=>setNote(event.target.value)} required/></label><button className="minor" onClick={()=>setObserved(selected.expected_count)}>Recount</button></div>}{current.reauth_required&&<label className="reauth-pin">Original checker PIN<input type="password" inputMode="numeric" value={reauthPin} onChange={event=>setReauthPin(event.target.value.replace(/\D/g,'').slice(0,4))}/></label>}<button disabled={(observed!==selected.expected_count&&note.trim().length<3)||(current.reauth_required&&reauthPin.length!==4)} onClick={()=>void confirmRoom()}>{observed===selected.expected_count?'Confirm count':'Confirm mismatch'}</button></div>:allChecked?<button onClick={()=>void complete()}>Complete safety check</button>:<div className="safety-room-chooser"><h2>Choose a Room</h2>{current.rooms.map((room:any)=><button type="button" key={room.room_id} className={`person-row ${room.checked_at?'checked':''}`} disabled={Boolean(room.checked_at)} onClick={()=>setSelectedRoomId(room.room_id)}><span><b>{room.room_name}</b><small>{room.expected_count} expected</small></span><strong>{room.checked_at?'✓ Checked':'Not checked'}</strong></button>)}</div>}</section>}{current&&current.status==='completed'&&<SafetySummary value={current} timezone={timezone}/>}<section className="safety-history"><h3>Recent checks</h3>{history.filter(item=>item.status==='completed').map(item=><details key={item.id}><summary>{formatCentreDateTime(item.completed_at||item.started_at,timezone)} · {item.checker} · {item.has_mismatch?'⚠ Mismatch':'✓ Match'}</summary><SafetySummary value={item} timezone={timezone}/></details>)}{!history.length&&<p>No previous safety checks.</p>}</section></section>;
 }
 
 function SafetySummary({value,timezone}:{value:any;timezone:string}){return <div className="safety-summary"><p>Started: {formatCentreDateTime(value.started_at,timezone)}{value.completed_at&&<> · Completed: {formatCentreDateTime(value.completed_at,timezone)}</>}</p><p>Checked by: {value.checker}</p>{value.rooms.filter((room:any)=>room.checked_at).map((room:any)=><div className="person-row" key={room.room_id}><span><b>{room.room_name}</b><small>Checked {formatCentreDateTime(room.checked_at,timezone)} · Expected {room.expected_count} · Observed {room.observed_count}{room.note?' · '+room.note:''}</small></span><b>{room.match?'✓':'⚠'}</b></div>)}</div>}
 
-function RoomsManager({
+export function RoomsManager({
   data,
   reload,
   notice
@@ -624,8 +622,7 @@ function RoomsManager({
         <div>
           <h2>Classrooms</h2>
           <p>
-            Click a room card to open its
-            classroom console.
+            Select a room to view or edit its settings.
           </p>
         </div>
 
@@ -651,7 +648,8 @@ function RoomsManager({
       }
 
       <div className="room-card-grid">
-        {data.rooms.map((room:any)=><React.Fragment key={room.id}><button
+        {data.rooms.map((room:any)=><button
+                key={room.id}
                 type="button"
                 className="room-card"
                 style={{borderColor:room.accent,backgroundColor:`${room.accent}12`}}
@@ -681,8 +679,9 @@ function RoomsManager({
                     `Accent ${room.accent}`
                   }
                 />
-              </button>{selected?.id===room.id&&<RoomEditor room={room} reload={reload} notice={notice}/>}</React.Fragment>)}
+              </button>)}
       </div>
+      {selected&&<section className="room-editor-section"><h2>Edit {selected.name}</h2><RoomEditor key={selected.id} room={selected} reload={reload} notice={notice}/></section>}
     </section>
   );
 }

@@ -141,6 +141,15 @@ def test_old_safety_check_accepts_active_original_checker_pin():
         assert db.scalar(select(CentreSafetyCheckRoom).where(CentreSafetyCheckRoom.safety_check_id==check.id, CentreSafetyCheckRoom.room_id==room.id)) is not None
     finally:db.close()
 
+def test_safety_check_reports_authoritative_reauth_threshold():
+    db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
+    try:
+        client=TestClient(app);login(client,'office');started=client.post('/api/admin/safety-checks',json={'staff_id':staff.id,'staff_pin':'1234'}).json()
+        assert started['reauth_required'] is False
+        check=db.get(CentreSafetyCheck,started['id']);check.started_at=now()-timedelta(minutes=31);db.commit()
+        assert client.get(f"/api/admin/safety-checks/{check.id}").json()['reauth_required'] is True
+    finally:db.close()
+
 def test_human_audit_display_omits_technical_ids_but_raw_data_preserves_them():
     db,centre,admin,office,teacher_account,other,other_admin,room,visit,staff,inactive,child,absent,parent=setup_020()
     try:
